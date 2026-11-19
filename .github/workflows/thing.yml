@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  rust-timeline:
+  rust-backend:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -15,23 +15,21 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Prepare Tauri compile assets
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force Frontdoor | Out-Null
-          Set-Content Frontdoor/index.html '<!doctype html><html><body></body></html>'
-
       - name: Test timeline core
         run: cargo test --manifest-path Backend/Cargo.toml -p pluto-timeline-core
 
-      - name: Check Tauri backend
-        shell: pwsh
-        run: |
-          $env:TAURI_CONFIG = '{"build":{"frontendDist":"../../../Frontdoor"},"bundle":{"icon":[],"resources":{}}}'
-          cargo check --manifest-path Backend/Cargo.toml -p pluto-desktop
+      - name: Build Rust C ABI backend
+        run: cargo build --release --manifest-path Backend/Cargo.toml -p pluto-backend-ffi
+
+      - name: Upload Rust backend DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluto-rust-backend
+          path: Backend/target/release/pluto_backend.dll
 
   build:
     runs-on: windows-latest
+    needs: rust-backend
 
     steps:
       - name: Checkout repository
@@ -135,7 +133,7 @@ jobs:
 
           if(MINGW)
               target_link_options(UI PRIVATE -static -static-libgcc -mwindows)
-              target_link_libraries(UI PRIVATE opengl32 gdi32 winmm)
+              target_link_libraries(UI PRIVATE opengl32 gdi32 winmm comdlg32)
           endif()
 
           set_target_properties(UI PROPERTIES
@@ -156,9 +154,21 @@ jobs:
 
           test -f ci-build/out/dist/UI.exe
 
+      - name: Download Rust backend DLL
+        uses: actions/download-artifact@v4
+        with:
+          name: pluto-rust-backend
+          path: ci-build/out/dist
+
+      - name: Package UI icons
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ci-build/out/dist/Icons -Force | Out-Null
+          Copy-Item -Path Icons\* -Destination ci-build/out/dist/Icons -Recurse -Force
+
       - name: Upload UI.exe
         uses: actions/upload-artifact@v4
         with:
           name: PlutoUI-Windows
-          path: ci-build/out/dist/UI.exe
+          path: ci-build/out/dist/*
           if-no-files-found: error

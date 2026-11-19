@@ -8,9 +8,148 @@ static float SlDefault(int gi) {
     if (gi / 8 == 4 && gi % 8 == 0) return 0.f; /* sharpness starts at 0 */
     return .5f;
 }
+
+static float gFxV[4][2];
+static float gFxSent[4][2];
+static bool gFxOn[4];
+static int gFilter;
+
+static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
+#ifdef _WIN32
+    static const char *sliderPaths[5][8] = {
+        {0},
+        {"hue", "saturation", "lightness"},
+        {"props.colors.light.exposure", "props.colors.light.brightness", "props.colors.light.contrast", "props.colors.light.highlights", "props.colors.light.shadows", "props.colors.light.whites", "props.colors.light.blacks"},
+        {"props.colors.color.temperature", "props.colors.color.vibrance", "props.colors.color.saturation"},
+        {"props.colors.detail.sharpness", "props.colors.detail.clarity", "props.colors.detail.vignette"}
+    };
+    static const char *wheelNames[3] = {"shadows", "tint", "highlights"};
+    static const char *presetNames[8] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro"};
+    static const char *effectNames[4] = {"chromatic", "glow", "glitch", "pixelate"};
+    static const char *audioPaths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
+
+    gNum[0] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.position.x", 0.f);
+    gNum[1] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.position.y", 0.f);
+    gNum[2] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.scale.w", 100.f);
+    gNum[3] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.scale.h", 100.f);
+    gRot = gRotT = PlutoReadNumber(clipBegin, clipEnd, "props.transform.rotation", 0.f);
+    gSl[0] = gSlT[0] = fmaxf(0.f, fminf(1.f, PlutoReadNumber(clipBegin, clipEnd, "props.transform.opacity", 100.f) / 100.f));
+    gLink[0] = false; gLink[1] = true; gLink[2] = false; gLink[3] = false;
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.position.linked", &gLink[0]);
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.scale.linked", &gLink[1]);
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.crop.linked", &gLink[2]);
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.distort.linked", &gLink[3]);
+
+    static const char *miniPaths[8] = {
+        "props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
+        "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"
+    };
+    for (int i = 0; i < 8; i++) gMini[i] = PlutoReadNumber(clipBegin, clipEnd, miniPaths[i], 0.f);
+
+    gHsl = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.colors.hsl.selected", 0.f));
+    if (gHsl < 0 || gHsl > 8) gHsl = 0;
+    for (int group = 1; group < 5; group++) {
+        for (int item = 0; item < 8 && sliderPaths[group][item]; item++) {
+            char path[128];
+            if (group == 1) snprintf(path, sizeof(path), "props.colors.hsl.%d.%s", gHsl, sliderPaths[group][item]);
+            else snprintf(path, sizeof(path), "%s", sliderPaths[group][item]);
+            float value = PlutoReadNumber(clipBegin, clipEnd, path, 0.f);
+            float normalized;
+            if (group == 1 && item == 0) normalized = value / 360.f + .5f;
+            else if (group == 4 && item == 0) normalized = value / 100.f;
+            else normalized = value / 200.f + .5f;
+            int gi = group * 8 + item;
+            gSl[gi] = gSlT[gi] = fmaxf(0.f, fminf(1.f, normalized));
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "props.colors.grading.%s.hue", wheelNames[i]);
+        float hue = PlutoReadNumber(clipBegin, clipEnd, path, 0.f);
+        snprintf(path, sizeof(path), "props.colors.grading.%s.amount", wheelNames[i]);
+        float amount = PlutoReadNumber(clipBegin, clipEnd, path, 0.f) / 100.f;
+        float angle = (hue - 90.f) * DEG2RAD;
+        gWh[i] = gWhT[i] = (Vector2){cosf(angle) * amount, sinf(angle) * amount};
+    }
+
+    for (int i = 0; i < 4; i++) {
+        float defaults[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
+        bool enabled = false;
+        char path[128];
+        snprintf(path, sizeof(path), "props.effects.%s.enabled", effectNames[i]);
+        PlutoJsonBoolPath(clipBegin, clipEnd, path, &enabled);
+        gFxOn[i] = enabled;
+        snprintf(path, sizeof(path), "props.effects.%s.amount", effectNames[i]);
+        if (i != 3) defaults[i][0] = PlutoReadNumber(clipBegin, clipEnd, path, defaults[i][0] * 100.f) / 100.f;
+        else {
+            snprintf(path, sizeof(path), "props.effects.%s.size", effectNames[i]);
+            defaults[i][0] = PlutoReadNumber(clipBegin, clipEnd, path, defaults[i][0] * 100.f) / 100.f;
+        }
+        snprintf(path, sizeof(path), "props.effects.%s.%s", effectNames[i], i == 0 ? "angle" : i == 1 ? "radius" : i == 2 ? "speed" : "blend");
+        float second = PlutoReadNumber(clipBegin, clipEnd, path, i == 0 ? 0.f : defaults[i][1] * 100.f);
+        defaults[i][1] = i == 0 ? second / 360.f + .5f : second / 100.f;
+        for (int p = 0; p < 2; p++) gFxV[i][p] = gFxSent[i][p] = fmaxf(0.f, fminf(1.f, defaults[i][p]));
+    }
+    char preset[32] = {0};
+    gFilter = 0;
+    if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.preset.id", preset, sizeof(preset)))
+        for (int i = 0; i < 8; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
+
+    for (int i = 0; i < 4; i++) {
+        float value = PlutoReadNumber(clipBegin, clipEnd, audioPaths[i], i == 0 ? 100.f : 0.f);
+        float normalized = i == 0 ? value / 200.f : value / (i == 1 ? 200.f : 24.f) + .5f;
+        gKnob[i] = fmaxf(0.f, fminf(1.f, normalized));
+    }
+    gSwOn[0] = gSwOn[1] = false;
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.audio.fadeIn", &gSwOn[0]);
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.audio.fadeOut", &gSwOn[1]);
+    gSl[40] = gSlT[40] = fmaxf(0.f, fminf(1.f, (PlutoReadNumber(clipBegin, clipEnd, "props.audio.fadeInDuration", 1.f) - 1.f) / 9.f));
+    gSl[41] = gSlT[41] = fmaxf(0.f, fminf(1.f, (PlutoReadNumber(clipBegin, clipEnd, "props.audio.fadeOutDuration", 1.f) - 1.f) / 9.f));
+#else
+    (void)clipBegin; (void)clipEnd;
+#endif
+}
+
 static void ResetAcc(int idx) {
-    if (idx == 0) { for (int i = 0; i < 3; i++) gWhT[i] = (Vector2){0, 0}; }
-    else { for (int s = 0; s < 8; s++) gSlT[idx * 8 + s] = SlDefault(idx * 8 + s); if (idx == 1) gHsl = 0; }
+    char updates[2048] = "[";
+    size_t used = 1;
+    bool first = true;
+#define ADD_ZERO_PROPERTY(path) do { \
+    int written = snprintf(updates + used, sizeof(updates) - used, "%s{\"path\":\"%s\",\"value\":0}", first ? "" : ",", (path)); \
+    if (written > 0 && (size_t)written < sizeof(updates) - used) { used += (size_t)written; first = false; } \
+} while (0)
+    if (idx == 0) {
+        static const char *channels[] = {"shadows", "tint", "highlights"};
+        for (int i = 0; i < 3; i++) {
+            gWhT[i] = (Vector2){0, 0};
+            char path[112];
+            snprintf(path, sizeof(path), "props.colors.grading.%s.hue", channels[i]); ADD_ZERO_PROPERTY(path);
+            snprintf(path, sizeof(path), "props.colors.grading.%s.amount", channels[i]); ADD_ZERO_PROPERTY(path);
+        }
+    } else {
+        for (int s = 0; s < 8; s++) gSlT[idx * 8 + s] = SlDefault(idx * 8 + s);
+        if (idx == 1) {
+            gHsl = 0;
+            int written = snprintf(updates + used, sizeof(updates) - used,
+                                   "{\"path\":\"props.colors.hsl\",\"value\":{}},{\"path\":\"props.colors.hsl.selected\",\"value\":0}");
+            if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
+        } else {
+            static const char *names[5][8] = {
+                {0}, {0},
+                {"exposure", "brightness", "contrast", "highlights", "shadows", "whites", "blacks"},
+                {"temperature", "vibrance", "saturation"},
+                {"sharpness", "clarity", "vignette"}
+            };
+            const char *group = idx == 2 ? "light" : idx == 3 ? "color" : "detail";
+            for (int field = 0; field < 8 && names[idx][field]; field++) {
+                char path[112];
+                snprintf(path, sizeof(path), "props.colors.%s.%s", group, names[idx][field]);
+                ADD_ZERO_PROPERTY(path);
+            }
+        }
+    }
+    if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
+#undef ADD_ZERO_PROPERTY
 }
 static void TickState(void) {
     float k = 1.f - expf(-18.f * gDt);
@@ -93,11 +232,14 @@ static void CommitValueEdit(float *v) {
     gEditValueId = 0;
 }
 
-static void ValueFieldLogic(Clay_ElementId id, float *v) {
+static bool ValueFieldLogic(Clay_ElementId id, float *v) {
+    float original = *v;
+    bool committed = false;
+    bool valueChanged = false;
     bool over = Clay_PointerOver(id);
     if (over || gValueDragId == id.id) gScrubCursor = true;
     if (gEditValueId == id.id) {
-        if (IsKeyPressed(KEY_ENTER)) CommitValueEdit(v);
+        if (IsKeyPressed(KEY_ENTER)) { CommitValueEdit(v); committed = true; valueChanged = fabsf(*v - original) > 0.001f; }
         else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
         int ch;
         while ((ch = GetCharPressed()) != 0) {
@@ -106,7 +248,7 @@ static void ValueFieldLogic(Clay_ElementId id, float *v) {
                 gEditValueText[gEditValueLen] = 0;
             }
         }
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over) CommitValueEdit(v);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over) { CommitValueEdit(v); committed = true; valueChanged = fabsf(*v - original) > 0.001f; }
     } else if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         gValueDragId = id.id;
         gValueDragging = false;
@@ -119,6 +261,7 @@ static void ValueFieldLogic(Clay_ElementId id, float *v) {
             gValueDragging = true;
             *v = gValueDragStart + dx * 0.2f;
         } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if (gValueDragging) { committed = true; valueChanged = fabsf(*v - gValueDragStart) > 0.001f; }
             if (!gValueDragging) {
                 double now = GetTime();
                 if (gLastValueClickId == id.id && now - gLastValueClickTime < 0.38) {
@@ -133,14 +276,34 @@ static void ValueFieldLogic(Clay_ElementId id, float *v) {
             gValueDragging = false;
         }
     }
+    return committed && valueChanged;
 }
 
 /* number field (GROW x 39): value + unit + up/down steppers */
+static const char *kNumPropertyPaths[4] = {"props.transform.position.x", "props.transform.position.y", "props.transform.scale.w", "props.transform.scale.h"};
+
+static void CommitNumField(int n, float before) {
+    if (n < 0 || n >= 4) return;
+    int group = n < 2 ? 0 : 1;
+    if (!gLink[group]) { PlutoTimelineSetProperty(kNumPropertyPaths[n], gNum[n]); return; }
+    int other = n ^ 1;
+    if (n >= 2) {
+        float ratio = fabsf(before) > 0.0001f ? gNum[n] / before : 1.f;
+        gNum[other] = fmaxf(0.f, gNum[other] * ratio);
+    } else gNum[other] = gNum[n];
+    char updates[384];
+    snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+             kNumPropertyPaths[n], gNum[n], kNumPropertyPaths[other], gNum[other]);
+    PlutoTimelineSetPropertiesJson(updates);
+}
+
 static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId id = CLAY_IDI("NumF", n);
     Clay_ElementId scrubId = CLAY_IDI("NumScrub", n);
     Bs b = Interact(id);
-    ValueFieldLogic(scrubId, v);
+    float before = gValueDragId == scrubId.id ? gValueDragStart : *v;
+    bool changed = ValueFieldLogic(scrubId, v);
+    if (changed) CommitNumField(n, before);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
@@ -151,8 +314,8 @@ static void NumField(int n, float *v, const char *unit) {
         }
         GAPX(3)
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}}}) {
-            if (Arrow(CLAY_IDI("NumU", n), I_CHEV_UP)) *v += 1.f;
-            if (Arrow(CLAY_IDI("NumD", n), I_CHEV_DN)) *v -= 1.f;
+            if (Arrow(CLAY_IDI("NumU", n), I_CHEV_UP)) { float old = *v; *v += 1.f; CommitNumField(n, old); }
+            if (Arrow(CLAY_IDI("NumD", n), I_CHEV_DN)) { float old = *v; *v -= 1.f; CommitNumField(n, old); }
         }
     }
 }
@@ -163,7 +326,26 @@ static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Clay_ElementId scrubId = CLAY_IDI("MiniScrub", n);
     Bs b = Interact(id);
-    ValueFieldLogic(scrubId, &gMini[n]);
+    bool changed = ValueFieldLogic(scrubId, &gMini[n]);
+    static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
+                                   "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
+    if (changed && n >= 0 && n < 8) {
+        if (n < 4 && gLink[2]) {
+            int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
+            gMini[other] = gMini[n];
+            char updates[384];
+            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]", paths[n], gMini[n], paths[other], gMini[other]);
+            PlutoTimelineSetPropertiesJson(updates);
+        } else if (n >= 4 && gLink[3]) {
+            char updates[768] = "["; size_t used = 1;
+            for (int i = 4; i < 8; i++) {
+                gMini[i] = gMini[n];
+                int written = snprintf(updates + used, sizeof(updates) - used, "%s{\"path\":\"%s\",\"value\":%.4f}", i == 4 ? "" : ",", paths[i], gMini[i]);
+                if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
+            }
+            if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
+        } else PlutoTimelineSetProperty(paths[n], gMini[n]);
+    }
     CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
@@ -188,7 +370,19 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             Icon(icon, 20, C_ICON);
             Tx(title, 19, C_TEXT, 1);
             HSPACE
-            if (IconBtn(CLAY_IDI("Reset", n), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) { *a = def; *b = def; }
+            if (IconBtn(CLAY_IDI("Reset", n), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) {
+                *a = def; *b = def;
+                char updates[512];
+                if (n == 0) {
+                    snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                             kNumPropertyPaths[0], *a, kNumPropertyPaths[1], *b);
+                } else {
+                    snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"props.transform.scale.linked\",\"value\":%s}]",
+                             kNumPropertyPaths[2], *a, kNumPropertyPaths[3], *b, gLink[link] ? "true" : "false");
+                }
+                PlutoTimelineSetPropertiesJson(updates);
+                gPreviewDirty = true;
+            }
         }
         GAPY(6)
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
@@ -196,7 +390,10 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             NumField(n * 2, a, unit);
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_C}}) {
-            if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) gLink[link] = !gLink[link];
+            if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) {
+                gLink[link] = !gLink[link];
+                PlutoTimelineSetBoolProperty(link == 0 ? "props.transform.position.linked" : "props.transform.scale.linked", gLink[link]);
+            }
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l2, 19, C_ICON, 0); }
@@ -232,7 +429,9 @@ static void CropBody(void) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             MiniField(1, "L");
             HSPACE
-            if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 30, 20)) gLink[2] = !gLink[2];
+            if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 30, 20)) {
+                gLink[2] = !gLink[2]; PlutoTimelineSetBoolProperty("props.transform.crop.linked", gLink[2]);
+            }
             HSPACE
             MiniField(2, "R");
         }
@@ -244,32 +443,29 @@ static void DistortBody(void) {
     CLAY(CLAY_ID("DistBody"), {.layout = {COLM, .sizing = {GROW, FIX(DIST_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10}, RCARD}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(4, "TL"); HSPACE MiniField(5, "TR"); }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-            if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 30, 20)) gLink[3] = !gLink[3];
+            if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 30, 20)) {
+                gLink[3] = !gLink[3]; PlutoTimelineSetBoolProperty("props.transform.distort.linked", gLink[3]);
+            }
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(6, "BL"); HSPACE MiniField(7, "BR"); }
     }
 }
 
 static void NavSection(void) {
-    float o0 = EaseIO(AnimLin(CLAY_ID("ExpCrop").id, gOpenTool == 0 ? 1.f : 0.f, 0.2f));
-    float o1 = EaseIO(AnimLin(CLAY_ID("ExpDist").id, gOpenTool == 1 ? 1.f : 0.f, 0.2f));
-    float h0 = roundf(o0 * (CROP_H + 10.f));
-    float h1 = roundf(o1 * (DIST_H + 10.f));
+    static int bodyKind = -1;
+    if (gOpenTool >= 0) bodyKind = gOpenTool;
+    float open = EaseIO(AnimLin(CLAY_ID("ToolBodyAnim").id, gOpenTool >= 0 ? 1.f : 0.f, 0.2f));
     CLAY(CLAY_ID("NavCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         CLAY(CLAY_ID("NavRow"), {.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) {
-            if (NavButton(0, I_CROP, "Crop Tools", o0)) { gOpenTool = (gOpenTool == 0) ? -1 : 0; gFollow = (gOpenTool == 0); }
-            if (NavButton(1, I_DISTORT, "Distort", o1)) { gOpenTool = (gOpenTool == 1) ? -1 : 1; gFollow = (gOpenTool == 1); }
+            if (NavButton(0, I_CROP, "Crop Tools", gOpenTool == 0 ? open : 0.f)) { gOpenTool = (gOpenTool == 0) ? -1 : 0; gFollow = (gOpenTool == 0); }
+            if (NavButton(1, I_DISTORT, "Distort", gOpenTool == 1 ? open : 0.f)) { gOpenTool = (gOpenTool == 1) ? -1 : 1; gFollow = (gOpenTool == 1); }
         }
-        if (h0 >= 1.f) {
-            CLAY(CLAY_ID("CropWrap"), {.layout = {COLM, .sizing = {GROW, FIX(h0)}}, .clip = {.vertical = true}}) {
+        if (bodyKind >= 0 && open >= 0.005f) {
+            float bodyHeight = bodyKind == 0 ? CROP_H : DIST_H;
+            float wrapHeight = roundf(open * (bodyHeight + 10.f));
+            CLAY(CLAY_ID("ToolBodyWrap"), {.layout = {COLM, .sizing = {GROW, FIX(wrapHeight)}}, .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
-                CropBody();
-            }
-        }
-        if (h1 >= 1.f) {
-            CLAY(CLAY_ID("DistWrap"), {.layout = {COLM, .sizing = {GROW, FIX(h1)}}, .clip = {.vertical = true}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
-                DistortBody();
+                if (bodyKind == 0) CropBody(); else DistortBody();
             }
         }
     }
@@ -280,6 +476,7 @@ static const char *RotStr(float r) { return fabsf(r) < 0.05f ? "0" : Fmt("%.1f",
 /* Transform tab. A flexible spacer positions the enlarged 66px nav buttons
    above a deliberate 26px bottom gap, matching the reference panel rhythm. */
 static void TransformView(void) {
+    static float sentRotation;
     CLAY(CLAY_ID("TfCol"), {.layout = {COLM, .sizing = {GROW, GROW}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) {
             FieldCard(0, "Position", I_POS, "X", "Y", &gNum[0], &gNum[1], 0.f, "px", 0);
@@ -288,7 +485,7 @@ static void TransformView(void) {
         GAPY(10)
         CLAY(CLAY_ID("RotCard"), {.layout = {COLM, .sizing = {GROW, FIX(160)}, .padding = {13, 13, 13, 0}, .childGap = 6}, RCARD}) {
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(35)}, .childGap = 8, .childAlignment = AL_Y}}) {
-                if (IconBtn(CLAY_ID("RotReset"), I_ROT, 34, 24, C_TEXT, false, 17)) gRotT = 0.f;
+                if (IconBtn(CLAY_ID("RotReset"), I_ROT, 34, 24, C_TEXT, false, 17)) { gRotT = 0.f; PlutoTimelineSetProperty("props.transform.rotation", 0.0); sentRotation = 0.f; }
                 Tx("Rotation", 19, C_TEXT, 0);
                 HSPACE
                 ValBox(RotStr(gRot), "\xC2\xB0", 128, 35, 22, 18, 11);
@@ -310,6 +507,10 @@ static void TransformView(void) {
                 } else gDragId = 0;
             }
             CLAY(rid, {.layout = {.sizing = {GROW, FIX(93)}}, .custom = {.customData = NC(K_ROTRULER, C_CARD, C_CARD, C_CARD, (gRot + 180.f) / 360.f, b.hover, 0)}}) {}
+            if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
+                PlutoTimelineSetProperty("props.transform.rotation", gRotT);
+                sentRotation = gRotT;
+            }
         }
         GAPY(10)
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}}}) {
@@ -320,7 +521,12 @@ static void TransformView(void) {
             }
             Clay_ElementId sid = CLAY_ID("OpacitySlider");
             Bs b = Interact(sid);
+            static float sentOpacity = 1.f;
             SliderLogic(sid, 0, 8.5f);
+            if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
+                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
+                sentOpacity = gSlT[0];
+            }
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},
                        .custom = {.customData = NC(K_SLIDER, RGB(38, 39, 43), RGB(150, 152, 160), C_CARD, gSl[0], (b.hover + (gSlDrag[0] ? 1.f : 0.f)) * 1.5f, 1)}}) {}
         }
@@ -332,10 +538,22 @@ static void TransformView(void) {
 
 /* ---------------- colors tab ---------------- */
 static void WheelItem(int i, const char *label) {
+    static Vector2 sent[3];
+    static bool sentInit;
     CLAY(CLAY_IDI("WheelCol", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
         Clay_ElementId wid = CLAY_IDI("Wheel", i);
         Bs b = Interact(wid);
         WheelLogic(i, wid);
+        if (!sentInit) { for (int j = 0; j < 3; j++) sent[j] = gWhT[j]; sentInit = true; }
+        if (!gWhDrag[i] && (fabsf(gWhT[i].x - sent[i].x) + fabsf(gWhT[i].y - sent[i].y) > .004f)) {
+            static const char *grade[3] = {"shadows", "tint", "highlights"};
+            float hue, amount; WheelInfo(gWhT[i], &hue, &amount);
+            char updates[256];
+            snprintf(updates, sizeof(updates), "[{\"path\":\"props.colors.grading.%s.hue\",\"value\":%.4f},{\"path\":\"props.colors.grading.%s.amount\",\"value\":%.4f}]",
+                     grade[i], hue, grade[i], amount * 100.f);
+            PlutoTimelineSetPropertiesJson(updates);
+            sent[i] = gWhT[i];
+        }
         float hue, len; WheelInfo(gWh[i], &hue, &len);
         bool col = len > 0.02f;
         Color dc = ColorFromHSV(hue, fminf(1.f, .3f + .7f * len), 1.f);
@@ -406,6 +624,9 @@ static void SliderSpec(int idx, int s, int *mode, Clay_Color *a, Clay_Color *b, 
 }
 
 static void SliderRow(int idx, int s) {
+    static float sent[NSL];
+    static bool sentInit;
+    if (!sentInit) { memcpy(sent, gSlT, sizeof(sent)); sentInit = true; }
     int gi = idx * 8 + s, mode; Clay_Color a, b, c;
     SliderSpec(idx, s, &mode, &a, &b, &c);
     bool uni = (idx == 4 && s == 0);
@@ -419,6 +640,26 @@ static void SliderRow(int idx, int s) {
         Clay_ElementId sid = CLAY_IDI("Slid", gi);
         Bs bs = Interact(sid);
         SliderLogic(sid, gi, 8.5f);
+        if (!gSlDrag[gi] && fabsf(gSlT[gi] - sent[gi]) > .002f && idx > 0 && idx < 5) {
+            static const char *paths[5][8] = {
+                {0},
+                {"hue", "saturation", "lightness"},
+                {"exposure", "brightness", "contrast", "highlights", "shadows", "whites", "blacks"},
+                {"temperature", "vibrance", "saturation"},
+                {"sharpness", "clarity", "vignette"}
+            };
+            char path[128];
+            double value = idx == 4 && s == 0 ? gSlT[gi] * 100.0 : (gSlT[gi] - .5) * 200.0;
+            if (idx == 1) {
+                snprintf(path, sizeof(path), "props.colors.hsl.%d.%s", gHsl, paths[idx][s]);
+                if (s == 0) value = (gSlT[gi] - .5) * 360.0;
+            } else {
+                const char *group = idx == 2 ? "light" : idx == 3 ? "color" : "detail";
+                snprintf(path, sizeof(path), "props.colors.%s.%s", group, paths[idx][s]);
+            }
+            PlutoTimelineSetProperty(path, value);
+            sent[gi] = gSlT[gi];
+        }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(14)}},
                    .custom = {.customData = NC(K_SLIDER, a, b, c, gSl[gi], (bs.hover + (gSlDrag[gi] ? 1.f : 0.f)) * 1.5f, 1 | mode)}}) {}
     }
@@ -430,7 +671,7 @@ static void Chip(int i) {
     Clay_ElementId id = CLAY_IDI("Chip", i);
     Bs b = Interact(id);
     float sel = Anim(id.id + 3u, gHsl == i ? 1.f : 0.f, 30.f);
-    if (b.clicked) gHsl = i;
+    if (b.clicked) { gHsl = i; PlutoTimelineSetProperty("props.colors.hsl.selected", i); }
     CLAY(id, {.layout = {.sizing = {FIX(30), FIX(30)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(15),
               .border = {.color = RGBA(240, 242, 246, 255.f * sel + 70.f * b.hover * (1.f - sel)), .width = CLAY_BORDER_OUTSIDE(2)}}) {
         float sz = 22.f + 2.f * b.hover - 2.f * b.press;
@@ -460,7 +701,7 @@ static void Accordion(int idx, const char *title, int icon) {
                         Bs b = Interact(rid);
                         Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, b.hover);
                         CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                            ResetIcon(rid, 14, rc, b.clicked);
+                            ResetIcon(rid, I_RESET, 14, rc, b.clicked);
                             Tx("Reset", 13, rc, 0);
                         }
                         if (b.clicked) ResetAcc(idx);
@@ -485,7 +726,7 @@ static void Accordion(int idx, const char *title, int icon) {
 
 static void ColorsView(void) {
     CLAY(CLAY_ID("AccList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-        Accordion(0, "Color Grading", I_GRADING);
+        Accordion(0, "Color Grading", I_PALETTE);
         Accordion(1, "HSL", I_SLIDERS);
         Accordion(2, "Light", I_SUN);
         Accordion(3, "Color", I_DROP);
@@ -509,7 +750,12 @@ static const FilterP kFilters[8] = {
 static void FilterThumb(int i) {
     Clay_ElementId id = CLAY_IDI("Flt", i);
     Bs b = Interact(id);
-    if (b.clicked) gFilter = i;
+    if (b.clicked) {
+        static const char *presets[8] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro"};
+        gFilter = i;
+        PlutoTimelineSetStringProperty("props.effects.preset.id", presets[i]);
+        PlutoTimelineSetProperty("props.effects.preset.intensity", 100.0);
+    }
     CLAY(id, {.layout = {.sizing = {GROW, FIX(84)}},
               .custom = {.customData = NC(K_FILTER, kFilters[i].a, kFilters[i].b, kFilters[i].sun, 0, b.hover, gFilter == i)}}) {}
 }
@@ -517,14 +763,22 @@ static void FilterThumb(int i) {
 /* ---- video effects (accordion: one effect open at a time) ---- */
 #define FX_ITEM_H 44.f
 #define FX_BODY_H 160.f   /* 12 pad | 26 enabled row | 10 | 44 param | 10 | 44 param | 14 pad */
-typedef struct { const char *name; int icon; const char *p1, *p2; bool angle; } FxDef;
+typedef struct { const char *name; const char *p1, *p2; bool angle; } FxDef;
 static const FxDef kFx[4] = {
-    {"Chromatic aberration", I_GRADING, "Amount",    "Angle", true},
-    {"Glow",                 I_SUN,     "Intensity", "Radius", false},
-    {"Glitch",               I_SLIDERS, "Amount",    "Speed", false},
-    {"Pixelate",             I_DISTORT, "Size",      "Blend", false},
+    {"Chromatic aberration", "Amount",    "Angle", true},
+    {"Glow",                 "Intensity", "Radius", false},
+    {"Glitch",               "Amount",    "Speed", false},
+    {"Pixelate",             "Size",      "Blend", false},
 };
 static float gFxV[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
+static float gFxSent[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
+static const char *gFxProp[4][2] = {
+    {"props.effects.chromatic.amount", "props.effects.chromatic.angle"},
+    {"props.effects.glow.amount", "props.effects.glow.radius"},
+    {"props.effects.glitch.amount", "props.effects.glitch.speed"},
+    {"props.effects.pixelate.size", "props.effects.pixelate.blend"}
+};
+static const char *gFxToggle[4] = {"props.effects.chromatic.enabled", "props.effects.glow.enabled", "props.effects.glitch.enabled", "props.effects.pixelate.enabled"};
 static bool  gFxOn[4];
 static bool  gFxSlDrag[4][2];
 static int   gFxOpen = 0;
@@ -557,7 +811,13 @@ static void FxParam(int i, int p, const char *label) {
         }
         Clay_ElementId sid = CLAY_IDI("FxSl", i * 2 + p);
         Bs bs = Interact(sid);
+        bool wasDragging = gFxSlDrag[i][p];
         FxSliderLogic(sid, v, &gFxSlDrag[i][p], 7.f);
+        if (wasDragging && !gFxSlDrag[i][p] && fabsf(*v - gFxSent[i][p]) > .002f) {
+            double value = (p == 1 && kFx[i].angle) ? (*v - .5f) * 360.0 : *v * 100.0;
+            PlutoTimelineSetProperty(gFxProp[i][p], value);
+            gFxSent[i][p] = *v;
+        }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
                    .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, *v,
                                                (bs.hover + (gFxSlDrag[i][p] ? 1.f : 0.f)) * 1.5f, 0)}}) {}
@@ -571,7 +831,17 @@ static void FxBody(int i) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
             Clay_ElementId swid = CLAY_IDI("FxSw", i);
             Bs sb = Interact(swid);
-            if (sb.clicked) gFxOn[i] = !gFxOn[i];
+            if (sb.clicked) {
+                gFxOn[i] = !gFxOn[i];
+                if (gFxOn[i]) {
+                    double first = gFxV[i][0] * 100.0;
+                    double second = i == 0 ? (gFxV[i][1] - .5f) * 360.0 : gFxV[i][1] * 100.0;
+                    char updates[512];
+                    snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":true},{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                             gFxToggle[i], gFxProp[i][0], first, gFxProp[i][1], second);
+                    PlutoTimelineSetPropertiesJson(updates);
+                } else PlutoTimelineSetBoolProperty(gFxToggle[i], false);
+            }
             float on = Anim(swid.id + 5u, gFxOn[i] ? 1.f : 0.f, 22.f);
             CLAY(swid, {.layout = {.sizing = {FIT, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {FIX(38), FIX(22)}},
@@ -583,17 +853,25 @@ static void FxBody(int i) {
             Bs rb = Interact(rid);
             Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
             CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                ResetIcon(rid, 14, rc, rb.clicked);
+                ResetIcon(rid, I_RESET, 14, rc, rb.clicked);
                 Tx("Reset", 14, rc, 0);
             }
-            if (rb.clicked) { gFxV[i][0] = (i == 0) ? .3f : .5f; gFxV[i][1] = .5f; }
+            if (rb.clicked) {
+                gFxV[i][0] = gFxSent[i][0] = (i == 0) ? .3f : i == 2 ? .4f : i == 3 ? .3f : .5f;
+                gFxV[i][1] = gFxSent[i][1] = .5f;
+                gFxOn[i] = false;
+                char updates[512];
+                snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":false},{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                         gFxToggle[i], gFxProp[i][0], gFxV[i][0] * 100.0, gFxProp[i][1], i == 0 ? 0.0 : gFxV[i][1] * 100.0);
+                PlutoTimelineSetPropertiesJson(updates);
+            }
         }
         FxParam(i, 0, kFx[i].p1);
         FxParam(i, 1, kFx[i].p2);
     }
 }
 
-/* effect row: icon, name, round +/- button (same surface language as the Crop/Distort nav buttons) */
+/* Effect rows use one small sparkle mark to keep the list visually quiet. */
 static bool FxHeader(int i, float open) {
     Clay_ElementId id = CLAY_IDI("FxHdr", i);
     Bs b = Interact(id);
@@ -602,7 +880,7 @@ static bool FxHeader(int i, float open) {
     CLAY(id, {.layout = {.sizing = {GROW, FIX(FX_ITEM_H)}, .padding = {14, 10, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
               .backgroundColor = BtnBg(base, hov, b), .cornerRadius = CLAY_CORNER_RADIUS(14),
               .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover * 0.72f, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        Icon(kFx[i].icon, 22, Mix(C_ICON, C_TEXT, open));
+        Icon(I_SPARKLE, 18, Mix(C_ICON, C_TEXT, open));
         Tx(kFx[i].name, 16, C_TEXT, 0);
         HSPACE
         Clay_Color gc = Mix(C_ICON, C_TEXT, fmaxf(b.hover, open));
@@ -667,10 +945,13 @@ static void EffectsView(void) {
                     Bs rb = Interact(rid);
                     Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
                     CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                        ResetIcon(rid, 14, rc, rb.clicked);
+                        ResetIcon(rid, I_RESET, 14, rc, rb.clicked);
                         Tx("Reset", 14, rc, 0);
                     }
-                    if (rb.clicked) gFilter = 0;
+                    if (rb.clicked) {
+                        gFilter = 0;
+                PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
+                    }
                 }
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("FltRows"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
@@ -688,7 +969,9 @@ static void EffectsView(void) {
     float ov = EaseIO(AnimLin(CLAY_ID("VfxAnim").id, gVfxOpen ? 1.f : 0.f, 0.2f));
     float oi[4], hb[4], sum = 0.f;
     for (int i = 0; i < 4; i++) {
-        oi[i] = EaseIO(AnimLin(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 0.2f));
+        oi[i] = Spring(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 680.f, 32.f);
+        if (oi[i] < 0.f) oi[i] = 0.f;
+        if (oi[i] > 1.04f) oi[i] = 1.04f;
         hb[i] = roundf(oi[i] * (FX_BODY_H + 8.f));
         sum += hb[i];
     }
@@ -752,7 +1035,7 @@ static void UpdateInspScroll(void) {
     gFadeR = (Rectangle){bb.x, bb.y, bb.width, bb.height};
     gFadeA = (1.f - gTabE) * 255.f;
     float maxS = fmaxf(0.f, cb.height - bb.height);
-    float wh = GetMouseWheelMove();
+    float wh = gWheelDelta;
     Vector2 m = GetMousePosition();
     if (wh != 0.f && m.x >= bb.x && m.x <= bb.x + bb.width && m.y >= bb.y && m.y <= bb.y + bb.height) {
         gScrollT -= wh * 60.f;
@@ -793,6 +1076,15 @@ static void RightPanel(void) {
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
                                    .clip = {.vertical = true, .childOffset = {0, -gScroll + (1.f - gTabE) * 18.f}}}) {
             CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}}) {
+                if (gTimelineSelected < 0) {
+                    CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {
+                        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
+                            Icon(I_FILM, 26, C_MUTED);
+                            Tx("Nothing to adjust", 17, C_TEXT, 1);
+                            TxWrap("Select a clip on the timeline to edit its properties.", 14, C_MUTED, 0);
+                        }
+                    }
+                } else {
                 if (gRightTab != 2) {
                     CLAY(CLAY_ID("InspTitle"), {.layout = {.sizing = {GROW, FIT}, .padding = {5, 0, 0, 5}, .childGap = 12, .childAlignment = AL_Y}}) {
                         Icon(icons[gRightTab], 26, C_ICON);
@@ -803,6 +1095,7 @@ static void RightPanel(void) {
                 else if (gRightTab == 1) ColorsView();
                 else if (gRightTab == 2) EffectsView();
                 else TextView();
+                }
             }
         }
     }

@@ -1,14 +1,20 @@
-# Pluto backend
+# Pluto Rust backend
 
-## What is connected
+The native raylib interface talks to the Rust `pluto-backend` C ABI DLL. There is no Tauri or WebView in the application.
 
-- `timeline-core/` stores and validates the clip snapshot sent by the Frontdoor, including track, timing, trim, link, transform, effect, and audio properties. The pointer-driven drag preview remains in the Frontdoor; each committed edit is synchronized to this Rust state.
-- `desktop/src-tauri/` provides native media selection and FFprobe metadata, cancellable FFmpeg export, export progress, and the Tauri commands used by the interface.
-- `Frontdoor/scripts/tauri-timeline.js` is the invoke bridge. `window.plutoTimeline` exposes timeline state and editing commands; `window.plutoNative` handles import, export, progress, and file URLs.
-- Video and image effects, transforms, titles, audio adjustments, and audio effects are sent with clip state and applied during FFmpeg export. The Frontdoor also previews them while editing.
+## Modules
 
-## GitHub Actions build
+- `timeline-core/` owns clip data, validation, snapping, and timeline mutations.
+- `backend-ffi/` exports a narrow C ABI. Cheap timeline commands are synchronous; FFprobe/media jobs use a background worker and are collected with `pluto_backend_poll` so rendering stays responsive.
+- `Frontend/backend_bridge.h` loads the DLL dynamically. GitHub Actions builds it and packages it beside `UI.exe`.
 
-`.github/workflows/rust-tauri.yml` installs FFmpeg on the Windows runner, stages `ffmpeg.exe` and `ffprobe.exe` for the bundle, builds Pluto, and uploads the executable with those tools as the `Pluto-Windows` artifact. Download the artifact as a folder so the executable keeps its adjacent `ffmpeg/` directory.
+The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend must be released with `pluto_backend_free`. See the exported function signatures in `Frontend/backend_bridge.h` and `Backend/backend-ffi/src/lib.rs`.
 
-For local development, install FFmpeg and FFprobe on `PATH`, or set `PLUTO_FFMPEG_DIR` to the directory containing both executables.
+## Implemented engine paths
+
+- Timeline get/add/move/split/delete, snapping, undo/redo, clip properties, and keyframe storage run synchronously in Rust.
+- Media inspection, FFprobe metadata, FFmpeg thumbnails, audio waveforms, preview frames, and export run on the backend worker so the C render loop stays responsive.
+- Preview and export both build video and audio filters through `backend-ffi/src/filters.rs`.
+- The UI loads generated media thumbnails and waveforms and displays the current rendered preview frame.
+
+FFmpeg and FFprobe resolve from `PLUTO_FFMPEG_DIR`, the app's adjacent `ffmpeg/` folder, or `PATH`. GitHub Actions builds the native UI and Rust DLL and places both in the UI artifact; the runner does not currently bundle FFmpeg itself.

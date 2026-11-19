@@ -55,7 +55,7 @@ enum {
     I_NONE, I_CROP, I_POS, I_SCALE, I_RESET, I_LINK, I_ROT, I_PLUS, I_CHEV_R, I_CHEV_L,
     I_CHEV_UP, I_CHEV_DN, I_SEARCH, I_LIBRARY, I_UNDO, I_REDO, I_EXPORT, I_NOTE, I_PALETTE,
     I_GRADING, I_SLIDERS, I_SUN, I_DROP, I_MOUNTAIN, I_DISTORT, I_SKIP_B, I_SKIP_F, I_PLAY,
-    I_LOOP, I_GRID, I_POINTER, I_HAND, I_SCISSORS, I_TEXT, I_TRASH, I_KF_PREV, I_KF_NEXT,
+    I_PAUSE, I_LOOP, I_GRID, I_POINTER, I_HAND, I_SCISSORS, I_TEXT, I_TRASH, I_KF_PREV, I_KF_NEXT,
     I_KF_DIAMOND, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
     I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
@@ -76,10 +76,26 @@ static Cust *NC(int k, Clay_Color a, Clay_Color b, Clay_Color c, float v, float 
 /* ------------------------------------------------------------------ */
 static float gFK[2] = {1.f, 1.f};   /* per-font size multiplier (normalises em size across fonts) */
 static float gDt;
+static float gWheelDelta;
+static bool gCtrlDown;
 static bool  gHand, gCross;
 static int   gLeftTab = 0, gRightTab = 0;
 static int   gPreviewRes = 720;
+static bool  gPreviewMenuOpen;
+static bool  gPreviewDirty;
+static float gPreviewDebounce;
+static uint64_t gPreviewTaskId;
+static Texture2D gPreviewFrame;
+static Rectangle gPreviewQualityRect;
 static float gMediaZoom = 1.f;
+static int   gTimelineTool;
+static float gTimelineZoom = 1.f, gTimelinePan, gPlayhead;
+static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineLoop = true, gTimelineGrid;
+static int   gTimelineSelected = -1, gMediaDragIndex = -1, gClipDragIndex = -1;
+static int   gClipDragTrack;
+static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
+static bool  gTimelinePanning;
+static uint64_t gClipSerial = 1;
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
 #ifdef _WIN32
@@ -139,6 +155,32 @@ static double gLastValueClickTime;
 static bool gValueDragging;
 static float gValueDragX, gValueDragStart;
 static bool gScrubCursor;
+
+#define MAX_IMPORTED_MEDIA 64
+typedef struct {
+    char path[1024], name[260], kind[16];
+    char thumbnailPath[1024], waveformPath[1024];
+    Texture2D thumbnail, waveform;
+    float duration;
+    bool hasAudio;
+} ImportedMedia;
+static ImportedMedia gImported[MAX_IMPORTED_MEDIA];
+static int gImportedCount;
+static int gMediaSelected = -1;
+static char gBackendMessage[256];
+
+#define MAX_TIMELINE_CLIPS 256
+typedef struct {
+    char id[64], label[260], path[1024];
+    int track; /* 0 = video 1, 1 = audio 1 */
+    float start, duration;
+    float keyframes[32];
+    int keyframeCount;
+} TimelineClipUi;
+static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
+static int gTimelineClipCount;
+static float TimelinePps(void);
+static float TimelineDuration(void);
 
 /* rotation ruler geometry (inside the 322px wide ruler box) */
 #define RULER_L 22.f
@@ -271,18 +313,21 @@ static void IconV(int k, float sz, Clay_Color c, float v) {
     CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},
                   .custom = {.customData = NC(k, c, c, c, v, 0, 0)}}) {}
 }
-static void Icon(int k, float sz, Clay_Color c) { IconV(k, sz, c, k == I_RESET ? 0.f : 1.f); }
+static void Icon(int k, float sz, Clay_Color c) { IconV(k, sz, c, (k == I_RESET || k == I_ROT) ? 0.f : 1.f); }
 
 static float ResetSpin(Clay_ElementId id, bool clicked) {
     uint32_t key = id.id ^ 0xA511E9B3u;
     float *progress = AnimPtr(key ^ 0x5BD1E995u, 0.f);
     if (clicked) *progress = 1.f;
-    return -360.f * EaseIO(AnimLin(key, 0.f, 0.30f));
+    if (*progress <= 0.f) return 0.f;
+    float angle = -360.f * EaseIO(1.f - *progress);
+    *progress = fmaxf(0.f, *progress - gDt / .30f);
+    return angle;
 }
 
-static void ResetIcon(Clay_ElementId id, float sz, Clay_Color c, bool clicked) {
+static void ResetIcon(Clay_ElementId id, int icon, float sz, Clay_Color c, bool clicked) {
     CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},
-                  .custom = {.customData = NC(K_ROT_ICON, c, c, c, ResetSpin(id, clicked), 0, I_RESET)}}) {}
+                  .custom = {.customData = NC(K_ROT_ICON, c, c, c, ResetSpin(id, clicked), 0, icon)}}) {}
 }
 
 static bool IconBtn(Clay_ElementId id, int icon, float box, float isz, Clay_Color base, bool sel, float rad) {
@@ -291,7 +336,7 @@ static bool IconBtn(Clay_ElementId id, int icon, float box, float isz, Clay_Colo
     Clay_Color bg = sel ? Mix(C_SEL, RGB(90, 95, 106), b.press * 0.6f) : RGBA(255, 255, 255, 14 * b.hover + 56 * b.press);
     CLAY(id, {.layout = {.sizing = {FIX(box), FIX(box)}, .childAlignment = AL_C},
               .backgroundColor = bg, .cornerRadius = CLAY_CORNER_RADIUS(rad)}) {
-        if (icon == I_RESET) ResetIcon(id, isz, ic, b.clicked);
+        if (icon == I_RESET || icon == I_ROT) ResetIcon(id, icon, isz, ic, b.clicked);
         else Icon(icon, isz, ic);
     }
     return b.clicked;

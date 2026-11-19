@@ -6,10 +6,12 @@ static void ValBox(const char *s, const char *unit, float w, float h, float fs, 
 static void SliderLogic(Clay_ElementId id, int gi, float kr);
 
 static void MediaView(void) {
+    static int lastMediaClick = -1;
+    static double lastMediaClickAt;
     Clay_BoundingBox mediaBox = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     Vector2 mouse = GetMousePosition();
-    float wheel = GetMouseWheelMove();
+    float wheel = gWheelDelta;
     if (ctrl && wheel != 0.f && mouse.x >= mediaBox.x && mouse.x <= mediaBox.x + mediaBox.width &&
         mouse.y >= mediaBox.y && mouse.y <= mediaBox.y + mediaBox.height) {
         gMediaZoom += wheel > 0.f ? .1f : -.1f;
@@ -23,7 +25,8 @@ static void MediaView(void) {
     int columns = (int)floorf((mediaBox.width - 18.f) / (100.f * gMediaZoom + 9.f));
     if (columns < 1) columns = 1;
     if (columns > 3) columns = 3;
-    int rows = (6 + columns - 1) / columns;
+    int mediaCount = 6 + gImportedCount;
+    int rows = (mediaCount + columns - 1) / columns;
     CLAY(CLAY_ID("MediaCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9}}) {
         Clay_ElementId sid = CLAY_ID("Search");
         Bs sb = Interact(sid);
@@ -36,19 +39,30 @@ static void MediaView(void) {
             CLAY(CLAY_IDI("MRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 9}}) {
                 for (int col = 0; col < columns; col++) {
                     int i = row * columns + col;
-                    if (i >= 6) break;
-                    const MediaItem *m = &kMedia[i];
+                    if (i >= mediaCount) break;
+                    bool imported = i >= 6;
+                    const MediaItem *m = imported ? NULL : &kMedia[i];
+                    const char *name = imported ? gImported[i - 6].name : m->name;
+                    const char *duration = imported ? Fmt("%d:%02d", (int)gImported[i - 6].duration / 60, (int)gImported[i - 6].duration % 60) : m->dur;
+                    Clay_Color sky1 = imported ? RGB(52, 66, 80) : m->sky1;
+                    Clay_Color sky2 = imported ? RGB(92, 103, 116) : m->sky2;
+                    Clay_Color mountain = imported ? RGB(44, 50, 60) : m->mtn;
+                    int style = imported ? 1 : m->style;
                     CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
                         Clay_ElementId tid = CLAY_IDI("Thumb", i);
                         Bs b = Interact(tid);
+                        if (imported && Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i - 6;
+                        if (b.clicked) gMediaSelected = i;
                         CLAY(tid, {.layout = {.sizing = {GROW, FIX(92.f * gMediaZoom)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
-                                   .custom = {.customData = NC(K_THUMB, m->sky1, m->sky2, m->mtn, 0, b.hover, m->style | (i << 4))}}) {
+                                   .border = {.color = gMediaSelected == i ? C_TEXT : RGBA(0, 0, 0, 0), .width = CLAY_BORDER_OUTSIDE(gMediaSelected == i ? 2 : 0)},
+                                   .custom = {.customData = NC(K_THUMB, sky1, sky2, mountain, 0, b.hover,
+                                                               style | ((imported ? i - 6 : i) << 4) | (imported ? 0x1000 : 0))}}) {
                             CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .padding = {5, 5, 1, 2}},
                                           .backgroundColor = RGBA(0, 0, 0, 150), .cornerRadius = CLAY_CORNER_RADIUS(5)}) {
-                                Tx(m->dur, 12.5f, C_TEXT, 1);
+                                Tx(duration, 12.5f, C_TEXT, 1);
                             }
                         }
-                        Tx(m->name, 14, Mix(C_MUTED, C_DIM, b.hover), 0);
+                        Tx(name, 14, Mix(C_MUTED, C_DIM, b.hover), 0);
                     }
                 }
             }
@@ -66,6 +80,8 @@ static const char *KnobVal(int idx) {
 
 /* draggable knob: drag up/down to change, snaps to the centre detent */
 static void KnobGroup(int idx, const char *label) {
+    static float sent[4] = {.5f, .5f, .5f, .5f};
+    static const char *paths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
     CLAY(CLAY_IDI("KG", idx), {.layout = {COLM, .sizing = {FIT, FIT}, .childGap = 5, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
         Clay_ElementId kid = CLAY_IDI("Knob", idx);
         Bs b = Interact(kid);
@@ -81,9 +97,14 @@ static void KnobGroup(int idx, const char *label) {
                 gKnob[idx] = v; drag = true;
             } else gDragId = 0;
         }
+        if (!drag && fabsf(gKnob[idx] - sent[idx]) > .002f) {
+            double value = idx == 0 ? gKnob[idx] * 200.0 : idx == 1 ? (gKnob[idx] - .5) * 200.0 : (gKnob[idx] - .5) * 24.0;
+            PlutoTimelineSetProperty(paths[idx], value);
+            sent[idx] = gKnob[idx];
+        }
         float act = Anim(kid.id + 9u, drag ? 1.f : b.hover * .6f, 20.f);
         float shown = Anim(kid.id + 13u, gKnob[idx], 30.f);      /* smooth pointer motion */
-        CLAY(kid, {.layout = {.sizing = {FIX(82), FIX(82)}}, .custom = {.customData = NC(K_KNOB, C_CARD, C_CARD, C_CARD, shown, act, 0)}}) {}
+        CLAY(kid, {.layout = {.sizing = {FIX(72), FIX(72)}}, .custom = {.customData = NC(K_KNOB, C_CARD, C_CARD, C_CARD, shown, act, 0)}}) {}
         Tx(label, 14, C_MUTED, 0);
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(74), FIX(28)}, .childAlignment = AL_C},
                       .backgroundColor = RGB(28, 29, 34), .cornerRadius = CLAY_CORNER_RADIUS(7),
@@ -96,7 +117,10 @@ static void KnobGroup(int idx, const char *label) {
 static void SwitchItem(int idx, const char *label) {
     Clay_ElementId id = CLAY_IDI("Switch", idx);
     Bs b = Interact(id);
-    if (b.clicked) gSwOn[idx] = !gSwOn[idx];
+    if (b.clicked) {
+        gSwOn[idx] = !gSwOn[idx];
+        PlutoTimelineSetBoolProperty(idx == 0 ? "props.audio.fadeIn" : "props.audio.fadeOut", gSwOn[idx]);
+    }
     float on = Anim(id.id + 5u, gSwOn[idx] ? 1.f : 0.f, 22.f);
     CLAY(id, {.layout = {.sizing = {FIT, FIT}, .childGap = 8, .childAlignment = AL_Y}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(46), FIX(26)}},
@@ -106,6 +130,8 @@ static void SwitchItem(int idx, const char *label) {
 }
 
 static void DurRow(int gi, const char *label) {
+    static float sent[2] = {0.f, 0.f};
+    int slot = gi == 40 ? 0 : 1;
     CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .padding = {3, 0, 0, 0}, .childGap = 4}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             Tx(label, 13.5f, C_DIM, 0);
@@ -115,6 +141,10 @@ static void DurRow(int gi, const char *label) {
         Clay_ElementId sid = CLAY_IDI("Dur", gi);
         Bs bs = Interact(sid);
         SliderLogic(sid, gi, 9.f);
+        if (!gSlDrag[gi] && fabsf(gSlT[gi] - sent[slot]) > .002f) {
+            PlutoTimelineSetProperty(slot == 0 ? "props.audio.fadeInDuration" : "props.audio.fadeOutDuration", 1.0 + gSlT[gi] * 9.0);
+            sent[slot] = gSlT[gi];
+        }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(20)}},
                    .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, gSl[gi],
                                                (bs.hover + (gSlDrag[gi] ? 1.f : 0.f)) * 1.5f, 0)}}) {}
@@ -127,7 +157,7 @@ static void AudioView(void) {
     Clay_BoundingBox vb = Clay_GetElementData(CLAY_ID("AudioScroll")).boundingBox;
     Clay_BoundingBox cb = Clay_GetElementData(CLAY_ID("AudioContent")).boundingBox;
     float maxS = fmaxf(0.f, cb.height - vb.height);
-    float wh = GetMouseWheelMove();
+    float wh = gWheelDelta;
     Vector2 mp = GetMousePosition();
     if (wh != 0.f && vb.width > 0.f && mp.x >= vb.x && mp.x <= vb.x + vb.width + 12 && mp.y >= vb.y && mp.y <= vb.y + vb.height)
         gAudT -= wh * 50.f;
@@ -163,12 +193,9 @@ static void AudioView(void) {
 }
 
 static void LeftPanel(void) {
-    /* tab-switch transition (fade + slide), measured from last frame */
-    gLTabT = fminf(1.f, gLTabT + gDt / 0.27f);
-    gLTabE = EaseIO(gLTabT);
-    Clay_BoundingBox lb = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
-    gLFadeR = (Rectangle){lb.x, lb.y, lb.width, lb.height};
-    gLFadeA = (1.f - gLTabE) * 255.f;
+    /* Keep the panel geometry fixed while switching media/audio content. */
+    gLTabT = gLTabE = 1.f;
+    gLFadeA = 0.f;
     float pill = Anim(CLAY_ID("LibPillAnim").id, (float)gLeftTab, 20.f);
 
     CLAY(CLAY_ID("Library"), {.layout = {COLM, .sizing = {CLAY_SIZING_FIXED(gLeftW), GROW}, .padding = {13, 13, 12, 12}, .childGap = 12}, PANEL}) {
@@ -178,6 +205,7 @@ static void LeftPanel(void) {
             HSPACE
             Clay_ElementId imp = CLAY_ID("Import");
             Bs b = Interact(imp);
+            if (b.clicked) PlutoRequestMediaImport();
             CLAY(imp, {.layout = {.sizing = {FIT, FIX(32)}, .padding = {13, 15, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
                        .backgroundColor = BtnBg(RGB(28, 29, 34), RGB(40, 42, 48), b), .cornerRadius = CLAY_CORNER_RADIUS(9),
                        .border = {.color = Mix(RGB(38, 40, 46), RGB(66, 68, 76), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
@@ -191,15 +219,13 @@ static void LeftPanel(void) {
                                   .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 2)}}) {
             for (int i = 0; i < 2; i++) {
                 if (TabBtn(CLAY_IDI("LibTab", i), i == 0 ? "Media" : "Audio", gLeftTab == i, 16.5f, 10, true) && gLeftTab != i) {
-                    gLeftTab = i; gAudS = gAudT = 0.f; gLTabT = 0.f; gLTabE = 0.f;
+                    gLeftTab = i;
                 }
             }
         }
-        /* NOTE: no vertical clip here. A clipped parent stops Clay from shrinking its GROW
-           children, which made the Audio scroll area as tall as its content (nothing to scroll).
-           The slide-in is done with top padding instead. */
+        /* Keep this slot fixed-size so Audio's taller scroll content cannot resize the preview. */
         CLAY(CLAY_ID("LibBody"), {.layout = {COLM, .sizing = {GROW, GROW},
-                                             .padding = {0, 0, (int)roundf((1.f - gLTabE) * 14.f), 0}}}) {
+                                             .padding = {0, 0, 0, 0}}}) {
             if (gLeftTab == 0) MediaView(); else AudioView();
         }
     }

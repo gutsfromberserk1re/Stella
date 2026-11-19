@@ -1,5 +1,5 @@
 /*
- * Pluto - video editor UI (visual only, no backend)
+ * Pluto - native raylib editor UI backed by the Rust C ABI
  * Layout: Clay (https://github.com/nicbarker/clay, v0.14 API)
  * Renderer: raylib (custom renderer included below, no external clay renderer needed)
  *
@@ -85,6 +85,7 @@ static Clay_ElementDeclaration ClayCompatDeclaration(
  * static implementation/state and are included exactly once in this order.
  */
 #include "core.h"
+#include "backend_bridge.h"
 #include "draw.h"
 
 /* Layout helpers and top bar are kept in the entry point. */
@@ -151,6 +152,7 @@ static void TopBar(void) {
         }
         Clay_ElementId ex = CLAY_ID("Export");
         Bs b = Interact(ex);
+        if (b.clicked) PlutoRequestExport();
         CLAY(ex, {.layout = {.sizing = {FIT, FIX(32)}, .padding = {12, 14, 0, 0}, .childGap = 8, .childAlignment = AL_Y},
                   .backgroundColor = BtnBg(RGB(27, 28, 33), RGB(38, 40, 46), b), .cornerRadius = CLAY_CORNER_RADIUS(9),
                   .border = {.color = Mix(RGB(54, 56, 62), RGB(86, 89, 98), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
@@ -158,9 +160,15 @@ static void TopBar(void) {
             Tx("Export", 13, C_TEXT, 1);
         }
         GAPX(18)
-        IconBtn(CLAY_ID("Undo"), I_UNDO, 28, 15, C_DIM, false, 8);
+        if (IconBtn(CLAY_ID("Undo"), I_UNDO, 28, 15, C_DIM, false, 8)) PlutoTimelineHistory(false);
         GAPX(8)
-        IconBtn(CLAY_ID("Redo"), I_REDO, 28, 15, RGB(76, 79, 88), false, 8);
+        if (IconBtn(CLAY_ID("Redo"), I_REDO, 28, 15, RGB(76, 79, 88), false, 8)) PlutoTimelineHistory(true);
+        if (gBackendMessage[0]) {
+            GAPX(10)
+            CLAY(CLAY_ID("BackendStatus"), {.layout = {.sizing = {FIX(300), FIT}}}) {
+                Tx(gBackendMessage, 12, C_MUTED, 0);
+            }
+        }
         HSPACE
         WindowButton("WindowMinimize", I_MINIMIZE);
         WindowButton("WindowMaximize", I_MAXIMIZE);
@@ -282,6 +290,8 @@ int main(void) {
 #endif
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
     InitWindow(1600, 967, "Pluto");   /* borderless custom title bar; 967 px tall => Transform fits */
+    LoadUiIcons();
+    if (PlutoBackendLoad()) PlutoTimelineCall("{\"command\":\"timeline_get\"}");
     SetWindowMinSize(1180, 720);
 #ifdef _WIN32
     HWND hwnd = (HWND)GetWindowHandle();
@@ -317,14 +327,34 @@ int main(void) {
 
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
+        if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gTimelinePlaying) {
+            float end = TimelineDuration();
+            gPlayhead += gDt;
+            if (gPlayhead >= end) {
+                if (gTimelineLoop) gPlayhead = 0.f;
+                else { gPlayhead = end; gTimelinePlaying = false; }
+            }
+            gPreviewDirty = true;
+        }
+        gWheelDelta = GetMouseWheelMove();
+        gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
         Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, GetMouseWheelMove() * 28.f}, gDt);
+        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, gCtrlDown ? 0.f : gWheelDelta * 28.f}, gDt);
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
+        PlutoPollBackend();
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         Clay_RenderCommandArray cmds = BuildUI();
+        if (gPreviewDirty) {
+            gPreviewDebounce += gDt;
+            if (gPreviewDebounce >= .12f) {
+                if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
+                else { gPreviewTaskId = 0; gPreviewDebounce = .10f; }
+            }
+        } else gPreviewDebounce = 0.f;
 
         if (gWindowAction == 1) MinimizeWindow();
         else if (gWindowAction == 2) {
@@ -338,11 +368,14 @@ int main(void) {
         BeginDrawing();
         ClearBackground((Color){14, 15, 17, 255});
         RenderUI(cmds);
+        DrawPreviewQualityDropdown();
         EndDrawing();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
                        gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :
                        gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
     }
+    PlutoUnloadMedia();
+    UnloadUiIcons();
     CloseWindow();
     return 0;
 }

@@ -56,13 +56,19 @@ impl Clip {
 
     fn validate(&self) -> Result<(), TimelineError> {
         if self.id.trim().is_empty() || self.label.trim().is_empty() {
-            return Err(TimelineError::InvalidClip("clip id and label are required".into()));
+            return Err(TimelineError::InvalidClip(
+                "clip id and label are required".into(),
+            ));
         }
         if !self.start.is_finite() || self.start < 0.0 {
-            return Err(TimelineError::InvalidClip("start must be finite and non-negative".into()));
+            return Err(TimelineError::InvalidClip(
+                "start must be finite and non-negative".into(),
+            ));
         }
         if !self.duration.is_finite() || self.duration <= 0.0 {
-            return Err(TimelineError::InvalidClip("duration must be finite and positive".into()));
+            return Err(TimelineError::InvalidClip(
+                "duration must be finite and positive".into(),
+            ));
         }
         Ok(())
     }
@@ -78,7 +84,11 @@ pub struct Timeline {
 
 impl Default for Timeline {
     fn default() -> Self {
-        Self { clips: Vec::new(), duration_seconds: MIN_TIMELINE_SECONDS, snapping: true }
+        Self {
+            clips: Vec::new(),
+            duration_seconds: MIN_TIMELINE_SECONDS,
+            snapping: true,
+        }
     }
 }
 
@@ -94,7 +104,10 @@ pub enum TimelineError {
 
 impl Timeline {
     pub fn new(clips: Vec<Clip>) -> Result<Self, TimelineError> {
-        let mut timeline = Self { clips, ..Self::default() };
+        let mut timeline = Self {
+            clips,
+            ..Self::default()
+        };
         timeline.validate_all()?;
         timeline.refresh_duration();
         Ok(timeline)
@@ -126,7 +139,11 @@ impl Timeline {
         playhead: f64,
         snap_threshold: f64,
     ) -> Result<Clip, TimelineError> {
-        if !desired_start.is_finite() || !playhead.is_finite() || !snap_threshold.is_finite() || snap_threshold < 0.0 {
+        if !desired_start.is_finite()
+            || !playhead.is_finite()
+            || !snap_threshold.is_finite()
+            || snap_threshold < 0.0
+        {
             return Err(TimelineError::InvalidRange);
         }
         let original = self.find(id)?.clone();
@@ -160,7 +177,10 @@ impl Timeline {
         }
         let mut clip = self.find(id)?.clone();
         if self.clips.iter().any(|other| {
-            other.id != id && other.track == clip.track && start < other.end() - EPSILON && end > other.start + EPSILON
+            other.id != id
+                && other.track == clip.track
+                && start < other.end() - EPSILON
+                && end > other.start + EPSILON
         }) {
             return Err(TimelineError::InvalidRange);
         }
@@ -171,8 +191,16 @@ impl Timeline {
         Ok(clip)
     }
 
-    pub fn split_clip(&mut self, id: &str, at: f64, right_id: String) -> Result<(Clip, Clip), TimelineError> {
-        if !at.is_finite() || right_id.trim().is_empty() || self.clips.iter().any(|c| c.id == right_id) {
+    pub fn split_clip(
+        &mut self,
+        id: &str,
+        at: f64,
+        right_id: String,
+    ) -> Result<(Clip, Clip), TimelineError> {
+        if !at.is_finite()
+            || right_id.trim().is_empty()
+            || self.clips.iter().any(|c| c.id == right_id)
+        {
             return Err(TimelineError::InvalidRange);
         }
         let mut left = self.find(id)?.clone();
@@ -199,7 +227,9 @@ impl Timeline {
         let clip = self.find(id)?.clone();
         let mut deleted = vec![clip.clone()];
         if let Some(linked) = clip.linked_clip_id.as_deref() {
-            if let Some(other) = self.clips.iter().find(|c| c.id == linked) { deleted.push(other.clone()); }
+            if let Some(other) = self.clips.iter().find(|c| c.id == linked) {
+                deleted.push(other.clone());
+            }
         }
         let ids: HashSet<_> = deleted.iter().map(|c| c.id.as_str()).collect();
         self.clips.retain(|c| !ids.contains(c.id.as_str()));
@@ -207,9 +237,21 @@ impl Timeline {
         Ok(deleted)
     }
 
-    fn snap_start(&self, id: &str, start: f64, duration: f64, playhead: f64, threshold: f64) -> f64 {
+    fn snap_start(
+        &self,
+        id: &str,
+        start: f64,
+        duration: f64,
+        playhead: f64,
+        threshold: f64,
+    ) -> f64 {
         let mut best: Option<(f64, f64)> = None;
-        for candidate in std::iter::once(playhead).chain(self.clips.iter().filter(|c| c.id != id).flat_map(|c| [c.start, c.end()])) {
+        for candidate in std::iter::once(playhead).chain(
+            self.clips
+                .iter()
+                .filter(|c| c.id != id)
+                .flat_map(|c| [c.start, c.end()]),
+        ) {
             for (edge, offset) in [(start, 0.0), (start + duration, duration)] {
                 let distance = (candidate - edge).abs();
                 if distance <= threshold && best.map_or(true, |(d, _)| distance < d) {
@@ -220,35 +262,60 @@ impl Timeline {
         best.map_or(start, |(_, value)| value.max(0.0))
     }
 
-    fn nearest_free_lane(&self, id: &str, desired: TrackId, start: f64, duration: f64) -> Result<TrackId, TimelineError> {
+    fn nearest_free_lane(
+        &self,
+        id: &str,
+        desired: TrackId,
+        start: f64,
+        duration: f64,
+    ) -> Result<TrackId, TimelineError> {
         let lanes = desired.lanes();
         let desired_index = lanes.iter().position(|lane| *lane == desired).unwrap_or(0);
         let mut candidates: Vec<_> = lanes.iter().copied().enumerate().collect();
         candidates.sort_by_key(|(index, _)| (index.abs_diff(desired_index), *index));
-        candidates.into_iter().map(|(_, lane)| lane).find(|lane| {
-            !self.clips.iter().any(|c| c.id != id && c.track == *lane && start < c.end() - EPSILON && start + duration > c.start + EPSILON)
-        }).ok_or(TimelineError::NoFreeTrack)
+        candidates
+            .into_iter()
+            .map(|(_, lane)| lane)
+            .find(|lane| {
+                !self.clips.iter().any(|c| {
+                    c.id != id
+                        && c.track == *lane
+                        && start < c.end() - EPSILON
+                        && start + duration > c.start + EPSILON
+                })
+            })
+            .ok_or(TimelineError::NoFreeTrack)
     }
 
     fn find(&self, id: &str) -> Result<&Clip, TimelineError> {
-        self.clips.iter().find(|clip| clip.id == id).ok_or_else(|| TimelineError::ClipNotFound(id.into()))
+        self.clips
+            .iter()
+            .find(|clip| clip.id == id)
+            .ok_or_else(|| TimelineError::ClipNotFound(id.into()))
     }
 
     fn replace(&mut self, clip: Clip) {
-        if let Some(index) = self.clips.iter().position(|current| current.id == clip.id) { self.clips[index] = clip; }
+        if let Some(index) = self.clips.iter().position(|current| current.id == clip.id) {
+            self.clips[index] = clip;
+        }
     }
 
     fn validate_all(&self) -> Result<(), TimelineError> {
         let mut ids = HashSet::new();
         for clip in &self.clips {
             clip.validate()?;
-            if !ids.insert(&clip.id) { return Err(TimelineError::DuplicateId(clip.id.clone())); }
+            if !ids.insert(&clip.id) {
+                return Err(TimelineError::DuplicateId(clip.id.clone()));
+            }
         }
         Ok(())
     }
 
     fn refresh_duration(&mut self) {
-        self.duration_seconds = self.clips.iter().map(Clip::end).fold(MIN_TIMELINE_SECONDS, f64::max);
+        self.duration_seconds = self
+            .clips
+            .iter()
+            .map(Clip::end)
+            .fold(MIN_TIMELINE_SECONDS, f64::max);
     }
 }
-
