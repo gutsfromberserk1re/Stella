@@ -67,7 +67,9 @@ static void TimelineTrackRow(int track, float height) {
     Clay_ElementId row = CLAY_IDI("TrackRow", track);
     static const Color videoBands[3] = {{26, 27, 30, 255}, {25, 26, 29, 255}, {30, 30, 32, 255}};
     static const Color audioBands[2] = {{23, 24, 27, 255}, {26, 27, 30, 255}};
-    Color bg = track < 4 ? videoBands[track % 3] : audioBands[(track - 4) % 2];
+    Color bgRaylib = track < 4 ? videoBands[track % 3] : audioBands[(track - 4) % 2];
+    /* FIX: Clay's backgroundColor is a Clay_Color (floats), not a raylib Color (unsigned char). */
+    Clay_Color bg = (Clay_Color){(float)bgRaylib.r, (float)bgRaylib.g, (float)bgRaylib.b, (float)bgRaylib.a};
     CLAY(row, {.layout = {.sizing = {GROW, FIX(height)}, .childAlignment = AL_Y}, .backgroundColor = bg,
                .border = {.color = RGB(41, 42, 46), .width = {.bottom = 1}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
