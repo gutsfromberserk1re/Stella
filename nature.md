@@ -6,7 +6,7 @@
 - Preview and export share the FFmpeg filter builder.
 
 ## Progress
-- GitHub Actions is configured to package one Stella Windows artifact with the UI, Rust DLL, icon, and FFmpeg runtime.
+- GitHub Actions publishes two Stella builds: a small UI/DLL/icon package and a full package with FFmpeg.
 - Removed demo media. Added filename hover tips and a media zoom cap.
 - Added preview menu motion, 30 fps scrub snapping, and left/right frame steps.
 - Added older video effect toggles and transitions between adjacent clips.
@@ -19,6 +19,6 @@
 - Run the GitHub build and check preview/export output.
 
 ## Next
-- Compile and package in GitHub Actions; confirm the single artifact works on Windows.
+- Compile and package in GitHub Actions; confirm both artifacts work on Windows.
 - Verify effect and transition output against preview frames.
 - Build shared keyframe interpolation and improve preview playback performance.
