@@ -88,10 +88,16 @@ static float TxtW(int font, const char *s, float size) {
 /* ------------------------------------------------------------------ */
 /* icons                                                               */
 /* ------------------------------------------------------------------ */
+static Vector2 IconPoint(float x, float y, float w, float h, float nx, float ny, float rotation) {
+    float dx = (nx - .5f) * w, dy = (ny - .5f) * h;
+    float a = rotation * DEG2RAD, cs = cosf(a), sn = sinf(a);
+    return (Vector2){x + .5f * w + dx * cs - dy * sn, y + .5f * h + dx * sn + dy * cs};
+}
+
 static void DrawIcon(int k, Rectangle r, Color c, float v) {
     float x = r.x, y = r.y, w = r.width, h = r.height;
     float t = fmaxf(1.3f, w / 11.0f);
-#define P(a, b) ((Vector2){x + (a) * w, y + (b) * h})
+#define P(a, b) IconPoint(x, y, w, h, a, b, k == I_RESET ? v : 0.f)
 #define LN(a, b, c2, d) DrawLineEx(P(a, b), P(c2, d), t, c)
     switch (k) {
     case I_PLUS:    LN(.22, .5, .78, .5); if (v > 0.01f) LN(.5, .5 - .28 * v, .5, .5 + .28 * v); break;
@@ -125,7 +131,7 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
     case I_CROP:    LN(.3, .1, .3, .7); LN(.3, .7, .9, .7); LN(.1, .3, .7, .3); LN(.7, .3, .7, .9); break;
     case I_POS:     LN(.5, .08, .5, .36); LN(.5, .64, .5, .92); LN(.08, .5, .36, .5); LN(.64, .5, .92, .5); DrawCircleV(P(.5, .5), .05f * w, c); break;
     case I_SCALE:   LN(.12, .88, .88, .12); LN(.55, .12, .88, .12); LN(.88, .12, .88, .45); LN(.12, .55, .12, .88); LN(.12, .88, .45, .88); break;
-    case I_RESET:
+    case I_RESET:   Arc(P(.5, .5), .34f * w, t, 210 + v, 500 + v, c); LN(.2, .33, .2, .1); LN(.2, .33, .42, .33); break;
     case I_ROT:     Arc(P(.5, .5), .34f * w, t, 210, 500, c); LN(.2, .33, .2, .1); LN(.2, .33, .42, .33); break;
     case I_LINK: {
                     /* Two open, interlocking chain links, drawn with a clean rounded stroke. */
@@ -405,6 +411,10 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                 DrawRing(c, 14.f + i, 15.f + i, 0, 360, 48, (Color){g.r, g.g, g.b, U8(a * (1.f - (i + .5f) / 10.f))});
         }
     } break;
+
+    case K_ROT_ICON:
+        DrawIcon(cu->i, r, RC(cu->a), cu->v);
+        break;
     }
 }
 

@@ -6,6 +6,24 @@ static void ValBox(const char *s, const char *unit, float w, float h, float fs, 
 static void SliderLogic(Clay_ElementId id, int gi, float kr);
 
 static void MediaView(void) {
+    Clay_BoundingBox mediaBox = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    Vector2 mouse = GetMousePosition();
+    float wheel = GetMouseWheelMove();
+    if (ctrl && wheel != 0.f && mouse.x >= mediaBox.x && mouse.x <= mediaBox.x + mediaBox.width &&
+        mouse.y >= mediaBox.y && mouse.y <= mediaBox.y + mediaBox.height) {
+        gMediaZoom += wheel > 0.f ? .1f : -.1f;
+        if (gMediaZoom < .65f) gMediaZoom = .65f;
+        if (gMediaZoom > 1.4f) gMediaZoom = 1.4f;
+    }
+    if (gLeftTab == 0) {
+        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) gMediaZoom = fminf(1.4f, gMediaZoom + .1f);
+        if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) gMediaZoom = fmaxf(.65f, gMediaZoom - .1f);
+    }
+    int columns = (int)floorf((mediaBox.width - 18.f) / (100.f * gMediaZoom + 9.f));
+    if (columns < 1) columns = 1;
+    if (columns > 3) columns = 3;
+    int rows = (6 + columns - 1) / columns;
     CLAY(CLAY_ID("MediaCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9}}) {
         Clay_ElementId sid = CLAY_ID("Search");
         Bs sb = Interact(sid);
@@ -14,15 +32,16 @@ static void MediaView(void) {
             Icon(I_SEARCH, 19, Mix(C_MUTED, C_TEXT, sb.hover * .6f));
             Tx("Search media", 16, C_MUTED, 0);
         }
-        for (int row = 0; row < 3; row++) {
+        for (int row = 0; row < rows; row++) {
             CLAY(CLAY_IDI("MRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 9}}) {
-                for (int col = 0; col < 2; col++) {
-                    int i = row * 2 + col;
+                for (int col = 0; col < columns; col++) {
+                    int i = row * columns + col;
+                    if (i >= 6) break;
                     const MediaItem *m = &kMedia[i];
                     CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
                         Clay_ElementId tid = CLAY_IDI("Thumb", i);
                         Bs b = Interact(tid);
-                        CLAY(tid, {.layout = {.sizing = {GROW, FIX(92)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
+                        CLAY(tid, {.layout = {.sizing = {GROW, FIX(92.f * gMediaZoom)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
                                    .custom = {.customData = NC(K_THUMB, m->sky1, m->sky2, m->mtn, 0, b.hover, m->style | (i << 4))}}) {
                             CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .padding = {5, 5, 1, 2}},
                                           .backgroundColor = RGBA(0, 0, 0, 150), .cornerRadius = CLAY_CORNER_RADIUS(5)}) {
@@ -145,7 +164,7 @@ static void AudioView(void) {
 
 static void LeftPanel(void) {
     /* tab-switch transition (fade + slide), measured from last frame */
-    gLTabT = fminf(1.f, gLTabT + gDt / 0.22f);
+    gLTabT = fminf(1.f, gLTabT + gDt / 0.27f);
     gLTabE = EaseIO(gLTabT);
     Clay_BoundingBox lb = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
     gLFadeR = (Rectangle){lb.x, lb.y, lb.width, lb.height};

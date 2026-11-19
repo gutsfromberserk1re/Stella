@@ -95,6 +95,7 @@ static void CommitValueEdit(float *v) {
 
 static void ValueFieldLogic(Clay_ElementId id, float *v) {
     bool over = Clay_PointerOver(id);
+    if (over || gValueDragId == id.id) gScrubCursor = true;
     if (gEditValueId == id.id) {
         if (IsKeyPressed(KEY_ENTER)) CommitValueEdit(v);
         else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
@@ -137,15 +138,15 @@ static void ValueFieldLogic(Clay_ElementId id, float *v) {
 /* number field (GROW x 39): value + unit + up/down steppers */
 static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId id = CLAY_IDI("NumF", n);
-    Clay_ElementId valueId = CLAY_IDI("NumValue", n);
+    Clay_ElementId scrubId = CLAY_IDI("NumScrub", n);
     Bs b = Interact(id);
-    ValueFieldLogic(valueId, v);
+    ValueFieldLogic(scrubId, v);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        HSPACE
-        CLAY(valueId, {.layout = {.sizing = {FIT, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
-            Tx(gEditValueId == valueId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
+        CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
+            HSPACE
+            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
             Tx(unit, 17, C_ICON, 0);
         }
         GAPX(3)
@@ -160,14 +161,18 @@ static void NumField(int n, float *v, const char *unit) {
    Deliberately fixed-width: these stay compact and the spacers around them absorb extra width. */
 static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
+    Clay_ElementId scrubId = CLAY_IDI("MiniScrub", n);
     Bs b = Interact(id);
+    ValueFieldLogic(scrubId, &gMini[n]);
     CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
-              .backgroundColor = Mix(Mix(C_RFIELD, RGB(46, 47, 54), b.hover), RGB(70, 73, 83), b.press * 0.8f), .cornerRadius = CLAY_CORNER_RADIUS(10),
+              .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Tx(lab, 12, RGB(112, 124, 156), 1);
-        HSPACE
-        Tx("0", 18, C_TEXT, 0);
-        Tx("px", 13, C_ICON, 0);
+        CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
+            HSPACE
+            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%.0f", gMini[n]), 18, C_TEXT, 0);
+            Tx("px", 13, C_ICON, 0);
+        }
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}, .padding = {2, 0, 0, 0}}}) {
             Icon(I_CHEV_UP, 10, C_ICON);
             Icon(I_CHEV_DN, 10, C_ICON);
@@ -206,13 +211,13 @@ static bool NavButton(int n, int icon, const char *label, float open) {
     Bs b = Interact(id);
     Clay_Color base = Mix(C_RCARD, RGB(42, 44, 51), open);
     Clay_Color hov  = Mix(RGB(38, 40, 46), RGB(48, 50, 58), open);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(64)}, .padding = {16, 18, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(64)}, .padding = {10, 10, 0, 0}, .childGap = 8, .childAlignment = AL_Y},
               .backgroundColor = BtnBg(base, hov, b), .cornerRadius = CLAY_CORNER_RADIUS(20),
               .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover * 0.72f, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        Icon(icon, 29, Mix(C_ICON, C_TEXT, open));
-        Tx(label, 19, C_TEXT, 0);
+        Icon(icon, 22, Mix(C_ICON, C_TEXT, open));
+        Tx(label, 16, C_TEXT, 0);
         HSPACE
-        Icon(open > 0.5f ? I_CHEV_DN : I_CHEV_R, 20, Mix(C_ICON, C_TEXT, open));
+        Icon(open > 0.5f ? I_CHEV_DN : I_CHEV_R, 16, Mix(C_ICON, C_TEXT, open));
     }
     return b.clicked;
 }
@@ -455,7 +460,7 @@ static void Accordion(int idx, const char *title, int icon) {
                         Bs b = Interact(rid);
                         Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, b.hover);
                         CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                            Icon(I_RESET, 14, rc);
+                            ResetIcon(rid, 14, rc, b.clicked);
                             Tx("Reset", 13, rc, 0);
                         }
                         if (b.clicked) ResetAcc(idx);
@@ -578,7 +583,7 @@ static void FxBody(int i) {
             Bs rb = Interact(rid);
             Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
             CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                Icon(I_RESET, 14, rc);
+                ResetIcon(rid, 14, rc, rb.clicked);
                 Tx("Reset", 14, rc, 0);
             }
             if (rb.clicked) { gFxV[i][0] = (i == 0) ? .3f : .5f; gFxV[i][1] = .5f; }
@@ -662,7 +667,7 @@ static void EffectsView(void) {
                     Bs rb = Interact(rid);
                     Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
                     CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                        Icon(I_RESET, 14, rc);
+                        ResetIcon(rid, 14, rc, rb.clicked);
                         Tx("Reset", 14, rc, 0);
                     }
                     if (rb.clicked) gFilter = 0;
@@ -742,7 +747,7 @@ static void UpdateInspScroll(void) {
     Clay_BoundingBox bb = Clay_GetElementData(CLAY_ID("InspBody")).boundingBox;
     Clay_BoundingBox cb = Clay_GetElementData(CLAY_ID("InspContent")).boundingBox;
     gInspViewH = bb.height;
-    gTabT = fminf(1.f, gTabT + gDt / 0.24f);
+    gTabT = fminf(1.f, gTabT + gDt / 0.29f);
     gTabE = gTabT * gTabT * (3.f - 2.f * gTabT);
     gFadeR = (Rectangle){bb.x, bb.y, bb.width, bb.height};
     gFadeA = (1.f - gTabE) * 255.f;

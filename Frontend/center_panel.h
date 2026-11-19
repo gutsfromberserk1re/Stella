@@ -37,9 +37,20 @@ static void CenterPanel(void) {
                 IconBtn(CLAY_ID("SkipF"), I_SKIP_F, 32, 16, C_DIM, false, 16);
             }
             CLAY(CLAY_ID("TransR"), {.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_CENTER}}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIX(22)}, .padding = {8, 8, 0, 0}, .childAlignment = AL_C},
-                              .backgroundColor = RGB(30, 31, 36), .cornerRadius = CLAY_CORNER_RADIUS(6)}) {
-                    Tx("1920\xC3\x97" "1080 \xC2\xB7 30 fps", 10, C_MUTED, 0);
+                Clay_ElementId previewQuality = CLAY_ID("PreviewQuality");
+                Bs q = Interact(previewQuality);
+                if (q.clicked) {
+                    static const int levels[] = {240, 360, 480, 720, 1080};
+                    int i = 0;
+                    while (i < 4 && levels[i] != gPreviewRes) i++;
+                    gPreviewRes = levels[(i + 1) % 5];
+                }
+                CLAY(previewQuality, {.layout = {.sizing = {FIT, FIX(30)}, .padding = {10, 10, 0, 0}, .childGap = 5, .childAlignment = AL_Y},
+                                      .backgroundColor = Mix(RGB(30, 31, 36), RGB(44, 46, 52), q.hover * .75f),
+                                      .cornerRadius = CLAY_CORNER_RADIUS(8),
+                                      .border = {.color = Mix(RGB(42, 44, 50), RGB(72, 76, 86), q.hover * .75f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    Tx(Fmt("Preview %dp", gPreviewRes), 12, C_TEXT, 0);
+                    Icon(I_CHEV_DN, 12, C_MUTED);
                 }
                 IconBtn(CLAY_ID("Loop"), I_LOOP, 30, 17, C_DIM, false, 8);
                 IconBtn(CLAY_ID("GridBtn"), I_GRID, 30, 17, C_DIM, false, 8);

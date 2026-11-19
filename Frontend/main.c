@@ -323,7 +323,7 @@ int main(void) {
         Clay_UpdateScrollContainers(false, (Clay_Vector2){0, GetMouseWheelMove() * 28.f}, gDt);
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
-        gCustN = 0; gHand = false; gCross = false; gResize = 0;
+        gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         Clay_RenderCommandArray cmds = BuildUI();
 
         if (gWindowAction == 1) MinimizeWindow();
@@ -340,7 +340,8 @@ int main(void) {
         RenderUI(cmds);
         EndDrawing();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
-                       gCross ? MOUSE_CURSOR_CROSSHAIR : gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
+                       gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :
+                       gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
     }
     CloseWindow();
     return 0;

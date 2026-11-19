@@ -59,7 +59,7 @@ enum {
     I_KF_DIAMOND, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
     I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
-    K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT
+    K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT, K_ROT_ICON
 };
 
 typedef struct { int kind; Clay_Color a, b, c; float v, f; int i; } Cust;
@@ -78,6 +78,8 @@ static float gFK[2] = {1.f, 1.f};   /* per-font size multiplier (normalises em s
 static float gDt;
 static bool  gHand, gCross;
 static int   gLeftTab = 0, gRightTab = 0;
+static int   gPreviewRes = 720;
+static float gMediaZoom = 1.f;
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
 #ifdef _WIN32
@@ -120,6 +122,7 @@ static int   gResize;                                 /* cursor: 0 normal, 1 hor
 
 /* values */
 static float gNum[4] = {0, 0, 100, 100};              /* X, Y, W, H */
+static float gMini[8];                                /* crop/distort numeric fields */
 static float gRot, gRotT; static bool gRotDrag;       /* degrees -180..180 */
 #define NSL 48
 static float gSl[NSL], gSlT[NSL]; static bool gSlDrag[NSL]; /* slider 0..1 (0 = opacity, 40/41 = fades) */
@@ -135,6 +138,7 @@ static int gEditValueLen;
 static double gLastValueClickTime;
 static bool gValueDragging;
 static float gValueDragX, gValueDragStart;
+static bool gScrubCursor;
 
 /* rotation ruler geometry (inside the 322px wide ruler box) */
 #define RULER_L 22.f
@@ -267,7 +271,19 @@ static void IconV(int k, float sz, Clay_Color c, float v) {
     CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},
                   .custom = {.customData = NC(k, c, c, c, v, 0, 0)}}) {}
 }
-static void Icon(int k, float sz, Clay_Color c) { IconV(k, sz, c, 1.f); }
+static void Icon(int k, float sz, Clay_Color c) { IconV(k, sz, c, k == I_RESET ? 0.f : 1.f); }
+
+static float ResetSpin(Clay_ElementId id, bool clicked) {
+    uint32_t key = id.id ^ 0xA511E9B3u;
+    float *progress = AnimPtr(key ^ 0x5BD1E995u, 0.f);
+    if (clicked) *progress = 1.f;
+    return -360.f * EaseIO(AnimLin(key, 0.f, 0.30f));
+}
+
+static void ResetIcon(Clay_ElementId id, float sz, Clay_Color c, bool clicked) {
+    CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},
+                  .custom = {.customData = NC(K_ROT_ICON, c, c, c, ResetSpin(id, clicked), 0, I_RESET)}}) {}
+}
 
 static bool IconBtn(Clay_ElementId id, int icon, float box, float isz, Clay_Color base, bool sel, float rad) {
     Bs b = Interact(id);
@@ -275,7 +291,8 @@ static bool IconBtn(Clay_ElementId id, int icon, float box, float isz, Clay_Colo
     Clay_Color bg = sel ? Mix(C_SEL, RGB(90, 95, 106), b.press * 0.6f) : RGBA(255, 255, 255, 14 * b.hover + 56 * b.press);
     CLAY(id, {.layout = {.sizing = {FIX(box), FIX(box)}, .childAlignment = AL_C},
               .backgroundColor = bg, .cornerRadius = CLAY_CORNER_RADIUS(rad)}) {
-        Icon(icon, isz, ic);
+        if (icon == I_RESET) ResetIcon(id, isz, ic, b.clicked);
+        else Icon(icon, isz, ic);
     }
     return b.clicked;
 }
