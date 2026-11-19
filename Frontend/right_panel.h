@@ -12,6 +12,10 @@ static float SlDefault(int gi) {
 static float gFxV[4][2];
 static float gFxSent[4][2];
 static bool gFxOn[4];
+static const char *gExtraFxNames[] = {"Sharpen", "Lens Distortion", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Fisheye", "Light Leak", "Mirror"};
+static const char *gExtraFxKeys[] = {"sharpen", "lens", "scanlines", "shake", "filmBurn", "halftone", "posterize", "fisheye", "lightLeak", "mirror"};
+#define EXTRA_FX_COUNT 10
+static bool gExtraFxOn[EXTRA_FX_COUNT];
 static int gFilter;
 
 static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
@@ -90,10 +94,17 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         defaults[i][1] = i == 0 ? second / 360.f + .5f : second / 100.f;
         for (int p = 0; p < 2; p++) gFxV[i][p] = gFxSent[i][p] = fmaxf(0.f, fminf(1.f, defaults[i][p]));
     }
+    for (int i = 0; i < EXTRA_FX_COUNT; i++) {
+        char path[96]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
+        gExtraFxOn[i] = false; PlutoJsonBoolPath(clipBegin, clipEnd, path, &gExtraFxOn[i]);
+    }
     char preset[32] = {0};
     gFilter = 0;
     if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.preset.id", preset, sizeof(preset)))
         for (int i = 0; i < 8; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
+    strcpy(gTransitionType, "none");
+    gTransitionDuration = PlutoReadNumber(clipBegin, clipEnd, "props.transitionOut.duration", 1.f);
+    PlutoJsonStringPath(clipBegin, clipEnd, "props.transitionOut.type", gTransitionType, sizeof(gTransitionType));
 
     for (int i = 0; i < 4; i++) {
         float value = PlutoReadNumber(clipBegin, clipEnd, audioPaths[i], i == 0 ? 100.f : 0.f);
@@ -871,6 +882,24 @@ static void FxBody(int i) {
     }
 }
 
+static void ExtraFxRow(int i) {
+    Clay_ElementId id = CLAY_IDI("FxExtra", i);
+    Bs b = Interact(id);
+    if (b.clicked) {
+        gExtraFxOn[i] = !gExtraFxOn[i];
+        char path[96]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
+        PlutoTimelineSetBoolProperty(path, gExtraFxOn[i]);
+    }
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(FX_ITEM_H)}, .padding = {14, 10, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
+              .backgroundColor = BtnBg(C_RCARD, RGB(38, 40, 46), b), .cornerRadius = CLAY_CORNER_RADIUS(12),
+              .border = {.color = Mix(C_RCARDB, RGB(70, 73, 81), b.hover * .55f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Icon(I_SPARKLE, 18, gExtraFxOn[i] ? C_TEXT : C_ICON);
+        Tx(gExtraFxNames[i], 15, C_TEXT, 0);
+        HSPACE
+        if (gExtraFxOn[i]) Icon(I_CHEV_DN, 14, C_TEXT); else Icon(I_PLUS, 14, C_ICON);
+    }
+}
+
 /* Effect rows use one small sparkle mark to keep the list visually quiet. */
 static bool FxHeader(int i, float open) {
     Clay_ElementId id = CLAY_IDI("FxHdr", i);
@@ -897,12 +926,33 @@ static bool FxHeader(int i, float open) {
     return b.clicked;
 }
 
-#define TRANS_DESC_H 46.f
+#define TRANS_DESC_H 210.f
+#define TRANS_EMPTY_H 46.f
 #define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
+static int TransitionNextClip(int from) {
+    if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track > 3) return -1;
+    float end = gTimelineClips[from].start + gTimelineClips[from].duration;
+    int best = -1;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        if (i == from || gTimelineClips[i].track != gTimelineClips[from].track) continue;
+        if (fabsf(gTimelineClips[i].start - end) <= .04f) { best = i; break; }
+    }
+    return best;
+}
+
+static void CommitTransition(void) {
+    char updates[256];
+    snprintf(updates, sizeof(updates), "[{\"path\":\"props.transitionOut.type\",\"value\":\"%s\"},{\"path\":\"props.transitionOut.duration\",\"value\":%.3f}]",
+             gTransitionType, (double)gTransitionDuration);
+    PlutoTimelineSetPropertiesJson(updates);
+}
+
 static void EffectsView(void) {
     /* ---- Transitions ---- */
+    int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
+    int next = TransitionNextClip(from);
     float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    float dh = roundf(o * TRANS_DESC_H);
+    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
@@ -916,7 +966,44 @@ static void EffectsView(void) {
         if (dh >= 1.f) {
             CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}}, .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
-                TxWrap("Place another clip right after this one to add a transition between them.", 14, C_MUTED, 0);
+                if (next < 0) {
+                    TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+                } else {
+                    TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                    const char *names[5] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris"};
+                    const char *keys[5] = {"none", "crossfade", "dip", "wipe", "iris"};
+                    for (int row = 0; row < 3; row++) {
+                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 8}}) {
+                            for (int col = 0; col < 2; col++) {
+                                int i = row * 2 + col;
+                                if (i >= 5) break;
+                                Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
+                                Bs cb = Interact(cid);
+                                bool selected = strcmp(gTransitionType, keys[i]) == 0;
+                                if (cb.clicked) { strcpy(gTransitionType, keys[i]); CommitTransition(); }
+                                CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
+                                          .backgroundColor = BtnBg(selected ? C_SEL : C_CARD, RGB(43, 45, 52), cb),
+                                          .cornerRadius = CLAY_CORNER_RADIUS(9),
+                                          .border = {.color = Mix(C_CARDB, C_ACCENT, selected ? .45f : cb.hover * .35f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                                    Tx(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
+                                }
+                            }
+                        }
+                    }
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
+                        Tx("Duration", 13, C_MUTED, 0); HSPACE; Tx(Fmt("%.1f s", gTransitionDuration), 13, C_TEXT, 0);
+                    }
+                    Clay_ElementId did = CLAY_ID("TransitionDuration");
+                    static bool durationDrag;
+                    if (Clay_PointerOver(did) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) durationDrag = true;
+                    if (durationDrag && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                        Clay_BoundingBox bb = Clay_GetElementData(did).boundingBox;
+                        if (bb.width > 1.f) gTransitionDuration = .1f + 1.9f * Clampf((GetMousePosition().x - bb.x) / bb.width, 0.f, 1.f);
+                    }
+                    if (durationDrag && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { durationDrag = false; CommitTransition(); }
+                    CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
+                               .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, (gTransitionDuration - .1f) / 1.9f, durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
+                }
             }
         }
     }
@@ -975,7 +1062,7 @@ static void EffectsView(void) {
         hb[i] = roundf(oi[i] * (FX_BODY_H + 8.f));
         sum += hb[i];
     }
-    float lh = roundf(ov * (10.f + 4.f * FX_ITEM_H + 3.f * 8.f + sum));
+    float lh = roundf(ov * (10.f + (4.f + EXTRA_FX_COUNT) * FX_ITEM_H + 13.f * 8.f + sum));
     CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId vid = CLAY_ID("VfxHdr");
         Bs vb = Interact(vid);
@@ -1001,6 +1088,7 @@ static void EffectsView(void) {
                             }
                         }
                     }
+                    for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
                 }
             }
         }

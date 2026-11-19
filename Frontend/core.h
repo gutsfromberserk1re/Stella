@@ -82,15 +82,25 @@ static bool  gHand, gCross;
 static int   gLeftTab = 0, gRightTab = 0;
 static int   gPreviewRes = 720;
 static bool  gPreviewMenuOpen;
+static float gPreviewMenuT;
 static bool  gPreviewDirty;
+static bool  gTimelineScrubbing;
 static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
 static Texture2D gPreviewFrame;
 static Rectangle gPreviewQualityRect;
 static float gMediaZoom = 1.f;
+static char gMediaHoverName[260];
+static Rectangle gMediaHoverRect;
 static int   gTimelineTool;
 static float gTimelineZoom = 1.f, gTimelinePan, gPlayhead;
-static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineLoop = true, gTimelineGrid;
+static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineGrid;
+static int gTransitionFocusClip = -1;
+static char gTransitionType[16] = "none";
+static float gTransitionDuration = 1.f;
+typedef struct { Rectangle rect; int clip; } TransitionButton;
+static TransitionButton gTransitionButtons[64];
+static int gTransitionButtonCount;
 static int   gTimelineSelected = -1, gMediaDragIndex = -1, gClipDragIndex = -1;
 static int   gClipDragTrack;
 static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
@@ -407,14 +417,3 @@ static void WheelInfo(Vector2 p, float *hue, float *len) {
     *len = sqrtf(p.x * p.x + p.y * p.y);
     *hue = fmodf(atan2f(p.y, p.x) * RAD2DEG + 90.f + 360.f, 360.f);
 }
-
-/* media table (needed by the thumbnail renderer) */
-typedef struct { const char *name, *dur; Clay_Color sky1, sky2, mtn; int style; const char *label; } MediaItem;
-static const MediaItem kMedia[6] = {
-    {"Coastal morning.mp4",  "0:12", {86, 172, 200, 255}, {150, 214, 224, 255}, {70, 82, 104, 255}, 0, "COASTAL MORNING"},
-    {"City at dusk.mp4",     "0:09", {96, 48, 130, 255},  {186, 98, 160, 255},  {46, 30, 76, 255},  0, "CITY AT DUSK"},
-    {"Forest trail.mp4",     "0:15", {48, 128, 108, 255}, {118, 188, 150, 255}, {26, 58, 62, 255},  0, "FOREST TRAIL"},
-    {"Desert still.jpg",     "0:06", {126, 138, 154, 255}, {190, 196, 206, 255}, {76, 82, 100, 255}, 0, "DESERT STILL"},
-    {"Night harbor.jpg",     "0:06", {38, 38, 88, 255},   {62, 52, 112, 255},   {28, 28, 54, 255},  0, "NIGHT HARBOR"},
-    {"Ambient soundtrack.wav", "0:24", {150, 40, 150, 255}, {255, 134, 92, 255}, {0, 0, 0, 255},     1, NULL},
-};

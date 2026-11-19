@@ -25,6 +25,7 @@ static void CenterPanel(void) {
             gPreviewMenuOpen = false;
         }
     }
+    gPreviewMenuT = EaseIO(AnimLin(CLAY_ID("PreviewMenuAnim").id, gPreviewMenuOpen ? 1.f : 0.f, .16f));
     Clay_BoundingBox pb = Clay_GetElementData(CLAY_ID("PreviewArea")).boundingBox;
     float aw = pb.width - 28, ah = pb.height - 28;
     if (aw < 60 || ah < 60) { aw = 640; ah = 360; }
@@ -70,7 +71,6 @@ static void CenterPanel(void) {
                     Tx(Fmt("%dp", gPreviewRes), 13, C_TEXT, 0);
                     Icon(I_CHEV_DN, 12, C_MUTED);
                 }
-                if (IconBtn(CLAY_ID("Loop"), I_LOOP, 30, 17, C_DIM, gTimelineLoop, 8)) gTimelineLoop = !gTimelineLoop;
                 if (IconBtn(CLAY_ID("GridBtn"), I_GRID, 30, 17, C_DIM, gTimelineGrid, 8)) gTimelineGrid = !gTimelineGrid;
             }
         }

@@ -242,6 +242,14 @@ fn project_duration(timeline: &Timeline) -> f64 {
     timeline.clips.iter().map(Clip::end).fold(0.0, f64::max)
 }
 
+fn transition_out(clip: &Clip) -> Option<(String, f64)> {
+    let transition = &clip.extra["props"]["transitionOut"];
+    let kind = transition["type"].as_str()?.to_owned();
+    if kind == "none" { return None; }
+    let duration = transition["duration"].as_f64().filter(|v| v.is_finite()).unwrap_or(1.0).max(0.05).min(clip.duration.min(3.0).max(0.05));
+    Some((kind, duration))
+}
+
 fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<(String, Vec<(String, bool)>, f64, bool), String> {
     let duration = project_duration(timeline);
     if duration <= 0.0 { return Err("Add at least one clip before exporting".into()); }
@@ -255,7 +263,14 @@ fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -
     let mut base = "base0".to_owned();
     for (n, clip) in video_clips.iter().enumerate() {
         let value = serde_json::to_value(*clip).map_err(|e| e.to_string())?;
-        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
+        let adjacent = |a: &Clip, b: &Clip| a.track == b.track && (a.end() - b.start).abs() <= 0.04;
+        let incoming = if n > 0 && adjacent(video_clips[n - 1], clip) { transition_out(video_clips[n - 1]) } else { None };
+        let has_next = n + 1 < video_clips.len() && adjacent(clip, video_clips[n + 1]);
+        let outgoing = if has_next { transition_out(clip) } else { None };
+        let (render_start, render_length) = incoming.as_ref().map_or((clip.start, clip.duration), |(_, d)| (clip.start - d, clip.duration + d));
+        let transition_in = incoming.as_ref().map(|(kind, d)| (kind.as_str(), *d));
+        let transition_out = outgoing.as_ref().map(|(kind, d)| (kind.as_str(), *d));
+        let (filters, x, y) = filters::video_filters(&value, width, height, render_start, render_length, transition_in, transition_out);
         let input = indices[&clip.id];
         let layer = format!("v{n}");
         let next = format!("base{}", n + 1);
@@ -334,12 +349,16 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
     let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
     let height = request["height"].as_u64().unwrap_or(720).clamp(240, 1080) as u32;
     let width = ((height as f64 * 16.0 / 9.0).round() as u32) & !1;
-    let mut active: Vec<_> = timeline.clips.iter().filter(|clip| clip.track.is_video() && clip.start <= at && at < clip.end()
+    let adjacent_transition = |clip: &Clip| timeline.clips.iter().find(|previous| previous.track == clip.track && (previous.end() - clip.start).abs() <= 0.04).and_then(transition_out);
+    let mut active: Vec<_> = timeline.clips.iter().filter(|clip| {
+        let transition_start = adjacent_transition(clip).map(|(_, d)| clip.start - d);
+        clip.track.is_video() && (clip.start <= at && at < clip.end() || transition_start.is_some_and(|start| start <= at && at < clip.end()))
         && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
-        && clip.extra.get("path").and_then(Value::as_str).is_some()).collect();
+        && clip.extra.get("path").and_then(Value::as_str).is_some()
+    }).collect();
     active.sort_by(|a, b| {
         let order = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
-        order(a.track).cmp(&order(b.track))
+        order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     let out = std::env::temp_dir().join("pluto-media-cache").join(format!("preview-{id}.png"));
     std::fs::create_dir_all(out.parent().ok_or("Invalid preview cache path")?).map_err(|e| e.to_string())?;
@@ -351,12 +370,36 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
         let image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
         let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
-        let source_at = source_offset + (at - clip.start).max(0.0);
+        let incoming = adjacent_transition(clip);
+        let render_start = incoming.as_ref().map_or(clip.start, |(_, d)| clip.start - d);
+        let source_at = source_offset + (at - render_start).max(0.0);
         let input = inputs.len();
         inputs.push((path, image, source_at));
         let mut value = serde_json::to_value(*clip).map_err(|e| e.to_string())?;
         value["sourceOffset"] = json!(0.0);
-        let (vf, x, y) = filters::video_filters(&value, width, height, 0.0, 1.0 / 30.0, None, None);
+        let (mut vf, x, y) = filters::video_filters(&value, width, height, 0.0, 1.0 / 30.0, None, None);
+        if let Some((kind, duration)) = incoming.as_ref().filter(|_| at < clip.start) {
+            let progress = ((at - render_start) / duration).clamp(0.0, 1.0);
+            if kind.as_str() == "wipe" {
+                vf.push_str(&format!(",geq=a='alpha(X,Y)*if(lte(X/W,{progress:.5}),1,0)'"));
+            } else if kind.as_str() == "iris" {
+                vf.push_str(&format!(",geq=a='alpha(X,Y)*if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.5*{progress:.5}),1,0)'"));
+            } else if kind.as_str() == "dip" {
+                if progress < 0.5 { vf.push_str(",colorchannelmixer=aa=0"); }
+                else {
+                    let brightness = ((progress - 0.5) * 2.0).clamp(0.0, 1.0);
+                    vf.push_str(&format!(",lutrgb=r='val*{brightness:.5}':g='val*{brightness:.5}':b='val*{brightness:.5}'"));
+                }
+            } else {
+                vf.push_str(&format!(",colorchannelmixer=aa={progress:.5}"));
+            }
+        } else if let Some((_kind, duration)) = transition_out(clip).filter(|(kind, _)| kind.as_str() == "dip") {
+            if at >= clip.end() - duration {
+                let progress = ((at - (clip.end() - duration)) / duration).clamp(0.0, 1.0);
+                let brightness = (1.0 - progress * 2.0).clamp(0.0, 1.0);
+                vf.push_str(&format!(",lutrgb=r='val*{brightness:.5}':g='val*{brightness:.5}':b='val*{brightness:.5}'"));
+            }
+        }
         let label = format!("pv{n}");
         let next = format!("base{}", n + 1);
         graph.push(format!("[{input}:v]{vf}[{label}]"));

@@ -6,8 +6,7 @@ static void ValBox(const char *s, const char *unit, float w, float h, float fs, 
 static void SliderLogic(Clay_ElementId id, int gi, float kr);
 
 static void MediaView(void) {
-    static int lastMediaClick = -1;
-    static double lastMediaClickAt;
+    gMediaHoverName[0] = 0;
     Clay_BoundingBox mediaBox = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     Vector2 mouse = GetMousePosition();
@@ -16,16 +15,16 @@ static void MediaView(void) {
         mouse.y >= mediaBox.y && mouse.y <= mediaBox.y + mediaBox.height) {
         gMediaZoom += wheel > 0.f ? .1f : -.1f;
         if (gMediaZoom < .65f) gMediaZoom = .65f;
-        if (gMediaZoom > 1.4f) gMediaZoom = 1.4f;
+        if (gMediaZoom > 2.2f) gMediaZoom = 2.2f;
     }
     if (gLeftTab == 0) {
-        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) gMediaZoom = fminf(1.4f, gMediaZoom + .1f);
+        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) gMediaZoom = fminf(2.2f, gMediaZoom + .1f);
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) gMediaZoom = fmaxf(.65f, gMediaZoom - .1f);
     }
     int columns = (int)floorf((mediaBox.width - 18.f) / (100.f * gMediaZoom + 9.f));
     if (columns < 1) columns = 1;
     if (columns > 3) columns = 3;
-    int mediaCount = 6 + gImportedCount;
+    int mediaCount = gImportedCount;
     int rows = (mediaCount + columns - 1) / columns;
     CLAY(CLAY_ID("MediaCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9}}) {
         Clay_ElementId sid = CLAY_ID("Search");
@@ -35,34 +34,39 @@ static void MediaView(void) {
             Icon(I_SEARCH, 19, Mix(C_MUTED, C_TEXT, sb.hover * .6f));
             Tx("Search media", 16, C_MUTED, 0);
         }
+        if (mediaCount == 0) {
+            CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 10, 0, 0}, .childGap = 5}}) {
+                Tx("Your media will appear here", 14, C_MUTED, 0);
+                Tx("Import a file to get started.", 13, C_MUTED, 0);
+            }
+        }
         for (int row = 0; row < rows; row++) {
             CLAY(CLAY_IDI("MRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 9}}) {
                 for (int col = 0; col < columns; col++) {
                     int i = row * columns + col;
                     if (i >= mediaCount) break;
-                    bool imported = i >= 6;
-                    const MediaItem *m = imported ? NULL : &kMedia[i];
-                    const char *name = imported ? gImported[i - 6].name : m->name;
-                    const char *duration = imported ? Fmt("%d:%02d", (int)gImported[i - 6].duration / 60, (int)gImported[i - 6].duration % 60) : m->dur;
-                    Clay_Color sky1 = imported ? RGB(52, 66, 80) : m->sky1;
-                    Clay_Color sky2 = imported ? RGB(92, 103, 116) : m->sky2;
-                    Clay_Color mountain = imported ? RGB(44, 50, 60) : m->mtn;
-                    int style = imported ? 1 : m->style;
+                    ImportedMedia *m = &gImported[i];
+                    const char *name = m->name;
+                    const char *duration = Fmt("%d:%02d", (int)m->duration / 60, (int)m->duration % 60);
                     CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
                         Clay_ElementId tid = CLAY_IDI("Thumb", i);
                         Bs b = Interact(tid);
-                        if (imported && Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i - 6;
+                        Clay_BoundingBox tb = Clay_GetElementData(tid).boundingBox;
+                        if (Clay_PointerOver(tid)) {
+                            strncpy(gMediaHoverName, name, sizeof(gMediaHoverName) - 1);
+                            gMediaHoverName[sizeof(gMediaHoverName) - 1] = 0;
+                            gMediaHoverRect = (Rectangle){tb.x, tb.y, tb.width, tb.height};
+                        }
+                        if (Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i;
                         if (b.clicked) gMediaSelected = i;
                         CLAY(tid, {.layout = {.sizing = {GROW, FIX(92.f * gMediaZoom)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
                                    .border = {.color = gMediaSelected == i ? C_TEXT : RGBA(0, 0, 0, 0), .width = CLAY_BORDER_OUTSIDE(gMediaSelected == i ? 2 : 0)},
-                                   .custom = {.customData = NC(K_THUMB, sky1, sky2, mountain, 0, b.hover,
-                                                               style | ((imported ? i - 6 : i) << 4) | (imported ? 0x1000 : 0))}}) {
+                                   .custom = {.customData = NC(K_THUMB, C_CARD, C_CARD, C_CARD, 0, b.hover, 0x1000 | (i << 4))}}) {
                             CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .padding = {5, 5, 1, 2}},
                                           .backgroundColor = RGBA(0, 0, 0, 150), .cornerRadius = CLAY_CORNER_RADIUS(5)}) {
                                 Tx(duration, 12.5f, C_TEXT, 1);
                             }
                         }
-                        Tx(name, 14, Mix(C_MUTED, C_DIM, b.hover), 0);
                     }
                 }
             }

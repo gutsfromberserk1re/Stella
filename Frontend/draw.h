@@ -135,7 +135,7 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
     case I_CHEV_DN: LN(.25, .38, .5, .62); LN(.5, .62, .75, .38); break;
     case I_SEARCH:  Ring(P(.44, .44), .28 * w, t, c); LN(.65, .65, .88, .88); break;
     case I_LIBRARY: StrokeRR((Rectangle){x + .1f * w, y + .15f * h, .8f * w, .7f * h}, .12f * w, t, c);
-                    LN(.32, .15, .32, .85); LN(.68, .15, .68, .85); LN(.1, .5, .9, .5); break;
+                    LN(.31, .15, .31, .85); LN(.31, .38, .87, .38); LN(.31, .62, .87, .62); break;
     case I_UNDO:    Arc(P(.5, .58), .3f * w, t, 215, 450, c); LN(.254, .408, .254, .2); LN(.254, .408, .47, .408); break;
     case I_REDO:    Arc(P(.5, .58), .3f * w, t, 90, 325, c);  LN(.746, .408, .746, .2); LN(.746, .408, .53, .408); break;
     case I_EXPORT:  LN(.5, .62, .5, .14); LN(.5, .14, .32, .32); LN(.5, .14, .68, .32);
@@ -226,7 +226,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     }
     switch (cu->kind) {
     case K_THUMB: {
-        int style = cu->i & 15, idx = (cu->i >> 4) & 255;
+        int idx = (cu->i >> 4) & 255;
         bool imported = (cu->i & 0x1000) != 0;
         bool hasTexture = imported && idx < gImportedCount && gImported[idx].thumbnail.id != 0;
         if (hasTexture) {
@@ -239,14 +239,6 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             DrawTexturePro(tex, src, r, (Vector2){0, 0}, 0.f, WHITE);
         } else {
             GradRR(r, 10, RC(cu->a), RC(cu->b));
-        }
-        if (style == 0 && !imported) {
-            DrawCircleV((Vector2){r.x + .72f * r.width, r.y + .30f * r.height}, r.height * .17f, (Color){250, 228, 150, 255});
-            Color m = RC(cu->c);
-            Tri((Vector2){r.x + .06f * r.width, r.y + r.height}, (Vector2){r.x + .30f * r.width, r.y + .40f * r.height}, (Vector2){r.x + .62f * r.width, r.y + r.height}, m);
-            Tri((Vector2){r.x + .36f * r.width, r.y + r.height}, (Vector2){r.x + .64f * r.width, r.y + .48f * r.height}, (Vector2){r.x + .94f * r.width, r.y + r.height}, LerpC(m, WHITE, .10f));
-            const char *lab = kMedia[idx].label;
-            if (lab) TxtAt(1, lab, r.x + 7, r.y + r.height - 37, 6, (Color){240, 240, 244, 235});
         }
         FillRR(r, 10, (Color){255, 255, 255, U8(20 * cu->f)});
         StrokeRR(r, 10, 1, (Color){255, 255, 255, U8(20 + 60 * cu->f)});
@@ -430,6 +422,22 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
         StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){148, 105, 178, 255});
+        if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
+            TimelineClipUi *clip = &gTimelineClips[clipIndex];
+            for (int k = 0; k < clip->keyframeCount; k++) {
+                float time = clip->keyframes[k];
+                if (time < clip->start || time > clip->start + clip->duration) continue;
+                float x = r.x + (time - clip->start) / fmaxf(.001f, clip->duration) * r.width;
+                float y = r.y + 13.f, half = 5.5f;
+                Color key = fabsf(time - gPlayhead) < (1.f / 60.f) ? (Color){255, 255, 255, 255} : (Color){226, 219, 247, 245};
+                Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};
+                DrawTriangle(a, d, b, key); DrawTriangle(c, b, d, key);
+                DrawLineEx(a, b, 1.f, (Color){72, 58, 90, 255});
+                DrawLineEx(b, c, 1.f, (Color){72, 58, 90, 255});
+                DrawLineEx(c, d, 1.f, (Color){72, 58, 90, 255});
+                DrawLineEx(d, a, 1.f, (Color){72, 58, 90, 255});
+            }
+        }
     } break;
 
     case K_SCROLLBAR: {
@@ -576,33 +584,57 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         DrawRectangleRec((Rectangle){gPHPos.x - 5, gPHPos.y - 4, 10, 8}, red);
         Tri((Vector2){gPHPos.x - 5, gPHPos.y + 4}, (Vector2){gPHPos.x + 5, gPHPos.y + 4}, (Vector2){gPHPos.x, gPHPos.y + 10}, red);
     }
+    for (int i = 0; i < gTransitionButtonCount; i++) {
+        Rectangle r = gTransitionButtons[i].rect;
+        bool hover = CheckCollisionPointRec(GetMousePosition(), r);
+        if (hover) gHand = true;
+        DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f, hover ? (Color){62, 67, 78, 255} : (Color){30, 32, 38, 245});
+        DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f), r.width * .5f, (Color){112, 116, 126, 255});
+        DrawLineEx((Vector2){r.x + 6.f, r.y + 11.f}, (Vector2){r.x + 16.f, r.y + 11.f}, 1.7f, WHITE);
+        DrawLineEx((Vector2){r.x + 11.f, r.y + 6.f}, (Vector2){r.x + 11.f, r.y + 16.f}, 1.7f, WHITE);
+    }
     if (gFadeA > 2.f && gFadeR.width > 0.f)
         GradRR(gFadeR, 22, (Color){28, 29, 32, U8(gFadeA)}, (Color){21, 22, 24, U8(gFadeA)});
     if (gLFadeA > 2.f && gLFadeR.width > 0.f)
         FillRR(gLFadeR, 0, (Color){23, 24, 28, U8(gLFadeA)});   /* = C_PANEL */
     if (gSB) FillRR(gSBR, 2, (Color){92, 95, 104, 255});
+    if (gMediaHoverName[0] && gMediaHoverRect.width > 0.f) {
+        Vector2 mouse = GetMousePosition();
+        Font font = FontPx(0, PxOf(0, 13.f));
+        Vector2 text = MeasureTextEx(font, gMediaHoverName, (float)font.baseSize, 0.f);
+        float tw = fminf(text.x, 330.f), th = fmaxf(22.f, text.y + 8.f);
+        Rectangle tip = {mouse.x + 14.f, mouse.y + 16.f, tw + 18.f, th};
+        if (tip.x + tip.width > GetScreenWidth() - 6.f) tip.x = mouse.x - tip.width - 12.f;
+        if (tip.y + tip.height > GetScreenHeight() - 6.f) tip.y = mouse.y - tip.height - 12.f;
+        FillRR(tip, 6.f, (Color){27, 28, 32, 245});
+        StrokeRR(tip, 6.f, 1.f, (Color){68, 70, 78, 245});
+        TxtAt(0, gMediaHoverName, tip.x + 9.f, tip.y + 4.f, 13.f, (Color){237, 237, 240, 255});
+    }
 }
 
 static void DrawPreviewQualityDropdown(void) {
-    if (!gPreviewMenuOpen || gPreviewQualityRect.width <= 0.f) return;
+    float t = gPreviewMenuT;
+    if (t < .01f || gPreviewQualityRect.width <= 0.f) return;
     const int options[] = {240, 360, 480, 720, 1080};
     Rectangle box = {gPreviewQualityRect.x + gPreviewQualityRect.width - 96.f,
-                     gPreviewQualityRect.y - 166.f, 96.f, 160.f};
+                     gPreviewQualityRect.y - 166.f + 8.f * (1.f - t), 96.f, 160.f};
     Vector2 mouse = GetMousePosition();
     bool over = mouse.x >= box.x && mouse.x <= box.x + box.width && mouse.y >= box.y && mouse.y <= box.y + box.height;
-    if (over) gHand = true;
-    FillRR(box, 9.f, (Color){24, 25, 28, 255});
-    StrokeRR(box, 9.f, 1.f, (Color){54, 56, 62, 255});
+    if (over && gPreviewMenuOpen) gHand = true;
+    FillRR(box, 9.f, (Color){24, 25, 28, U8(255.f * t)});
+    StrokeRR(box, 9.f, 1.f, (Color){54, 56, 62, U8(255.f * t)});
     for (int i = 0; i < 5; i++) {
         Rectangle row = {box.x + 4.f, box.y + 4.f + i * 30.f, box.width - 8.f, 28.f};
-        bool rowHover = mouse.x >= row.x && mouse.x <= row.x + row.width && mouse.y >= row.y && mouse.y <= row.y + row.height;
-        if (options[i] == gPreviewRes) FillRR(row, 6.f, (Color){45, 47, 53, 255});
-        else if (rowHover) FillRR(row, 6.f, (Color){37, 39, 44, 255});
+        bool rowHover = gPreviewMenuOpen && mouse.x >= row.x && mouse.x <= row.x + row.width && mouse.y >= row.y && mouse.y <= row.y + row.height;
+        if (options[i] == gPreviewRes) FillRR(row, 6.f, (Color){45, 47, 53, U8(255.f * t)});
+        else if (rowHover) FillRR(row, 6.f, (Color){37, 39, 44, U8(255.f * t)});
         char label[16]; snprintf(label, sizeof(label), "%dp", options[i]);
-        TxtAt(0, label, row.x + 12.f, row.y + 6.f, 13.f, options[i] == gPreviewRes ? RC(C_TEXT) : RC(C_DIM));
+        Color txt = options[i] == gPreviewRes ? RC(C_TEXT) : RC(C_DIM); txt.a = U8(txt.a * t);
+        TxtAt(0, label, row.x + 12.f, row.y + 6.f, 13.f, txt);
         if (options[i] == gPreviewRes) {
-            DrawLineEx((Vector2){row.x + row.width - 17.f, row.y + 14.f}, (Vector2){row.x + row.width - 13.f, row.y + 18.f}, 1.6f, (Color){224, 226, 231, 255});
-            DrawLineEx((Vector2){row.x + row.width - 13.f, row.y + 18.f}, (Vector2){row.x + row.width - 7.f, row.y + 10.f}, 1.6f, (Color){224, 226, 231, 255});
+            Color check = (Color){224, 226, 231, U8(255.f * t)};
+            DrawLineEx((Vector2){row.x + row.width - 17.f, row.y + 14.f}, (Vector2){row.x + row.width - 13.f, row.y + 18.f}, 1.6f, check);
+            DrawLineEx((Vector2){row.x + row.width - 13.f, row.y + 18.f}, (Vector2){row.x + row.width - 7.f, row.y + 10.f}, 1.6f, check);
         }
     }
 }

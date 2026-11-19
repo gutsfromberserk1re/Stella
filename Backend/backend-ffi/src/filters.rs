@@ -123,24 +123,25 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         let sharpen = &effects["sharpen"];
         let radius = (n(sharpen, "radius", 5.0).round() as i32).clamp(3, 23) | 1;
         let threshold = 1.0 - n(sharpen, "threshold", 10.0).clamp(0.0, 100.0) / 125.0;
-        let amount = n(sharpen, "amount", 0.0) / 100.0 * threshold;
+        let amount = n(sharpen, "amount", 45.0) / 100.0 * threshold;
         filters.push(format!("unsharp={radius}:{radius}:{amount:.3}:5:5:0"));
     }
     for key in ["lens", "fisheye"] {
         if enabled(effects, key) {
-            let amount = n(&effects[key], "amount", 0.0) / 100.0 * 0.22 * n(&effects[key], "blend", 100.0) / 100.0;
+            let fallback = if key == "lens" { 55.0 } else { 40.0 };
+            let amount = n(&effects[key], "amount", fallback) / 100.0 * 0.22 * n(&effects[key], "blend", 100.0) / 100.0;
             filters.push(format!("lenscorrection=cx=0.5:cy=0.5:k1={amount:.4}:k2=0"));
             let zoom = (n(&effects[key], "scale", 100.0) / 100.0).clamp(0.5, 1.5);
             if (zoom - 1.0).abs() > 0.001 { filters.push(format!("scale=iw*{zoom:.4}:ih*{zoom:.4}")); }
         }
     }
-    if enabled(effects, "scanlines") { filters.push(format!("drawgrid=width=iw:height={}:thickness=1:color=black@{:.3}", n(&effects["scanlines"], "spacing", 3.0).max(1.0), (n(&effects["scanlines"], "amount", 0.0) / 100.0).clamp(0.0, 1.0))); }
+    if enabled(effects, "scanlines") { filters.push(format!("drawgrid=width=iw:height={}:thickness=1:color=black@{:.3}", n(&effects["scanlines"], "spacing", 4.0).max(1.0), (n(&effects["scanlines"], "amount", 32.0) / 100.0).clamp(0.0, 1.0))); }
     if enabled(effects, "shake") {
         // Motion is added to the overlay coordinates below, based on this enabled value.
     }
     if enabled(effects, "filmBurn") {
         let burn = &effects["filmBurn"];
-        let amount = n(burn, "amount", 0.0) / 100.0 * 0.34;
+        let amount = n(burn, "amount", 42.0) / 100.0 * 0.34;
         let warmth = n(burn, "warmth", 0.0) / 100.0;
         let spread = (0.12 + n(burn, "edge", 38.0) / 100.0 * 0.72).clamp(0.12, 0.84);
         let flicker = n(burn, "flicker", 12.0) / 100.0 * 0.45;
@@ -149,7 +150,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     }
     if enabled(effects, "lightLeak") {
         let leak = &effects["lightLeak"];
-        let amount = n(leak, "amount", 0.0) / 100.0 * 0.5;
+        let amount = n(leak, "amount", 40.0) / 100.0 * 0.5;
         let warmth = n(leak, "warmth", 70.0) / 100.0;
         let position = n(leak, "position", 35.0) / 100.0;
         let radius = (0.14 + warmth * 0.38).clamp(0.14, 0.52);
@@ -172,11 +173,12 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         let target = n(posterize, "levels", 6.0).clamp(2.0, 16.0);
         if blend > 0.0 { filters.push(format!("posterize=levels={:.0}", (16.0 - (16.0 - target) * blend).clamp(2.0, 16.0))); }
     }
+    if enabled(effects, "mirror") { filters.push("hflip".into()); }
 
     if let Some((kind, transition_duration)) = transition_in {
         let d = transition_duration.clamp(0.05, length.max(0.05));
         if kind == "dip" {
-            filters.push(format!("fade=t=in:st={start:.5}:d={:.5}", (d / 2.0).max(0.025)));
+            filters.push(format!("fade=t=in:st={:.5}:d={:.5}", start + d / 2.0, (d / 2.0).max(0.025)));
         } else if kind == "wipe" {
             filters.push(format!("geq=a='alpha(X,Y)*if(lte(X/W,min(max((T-{start:.5})/{d:.5},0),1)),1,0)'"));
         } else if kind == "iris" {
@@ -187,7 +189,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     }
     if let Some((kind, transition_duration)) = transition_out {
         let d = transition_duration.clamp(0.05, length.max(0.05));
-        if kind == "dip" { filters.push(format!("fade=t=out:st={:.5}:d={:.5}", start + length - d / 2.0, (d / 2.0).max(0.025))); }
+        if kind == "dip" { filters.push(format!("fade=t=out:st={:.5}:d={:.5}", start + length - d, (d / 2.0).max(0.025))); }
         filters.push(format!("tpad=stop_mode=clone:stop_duration={d:.5}"));
     }
 
@@ -210,7 +212,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let x = n(&transform["position"], "x", 0.0) * width as f64 / 1920.0;
     let y = n(&transform["position"], "y", 0.0) * height as f64 / 1080.0;
     let (shake_x, shake_y) = if enabled(effects, "shake") {
-        let amount = n(&effects["shake"], "amount", 0.0) * width as f64 / 1920.0 * 0.18;
+        let amount = n(&effects["shake"], "amount", 18.0) * width as f64 / 1920.0 * 0.18;
         let freq = (n(&effects["shake"], "frequency", 8.0) * (1.0 - n(&effects["shake"], "smoothness", 35.0) / 120.0)).max(0.5);
         (format!("+sin(2*PI*t*{freq:.3})*{amount:.3}"), format!("+cos(2*PI*t*{freq:.3})*{amount:.3}"))
     } else { (String::new(), String::new()) };

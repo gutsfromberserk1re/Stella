@@ -1,12 +1,12 @@
 
-name: Build Pluto UI and Rust backend
+name: Build Stella for Windows
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  rust-backend:
+  windows-package:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -20,20 +20,6 @@ jobs:
 
       - name: Build Rust C ABI backend
         run: cargo build --release --manifest-path Backend/Cargo.toml -p pluto-backend-ffi
-
-      - name: Upload Rust backend DLL
-        uses: actions/upload-artifact@v4
-        with:
-          name: pluto-rust-backend
-          path: Backend/target/release/pluto_backend.dll
-
-  build:
-    runs-on: windows-latest
-    needs: rust-backend
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
       - name: Install UCRT64 build tools
         uses: msys2/setup-msys2@v2
@@ -101,7 +87,7 @@ jobs:
 
           cat > ci-build/CMakeLists.txt <<'CMAKE'
           cmake_minimum_required(VERSION 3.22)
-          project(PlutoUI C)
+          project(StellaUI C RC)
 
           set(CMAKE_C_STANDARD 99)
           set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -120,23 +106,27 @@ jobs:
           endif()
 
           add_executable(
-              UI
+              Stella
               "${CMAKE_CURRENT_LIST_DIR}/../${UI_SOURCE_FILE}"
           )
 
-          target_include_directories(UI PRIVATE
+          file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/../Icons/Logo/Pluto.ico" STELLA_ICON)
+          file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/Stella.rc" "1 ICON \"${STELLA_ICON}\"\n")
+          target_sources(Stella PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/Stella.rc")
+
+          target_include_directories(Stella PRIVATE
               "${CMAKE_CURRENT_LIST_DIR}/.."
               "${CMAKE_CURRENT_LIST_DIR}/../Frontend"
           )
 
-          target_link_libraries(UI PRIVATE raylib)
+          target_link_libraries(Stella PRIVATE raylib)
 
           if(MINGW)
-              target_link_options(UI PRIVATE -static -static-libgcc -mwindows)
-              target_link_libraries(UI PRIVATE opengl32 gdi32 winmm comdlg32)
+              target_link_options(Stella PRIVATE -static -static-libgcc -mwindows)
+              target_link_libraries(Stella PRIVATE opengl32 gdi32 winmm comdlg32)
           endif()
 
-          set_target_properties(UI PROPERTIES
+          set_target_properties(Stella PROPERTIES
               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dist"
           )
           CMAKE
@@ -152,23 +142,48 @@ jobs:
 
           ccache --show-stats
 
-          test -f ci-build/out/dist/UI.exe
+          test -f ci-build/out/dist/Stella.exe
 
-      - name: Download Rust backend DLL
-        uses: actions/download-artifact@v4
-        with:
-          name: pluto-rust-backend
-          path: ci-build/out/dist
+      - name: Package Rust backend
+        shell: pwsh
+        run: Copy-Item Backend\target\release\pluto_backend.dll ci-build\out\dist\pluto_backend.dll -Force
 
       - name: Package UI icons
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path ci-build/out/dist/Icons -Force | Out-Null
           Copy-Item -Path Icons\* -Destination ci-build/out/dist/Icons -Recurse -Force
+          Copy-Item Icons\Logo\Pluto.ico ci-build/out/dist/Icons/Logo/Stella.ico -Force
 
-      - name: Upload UI.exe
+      - name: Bundle FFmpeg runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64'
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $bin = Get-ChildItem -LiteralPath $extract -Directory -Filter bin -Recurse | Select-Object -First 1
+          if (-not $bin) { throw 'FFmpeg archive did not contain a bin directory' }
+          $dest = Join-Path (Resolve-Path ci-build/out/dist).Path 'ffmpeg'
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Copy-Item -Path (Join-Path $bin.FullName '*') -Destination $dest -Recurse -Force
+          Copy-Item -LiteralPath LICENSE -Destination (Join-Path $dest 'LICENSE-GPL-3.txt') -Force
+          Get-ChildItem -LiteralPath $extract -Recurse -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|README)' } | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Force
+          }
+          $notice = @'
+          FFmpeg is provided by BtbN/FFmpeg-Builds using a GPL shared Windows x64 build.
+          Source and corresponding build project: https://github.com/FFmpeg/FFmpeg and https://github.com/BtbN/FFmpeg-Builds
+          Build archive: ffmpeg-master-latest-win64-gpl-shared.zip (resolved at workflow run time)
+          FFmpeg is licensed under the GNU General Public License version 3 or later.
+          This package includes FFmpeg executable files and their shared runtime DLLs.
+          '@
+          $notice | Set-Content -LiteralPath (Join-Path $dest 'THIRD_PARTY_NOTICES.txt') -Encoding UTF8
+
+      - name: Upload Stella Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: PlutoUI-Windows
+          name: Stella-Windows-x64
           path: ci-build/out/dist/*
           if-no-files-found: error

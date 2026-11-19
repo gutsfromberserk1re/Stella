@@ -146,7 +146,7 @@ static void TopBar(void) {
             CLAY(CLAY_ID("Logo"), {.layout = {.sizing = {FIX(24), FIX(24)}}, .backgroundColor = RGB(20, 21, 25),
                                    .cornerRadius = CLAY_CORNER_RADIUS(6), .border = {.color = RGB(64, 66, 73), .width = CLAY_BORDER_OUTSIDE(1)}}) {}
             GAPX(14)
-            Tx("Pluto", 15, C_TEXT, 1);
+            Tx("Stella", 15, C_TEXT, 1);
             GAPX(40)
             Tx("Untitled Project", 13, C_DIM, 0);
         }
@@ -289,13 +289,18 @@ int main(void) {
     SetProcessDPIAware();
 #endif
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
-    InitWindow(1600, 967, "Pluto");   /* borderless custom title bar; 967 px tall => Transform fits */
+    InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
     LoadUiIcons();
     if (PlutoBackendLoad()) PlutoTimelineCall("{\"command\":\"timeline_get\"}");
     SetWindowMinSize(1180, 720);
 #ifdef _WIN32
     HWND hwnd = (HWND)GetWindowHandle();
     if (hwnd) {
+        HICON appIcon = (HICON)LoadImageA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        if (appIcon) {
+            SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)appIcon);
+            SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)appIcon);
+        }
         gPreviousWndProc = (WNDPROC)(LONG_PTR)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
         if (gPreviousWndProc) SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)PlutoWindowProc);
     }
@@ -328,12 +333,17 @@ int main(void) {
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gEditValueId == 0 && !gTimelinePlaying && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))) {
+            float frame = floorf(gPlayhead * 30.f + .5f);
+            frame += IsKeyPressed(KEY_RIGHT) ? 1.f : -1.f;
+            gPlayhead = fmaxf(0.f, fminf(TimelineDuration(), frame / 30.f));
+            gPreviewDirty = true;
+        }
         if (gTimelinePlaying) {
             float end = TimelineDuration();
-            gPlayhead += gDt;
+            gPlayhead = floorf((gPlayhead + gDt) * 30.f + .5f) / 30.f;
             if (gPlayhead >= end) {
-                if (gTimelineLoop) gPlayhead = 0.f;
-                else { gPlayhead = end; gTimelinePlaying = false; }
+                gPlayhead = end; gTimelinePlaying = false;
             }
             gPreviewDirty = true;
         }
@@ -347,12 +357,13 @@ int main(void) {
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
         PlutoPollBackend();
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
+        gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
         if (gPreviewDirty) {
             gPreviewDebounce += gDt;
-            if (gPreviewDebounce >= .12f) {
+            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying ? .045f : .075f)) {
                 if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
-                else { gPreviewTaskId = 0; gPreviewDebounce = .10f; }
+                else { gPreviewTaskId = 0; gPreviewDebounce = .045f; }
             }
         } else gPreviewDebounce = 0.f;
 
