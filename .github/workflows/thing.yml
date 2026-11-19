@@ -155,6 +155,13 @@ jobs:
           Copy-Item -Path Icons\* -Destination ci-build/out/dist/Icons -Recurse -Force
           Copy-Item Icons\Logo\Pluto.ico ci-build/out/dist/Icons/Logo/Stella.ico -Force
 
+      - name: Upload lightweight Stella package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stella-Windows-x64-lite
+          path: ci-build/out/dist/*
+          if-no-files-found: error
+
       - name: Bundle FFmpeg runtime
         shell: pwsh
         run: |
@@ -181,9 +188,9 @@ jobs:
           '@
           $notice | Set-Content -LiteralPath (Join-Path $dest 'THIRD_PARTY_NOTICES.txt') -Encoding UTF8
 
-      - name: Upload Stella Windows package
+      - name: Upload Stella package with FFmpeg
         uses: actions/upload-artifact@v4
         with:
-          name: Stella-Windows-x64
+          name: Stella-Windows-x64-full
           path: ci-build/out/dist/*
           if-no-files-found: error
