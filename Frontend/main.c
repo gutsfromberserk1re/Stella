@@ -6,9 +6,8 @@
  * Text rendering: every font size is rasterised at its exact pixel size (cached), so glyphs
  * are drawn 1:1 with no texture down-scaling -> crisp text.
  *
- * Font note: put Inter-Regular.ttf and Inter-SemiBold.ttf in ./resources/ for the exact
- * glyph shapes of the reference. Font sizes are normalised, so any font renders at the
- * same size.
+ * Optional Inter-Regular, Inter-Medium, and Inter-SemiBold files can live in resources/.
+ * Raster size follows monitor DPI; logical layout sizes remain unchanged.
  */
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -288,9 +287,12 @@ int main(void) {
     /* Prevent Windows bitmap-scaling the UI on scaled displays. */
     SetProcessDPIAware();
 #endif
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
+    Vector2 dpiScale = GetWindowScaleDPI();
+    gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));
     LoadUiIcons();
+    LoadKnobTexture();
     if (PlutoBackendLoad()) PlutoTimelineCall("{\"command\":\"timeline_get\"}");
     SetWindowMinSize(1180, 720);
 #ifdef _WIN32
@@ -309,18 +311,30 @@ int main(void) {
     const char *reg[] = {"resources/Inter-Regular.ttf", "Inter-Regular.ttf", "C:/Windows/Fonts/segoeui.ttf",
                          "/System/Library/Fonts/Supplemental/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                          "/usr/share/fonts/TTF/DejaVuSans.ttf"};
-    const char *bold[] = {"resources/Inter-SemiBold.ttf", "Inter-SemiBold.ttf", "C:/Windows/Fonts/seguisb.ttf", "C:/Windows/Fonts/segoeuib.ttf",
+    const char *medium[] = {"resources/Inter-Medium.ttf", "Inter-Medium.ttf", "C:/Windows/Fonts/seguisb.ttf",
+                            "C:/Windows/Fonts/segoeuisl.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                            "/usr/share/fonts/TTF/DejaVuSans.ttf"};
+    const char *semiBold[] = {"resources/Inter-SemiBold.ttf", "Inter-SemiBold.ttf", "C:/Windows/Fonts/segoeuisb.ttf",
+                          "C:/Windows/Fonts/seguisb.ttf", "C:/Windows/Fonts/segoeuib.ttf",
                           "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                           "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"};
     gFcpN = 0;
     for (int c = 32; c < 127; c++) gFcps[gFcpN++] = c;
     gFcps[gFcpN++] = 0xB0; gFcps[gFcpN++] = 0xD7; gFcps[gFcpN++] = 0xB7; gFcps[gFcpN++] = 0x2026;
     bool okR = FindFont(reg, 6, 0);
-    bool okB = FindFont(bold, 7, 1);
-    if (!okB && okR) {
+    bool okM = FindFont(medium, 7, 1);
+    bool okSB = FindFont(semiBold, 8, 2);
+    if (!okM && okR) {
         strcpy(gFontPath[1], gFontPath[0]);
         gFontOK[1] = true;
         gFK[1] = gFK[0];
+    }
+    if (!okSB && (okM || okR)) {
+        int source = okM ? 1 : 0;
+        strcpy(gFontPath[2], gFontPath[source]);
+        gFontOK[2] = true;
+        gFK[2] = gFK[source];
     }
 
     for (int i = 0; i < NSL; i++) gSl[i] = gSlT[i] = SlDefault(i);
@@ -333,6 +347,12 @@ int main(void) {
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
+            gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
+            PlutoTimelineDelete(gTimelineSelected);
+            memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
+            gTimelineSelected = -1;
+        }
         if (gEditValueId == 0 && !gTimelinePlaying && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))) {
             float frame = floorf(gPlayhead * 30.f + .5f);
             frame += IsKeyPressed(KEY_RIGHT) ? 1.f : -1.f;
@@ -349,6 +369,9 @@ int main(void) {
         }
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        Vector2 currentDpi = GetWindowScaleDPI();
+        float currentDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(currentDpi.x, currentDpi.y)));
+        if (fabsf(currentDpiScale - gDpiScale) > 0.01f) gDpiScale = currentDpiScale;
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
         Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
@@ -380,6 +403,7 @@ int main(void) {
         ClearBackground((Color){14, 15, 17, 255});
         RenderUI(cmds);
         DrawPreviewQualityDropdown();
+        DrawTimelineContextMenu();
         EndDrawing();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
                        gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :

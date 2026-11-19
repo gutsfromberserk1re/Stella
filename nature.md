@@ -1,24 +1,17 @@
 # Nature
 
-## Current setup
-- Native C/raylib UI talks to a Rust C ABI backend. No Tauri or WebView.
-- Rust sends media work to FFmpeg/FFprobe on a background worker.
-- Preview and export share the FFmpeg filter builder.
+## Setup
+- Stella uses a native C/raylib UI and a Rust C ABI backend. No Tauri or WebView.
+- Rust runs FFmpeg tasks off the UI thread; GitHub builds the app.
 
-## Progress
-- GitHub Actions publishes two Stella builds: a small UI/DLL/icon package and a full package with FFmpeg.
-- Removed demo media. Added filename hover tips and a media zoom cap.
-- Added preview menu motion, 30 fps scrub snapping, and left/right frame steps.
-- Added older video effect toggles and transitions between adjacent clips.
-- Timeline keyframes now show as diamonds on their clips.
-
-## Still needed
-- Keyframe values are stored, but shared interpolation across all properties is not finished.
-- Preview still launches FFmpeg for individual frames; smooth real-time playback needs a persistent decoder.
-- New effect rows currently use defaults; add editable controls.
-- Run the GitHub build and check preview/export output.
+## Done
+- Added lite and FFmpeg-bundled Windows workflow artifacts.
+- Added media import, thumbnails, waveforms, FFmpeg preview/export, and effect filters.
+- Added timeline snapping, frame stepping, drag previews, track expansion, keyframe markers, grouping, and audio linking.
+- Updated DPI-aware text and ICO tool icons; value pills support typing and horizontal scrubbing.
+- Refined cool colors, timeline lane bands, toolbar grouping, and icon sizing.
 
 ## Next
-- Compile and package in GitHub Actions; confirm both artifacts work on Windows.
-- Verify effect and transition output against preview frames.
-- Build shared keyframe interpolation and improve preview playback performance.
+- Finish shared keyframe interpolation across properties.
+- Improve preview playback with a persistent decoder and bounded frame cache.
+- Verify both GitHub artifacts and compare preview with exports.

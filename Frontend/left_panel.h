@@ -2,7 +2,9 @@
 /* ------------------------------------------------------------------ */
 /* UI: library (left)                                                  */
 /* ------------------------------------------------------------------ */
-static void ValBox(const char *s, const char *unit, float w, float h, float fs, float ufs, float pad);
+static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
+                           float w, float h, float fs, float ufs, float pad,
+                           float minimum, float maximum, int decimals);
 static void SliderLogic(Clay_ElementId id, int gi, float kr);
 
 static void MediaView(void) {
@@ -21,9 +23,12 @@ static void MediaView(void) {
         if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) gMediaZoom = fminf(2.2f, gMediaZoom + .1f);
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) gMediaZoom = fmaxf(.65f, gMediaZoom - .1f);
     }
-    int columns = (int)floorf((mediaBox.width - 18.f) / (100.f * gMediaZoom + 9.f));
+    float desiredTileWidth = 100.f * gMediaZoom;
+    int columns = (int)floorf((mediaBox.width - 18.f + 9.f) / (desiredTileWidth + 9.f));
     if (columns < 1) columns = 1;
     if (columns > 3) columns = 3;
+    float tileWidth = fmaxf(72.f, fminf(desiredTileWidth,
+        (mediaBox.width - 18.f - 9.f * (columns - 1)) / columns));
     int mediaCount = gImportedCount;
     int rows = (mediaCount + columns - 1) / columns;
     CLAY(CLAY_ID("MediaCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9}}) {
@@ -48,7 +53,7 @@ static void MediaView(void) {
                     ImportedMedia *m = &gImported[i];
                     const char *name = m->name;
                     const char *duration = Fmt("%d:%02d", (int)m->duration / 60, (int)m->duration % 60);
-                    CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
+                    CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {FIX(tileWidth), FIT}, .childGap = 6}}) {
                         Clay_ElementId tid = CLAY_IDI("Thumb", i);
                         Bs b = Interact(tid);
                         Clay_BoundingBox tb = Clay_GetElementData(tid).boundingBox;
@@ -59,7 +64,7 @@ static void MediaView(void) {
                         }
                         if (Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i;
                         if (b.clicked) gMediaSelected = i;
-                        CLAY(tid, {.layout = {.sizing = {GROW, FIX(92.f * gMediaZoom)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
+                        CLAY(tid, {.layout = {.sizing = {GROW, FIX(tileWidth * 9.f / 16.f)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
                                    .border = {.color = gMediaSelected == i ? C_TEXT : RGBA(0, 0, 0, 0), .width = CLAY_BORDER_OUTSIDE(gMediaSelected == i ? 2 : 0)},
                                    .custom = {.customData = NC(K_THUMB, C_CARD, C_CARD, C_CARD, 0, b.hover, 0x1000 | (i << 4))}}) {
                             CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .padding = {5, 5, 1, 2}},
@@ -75,13 +80,6 @@ static void MediaView(void) {
 }
 
 /* value text for knob idx */
-static const char *KnobVal(int idx) {
-    float v = gKnob[idx];
-    if (idx == 0) return Fmt("%d %%", (int)roundf(v * 200.f));
-    if (idx == 1) return Fmt("%d", (int)roundf((v - .5f) * 200.f));
-    return Fmt("%d dB", (int)roundf((v - .5f) * 24.f));
-}
-
 /* draggable knob: drag up/down to change, snaps to the centre detent */
 static void KnobGroup(int idx, const char *label) {
     static float sent[4] = {.5f, .5f, .5f, .5f};
@@ -108,12 +106,28 @@ static void KnobGroup(int idx, const char *label) {
         }
         float act = Anim(kid.id + 9u, drag ? 1.f : b.hover * .6f, 20.f);
         float shown = Anim(kid.id + 13u, gKnob[idx], 30.f);      /* smooth pointer motion */
-        CLAY(kid, {.layout = {.sizing = {FIX(72), FIX(72)}}, .custom = {.customData = NC(K_KNOB, C_CARD, C_CARD, C_CARD, shown, act, 0)}}) {}
+        static float sPos[4] = {1.f, 1.f, 1.f, 1.f}, sVel[4] = {0.f, 0.f, 0.f, 0.f};
+        float target = drag ? .93f : 1.f, dtc = gDt > 1.f / 30.f ? 1.f / 30.f : gDt;
+        const float k = 380.f, damp = 2.f * .42f * sqrtf(k);
+        for (float t = 0.f; t < dtc; t += 1.f / 240.f) {
+            float h = fminf(1.f / 240.f, dtc - t);
+            sVel[idx] += (-k * (sPos[idx] - target) - damp * sVel[idx]) * h;
+            sPos[idx] += sVel[idx] * h;
+        }
+        CLAY(kid, {.layout = {.sizing = {FIX(72), FIX(72)}},
+                   .custom = {.customData = NC(K_KNOB, C_CARD, ((Clay_Color){sPos[idx], 0, 0, 255}), C_CARD, shown, act, 0)}}) {}
         Tx(label, 14, C_MUTED, 0);
-        CLAY_AUTO_ID({.layout = {.sizing = {FIX(74), FIX(28)}, .childAlignment = AL_C},
-                      .backgroundColor = RGB(28, 29, 34), .cornerRadius = CLAY_CORNER_RADIUS(7),
-                      .border = {.color = Mix(RGB(40, 42, 48), RGB(64, 67, 75), act), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-            Tx(KnobVal(idx), 14, C_TEXT, 0);
+        float shownValue = idx == 0 ? roundf(gKnob[idx] * 200.f) :
+                           idx == 1 ? roundf((gKnob[idx] - .5f) * 200.f) : roundf((gKnob[idx] - .5f) * 24.f);
+        const char *unit = idx == 0 ? "%" : idx >= 2 ? "dB" : NULL;
+        float minimum = idx == 0 ? 0.f : idx == 1 ? -100.f : -12.f;
+        float maximum = idx == 0 ? 200.f : idx == 1 ? 100.f : 12.f;
+        if (ValBoxEditable(CLAY_IDI("KnobValue", idx), &shownValue, unit, 74, 28, 15.5f, 12.5f, 9,
+                           minimum, maximum, 0)) {
+            gKnob[idx] = idx == 0 ? shownValue / 200.f : idx == 1 ? shownValue / 200.f + .5f : shownValue / 24.f + .5f;
+            double value = shownValue;
+            PlutoTimelineSetProperty(paths[idx], value);
+            sent[idx] = gKnob[idx];
         }
     }
 }
@@ -140,7 +154,12 @@ static void DurRow(int gi, const char *label) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             Tx(label, 13.5f, C_DIM, 0);
             HSPACE
-            ValBox(Fmt("%d", 1 + (int)roundf(gSl[gi] * 9.f)), "s", 72, 27, 14.5f, 12.f, 10);
+            float durationValue = 1.f + roundf(gSl[gi] * 9.f);
+            if (ValBoxEditable(CLAY_IDI("DurationValue", gi), &durationValue, "s", 72, 27, 14.5f, 12.f, 10, 1.f, 10.f, 0)) {
+                gSl[gi] = gSlT[gi] = (durationValue - 1.f) / 9.f;
+                PlutoTimelineSetProperty(slot == 0 ? "props.audio.fadeInDuration" : "props.audio.fadeOutDuration", durationValue);
+                sent[slot] = gSlT[gi];
+            }
         }
         Clay_ElementId sid = CLAY_IDI("Dur", gi);
         Bs bs = Interact(sid);

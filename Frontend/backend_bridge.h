@@ -231,6 +231,17 @@ static float PlutoReadNumber(const char *begin, const char *end, const char *pat
     return PlutoJsonNumberPath(begin, end, path, &value) && isfinite(value) ? (float)value : fallback;
 }
 
+static int PlutoTrackIndex(const char *name) {
+    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2"};
+    for (int i = 0; i < 6; i++) if (strcmp(name, names[i]) == 0) return i;
+    return 0;
+}
+
+static const char *PlutoTrackName(int track) {
+    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2"};
+    return names[track < 0 ? 0 : track > 5 ? 5 : track];
+}
+
 static bool PlutoSyncTimeline(const char *json) {
     const char *array = strstr(json, "\"clips\":[");
     if (!array) return false;
@@ -261,15 +272,23 @@ static bool PlutoSyncTimeline(const char *json) {
         if (!end) break;
         TimelineClipUi *clip = &gTimelineClips[count];
         memset(clip, 0, sizeof(*clip));
+        clip->mediaIndex = -1;
         double start = 0.0, duration = 0.0;
         char track[16] = {0};
         if (PlutoJsonStringRange(begin, end, "id", clip->id, sizeof(clip->id)) &&
             PlutoJsonStringRange(begin, end, "label", clip->label, sizeof(clip->label))) {
             PlutoJsonStringRange(begin, end, "path", clip->path, sizeof(clip->path));
             PlutoJsonStringRange(begin, end, "track", track, sizeof(track));
+            PlutoJsonStringRange(begin, end, "groupId", clip->groupId, sizeof(clip->groupId));
+            PlutoJsonStringRange(begin, end, "linkedAudioId", clip->linkedId, sizeof(clip->linkedId));
+            PlutoJsonStringRange(begin, end, "kind", clip->kind, sizeof(clip->kind));
             PlutoJsonNumberRange(begin, end, "start", &start);
             PlutoJsonNumberRange(begin, end, "dur", &duration);
-            clip->track = strcmp(track, "a1") == 0 || strcmp(track, "a2") == 0 ? 1 : 0;
+            clip->track = PlutoTrackIndex(track);
+            const char *hasAudio = strstr(begin, "\"hasAudio\":true");
+            clip->hasAudio = hasAudio && hasAudio < end;
+            for (int media = 0; media < gImportedCount; media++)
+                if (clip->path[0] && strcmp(clip->path, gImported[media].path) == 0) { clip->mediaIndex = media; break; }
             clip->start = (float)start;
             clip->duration = (float)duration;
             const char *ka = strstr(begin, "\"keyframes\":[");
@@ -341,17 +360,17 @@ static void PlutoJsonEscape(const char *src, char *dst, size_t cap) {
     dst[n] = 0;
 }
 
-static bool PlutoTimelineAddMedia(int mediaIndex, float start) {
+static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) {
     if (mediaIndex < 0 || mediaIndex >= gImportedCount || gTimelineClipCount >= MAX_TIMELINE_CLIPS) return false;
     ImportedMedia *media = &gImported[mediaIndex];
     char path[2048], label[520], id[64], request[4096];
     PlutoJsonEscape(media->path, path, sizeof(path));
     PlutoJsonEscape(media->name, label, sizeof(label));
     snprintf(id, sizeof(id), "clip-%llu", (unsigned long long)gClipSerial++);
-    int track = strcmp(media->kind, "audio") == 0 ? 1 : 0;
+    if ((strcmp(media->kind, "audio") == 0) != (track >= 4)) track = strcmp(media->kind, "audio") == 0 ? 4 : 0;
     snprintf(request, sizeof(request),
              "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"%s\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"%s\",\"hasAudio\":%s,\"sourceOffset\":0,\"props\":{}}}",
-             id, track ? "a1" : "v1", fmaxf(0.f, start), fmaxf(.05f, media->duration), label, path,
+             id, PlutoTrackName(track), fmaxf(0.f, start), fmaxf(.05f, media->duration), label, path,
              media->kind, media->hasAudio ? "true" : "false");
     if (!PlutoTimelineCall(request)) return false;
     for (int i = 0; i < gTimelineClipCount; i++) if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
@@ -363,7 +382,7 @@ static bool PlutoTimelineMove(int index, float start, int track) {
     if (index < 0 || index >= gTimelineClipCount) return false;
     char id[128], request[512]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
     snprintf(request, sizeof(request), "{\"command\":\"timeline_move_clip\",\"id\":\"%s\",\"start\":%.4f,\"track\":\"%s\",\"playhead\":%.4f,\"snapThreshold\":0.25}",
-             id, fmaxf(0.f, start), track ? "a1" : "v1", gPlayhead);
+             id, fmaxf(0.f, start), PlutoTrackName(track), gPlayhead);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
@@ -376,6 +395,48 @@ static bool PlutoTimelineDelete(int index) {
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
+}
+
+static bool PlutoTimelineGroupSelected(void) {
+    char request[8192];
+    int used = snprintf(request, sizeof(request), "{\"command\":\"timeline_group_clips\",\"groupId\":\"group-%llu\",\"ids\":[",
+                        (unsigned long long)gClipSerial++);
+    int selected = 0;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        if (!gTimelineMultiSelect[i]) continue;
+        char escaped[160]; PlutoJsonEscape(gTimelineClips[i].id, escaped, sizeof(escaped));
+        int n = snprintf(request + used, sizeof(request) - (size_t)used, "%s\"%s\"", selected ? "," : "", escaped);
+        if (n < 0 || (size_t)n >= sizeof(request) - (size_t)used) return false;
+        used += n; selected++;
+    }
+    if (selected < 2 || (size_t)used + 3 >= sizeof(request)) return false;
+    strcpy(request + used, "]}");
+    return PlutoTimelineCall(request);
+}
+
+static bool PlutoTimelineUngroup(int index) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    char id[160], request[256]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_ungroup_clip\",\"id\":\"%s\"}", id);
+    return PlutoTimelineCall(request);
+}
+
+static bool PlutoTimelineSeparateAudio(int index) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    char id[160], request[512], audioId[64];
+    PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(audioId, sizeof(audioId), "audio-%llu", (unsigned long long)gClipSerial++);
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_separate_audio\",\"id\":\"%s\",\"audioId\":\"%s\"}", id, audioId);
+    bool okay = PlutoTimelineCall(request);
+    if (okay) gPreviewDirty = true;
+    return okay;
+}
+
+static bool PlutoTimelineUnlink(int index) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    char id[160], request[256]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_unlink_clip\",\"id\":\"%s\"}", id);
+    return PlutoTimelineCall(request);
 }
 
 static bool PlutoTimelineSplit(int index, float at) {
@@ -581,7 +642,7 @@ static PlutoBackend gBackend;
 static bool PlutoBackendLoad(void) { return false; }
 static bool PlutoTimelineCall(const char *request) { (void)request; return false; }
 static void PlutoTimelineSelect(int index) { (void)index; }
-static bool PlutoTimelineAddMedia(int mediaIndex, float start) { (void)mediaIndex; (void)start; return false; }
+static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) { (void)mediaIndex; (void)start; (void)track; return false; }
 static bool PlutoTimelineMove(int index, float start, int track) { (void)index; (void)start; (void)track; return false; }
 static bool PlutoTimelineDelete(int index) { (void)index; return false; }
 static bool PlutoTimelineSplit(int index, float at) { (void)index; (void)at; return false; }

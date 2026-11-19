@@ -228,22 +228,12 @@ static bool Arrow(Clay_ElementId id, int icon) {
     return b.clicked;
 }
 
-/* read-only value pill: value (fs) + optional unit (ufs), right aligned with `pad` px inset */
-static void ValBox(const char *s, const char *unit, float w, float h, float fs, float ufs, float pad) {
-    CLAY_AUTO_ID({.layout = {.sizing = {FIX(w), FIX(h)}, .padding = {0, pad, 0, 0}, .childGap = 5,
-                             .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_CENTER}},
-                  .backgroundColor = C_VALBOX, .cornerRadius = CLAY_CORNER_RADIUS(12)}) {
-        Tx(s, fs, C_TEXT, 0);
-        if (unit) Tx(unit, ufs, C_ICON, 0);
-    }
-}
-
 static void CommitValueEdit(float *v) {
     if (gEditValueLen > 0) *v = strtof(gEditValueText, NULL);
     gEditValueId = 0;
 }
 
-static bool ValueFieldLogic(Clay_ElementId id, float *v) {
+static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) {
     float original = *v;
     bool committed = false;
     bool valueChanged = false;
@@ -270,7 +260,7 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v) {
         float dx = GetMousePosition().x - gValueDragX;
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && fabsf(dx) > 3.f) {
             gValueDragging = true;
-            *v = gValueDragStart + dx * 0.2f;
+            *v = gValueDragStart + dx * dragSensitivity;
         } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             if (gValueDragging) { committed = true; valueChanged = fabsf(*v - gValueDragStart) > 0.001f; }
             if (!gValueDragging) {
@@ -288,6 +278,27 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v) {
         }
     }
     return committed && valueChanged;
+}
+
+/* Value pills use their full hit area for click-to-type and horizontal scrubbing. */
+static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
+                           float w, float h, float fs, float ufs, float pad,
+                           float minimum, float maximum, int decimals) {
+    float dragSensitivity = fminf(.2f, fmaxf(.003f, (maximum - minimum) * .2f / 100.f));
+    bool changed = ValueFieldLogic(id, value, dragSensitivity);
+    *value = fmaxf(minimum, fminf(maximum, *value));
+    bool over = Clay_PointerOver(id);
+    CLAY(id, {.layout = {.sizing = {FIX(w), FIX(h)}, .padding = {0, pad, 0, 0}, .childGap = 5,
+                         .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_CENTER}},
+              .backgroundColor = Mix(C_VALBOX, RGB(47, 49, 55), over ? .28f : 0.f),
+              .cornerRadius = CLAY_CORNER_RADIUS(12),
+              .border = {.color = Mix(C_VALBOX, RGB(65, 67, 75), over ? .45f : 0.f),
+                         .width = CLAY_BORDER_OUTSIDE(over ? 1 : 0)}}) {
+        if (gEditValueId == id.id) Tx(Fmt("%s|", gEditValueText), fs + 2.f, C_TEXT, 0);
+        else Tx(decimals > 0 ? Fmt("%.*f", decimals, *value) : Fmt("%.0f", *value), fs + 2.f, C_TEXT, 0);
+        if (unit) Tx(unit, ufs + 1.f, C_ICON, 0);
+    }
+    return changed;
 }
 
 /* number field (GROW x 39): value + unit + up/down steppers */
@@ -313,7 +324,7 @@ static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId scrubId = CLAY_IDI("NumScrub", n);
     Bs b = Interact(id);
     float before = gValueDragId == scrubId.id ? gValueDragStart : *v;
-    bool changed = ValueFieldLogic(scrubId, v);
+    bool changed = ValueFieldLogic(scrubId, v, .2f);
     if (changed) CommitNumField(n, before);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
@@ -337,7 +348,7 @@ static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Clay_ElementId scrubId = CLAY_IDI("MiniScrub", n);
     Bs b = Interact(id);
-    bool changed = ValueFieldLogic(scrubId, &gMini[n]);
+    bool changed = ValueFieldLogic(scrubId, &gMini[n], .2f);
     static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
                                    "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
     if (changed && n >= 0 && n < 8) {
@@ -482,12 +493,11 @@ static void NavSection(void) {
     }
 }
 
-static const char *RotStr(float r) { return fabsf(r) < 0.05f ? "0" : Fmt("%.1f", r); }
-
 /* Transform tab. A flexible spacer positions the enlarged 66px nav buttons
    above a deliberate 26px bottom gap, matching the reference panel rhythm. */
 static void TransformView(void) {
     static float sentRotation;
+    static float sentOpacity = 1.f;
     CLAY(CLAY_ID("TfCol"), {.layout = {COLM, .sizing = {GROW, GROW}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) {
             FieldCard(0, "Position", I_POS, "X", "Y", &gNum[0], &gNum[1], 0.f, "px", 0);
@@ -499,7 +509,13 @@ static void TransformView(void) {
                 if (IconBtn(CLAY_ID("RotReset"), I_ROT, 34, 24, C_TEXT, false, 17)) { gRotT = 0.f; PlutoTimelineSetProperty("props.transform.rotation", 0.0); sentRotation = 0.f; }
                 Tx("Rotation", 19, C_TEXT, 0);
                 HSPACE
-                ValBox(RotStr(gRot), "\xC2\xB0", 128, 35, 22, 18, 11);
+                float rotationValue = gRot;
+                if (ValBoxEditable(CLAY_ID("RotationValue"), &rotationValue, "\xC2\xB0", 128, 35, 22, 18, 11, -180.f, 180.f, 1)) {
+                    gRot = gRotT = rotationValue;
+                    sentRotation = rotationValue;
+                    PlutoTimelineSetProperty("props.transform.rotation", rotationValue);
+                    gPreviewDirty = true;
+                }
             }
             Clay_ElementId rid = CLAY_ID("RotRuler");
             Bs b = Interact(rid);
@@ -528,11 +544,15 @@ static void TransformView(void) {
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
                 Tx("Opacity", 18, C_TEXT, 0);
                 HSPACE
-                ValBox(Fmt("%d", (int)roundf(gSl[0] * 100.f)), "%", 72, 27, 16, 13, 8);
+                float opacityValue = gSl[0] * 100.f;
+                if (ValBoxEditable(CLAY_ID("OpacityValue"), &opacityValue, "%", 72, 27, 16, 13, 8, 0.f, 100.f, 0)) {
+                    gSl[0] = gSlT[0] = opacityValue / 100.f;
+                    PlutoTimelineSetProperty("props.transform.opacity", opacityValue);
+                    sentOpacity = gSlT[0];
+                }
             }
             Clay_ElementId sid = CLAY_ID("OpacitySlider");
             Bs b = Interact(sid);
-            static float sentOpacity = 1.f;
             SliderLogic(sid, 0, 8.5f);
             if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
                 PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
@@ -618,6 +638,32 @@ static const char *kSliderNames[5][8] = {
     {"Exposure", "Brightness", "Contrast", "Highlights", "Shadows", "Whites", "Blacks"},
     {"Temperature", "Vibrance", "Saturation"}, {"Sharpness", "Clarity", "Vignette"}
 };
+
+static const char *gColorSliderKeys[5][8] = {
+    {0}, {"hue", "saturation", "lightness"},
+    {"exposure", "brightness", "contrast", "highlights", "shadows", "whites", "blacks"},
+    {"temperature", "vibrance", "saturation"}, {"sharpness", "clarity", "vignette"}
+};
+
+static float ColorSliderFromDisplay(int idx, int s, float value) {
+    if (idx == 1 && s == 0) return .5f + value / 360.f;
+    if (idx == 4 && s == 0) return value / 100.f;
+    return .5f + value / 200.f;
+}
+
+static double ColorSliderBackendValue(int idx, int s, float normalized) {
+    if (idx == 1 && s == 0) return (normalized - .5f) * 360.0;
+    if (idx == 4 && s == 0) return normalized * 100.0;
+    return (normalized - .5f) * 200.0;
+}
+
+static void ColorSliderProperty(int idx, int s, char *path, size_t cap) {
+    if (idx == 1) snprintf(path, cap, "props.colors.hsl.%d.%s", gHsl, gColorSliderKeys[idx][s]);
+    else {
+        const char *group = idx == 2 ? "light" : idx == 3 ? "color" : "detail";
+        snprintf(path, cap, "props.colors.%s.%s", group, gColorSliderKeys[idx][s]);
+    }
+}
 /* last measured body heights (fallbacks until first measure) */
 static float gAccH[5] = {250.f, 270.f, 410.f, 190.f, 190.f};
 
@@ -641,34 +687,30 @@ static void SliderRow(int idx, int s) {
     int gi = idx * 8 + s, mode; Clay_Color a, b, c;
     SliderSpec(idx, s, &mode, &a, &b, &c);
     bool uni = (idx == 4 && s == 0);
-    int val = uni ? (int)roundf(gSl[gi] * 100.f) : (int)roundf((gSl[gi] - .5f) * 200.f);
+    int val = uni ? (int)roundf(gSl[gi] * 100.f) :
+              idx == 1 && s == 0 ? (int)roundf((gSl[gi] - .5f) * 360.f) : (int)roundf((gSl[gi] - .5f) * 200.f);
     CLAY(CLAY_IDI("SRow", gi), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 5}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             Tx(kSliderNames[idx][s], 16.5f, C_DIM, 0);
             HSPACE
-            ValBox(Fmt("%d", val), NULL, 72, 26, 15, 0, 11);
+            float editValue = (float)val;
+            if (ValBoxEditable(CLAY_IDI("ColorValue", gi), &editValue, NULL, 72, 26, 15, 0, 11,
+                               idx == 1 && s == 0 ? -180.f : idx == 4 && s == 0 ? 0.f : -100.f,
+                               idx == 1 && s == 0 ? 180.f : idx == 4 && s == 0 ? 100.f : 100.f, 0)) {
+                float normalized = fmaxf(0.f, fminf(1.f, ColorSliderFromDisplay(idx, s, roundf(editValue))));
+                gSl[gi] = gSlT[gi] = normalized;
+                char path[128]; ColorSliderProperty(idx, s, path, sizeof(path));
+                PlutoTimelineSetProperty(path, ColorSliderBackendValue(idx, s, normalized));
+                sent[gi] = normalized;
+            }
         }
         Clay_ElementId sid = CLAY_IDI("Slid", gi);
         Bs bs = Interact(sid);
         SliderLogic(sid, gi, 8.5f);
         if (!gSlDrag[gi] && fabsf(gSlT[gi] - sent[gi]) > .002f && idx > 0 && idx < 5) {
-            static const char *paths[5][8] = {
-                {0},
-                {"hue", "saturation", "lightness"},
-                {"exposure", "brightness", "contrast", "highlights", "shadows", "whites", "blacks"},
-                {"temperature", "vibrance", "saturation"},
-                {"sharpness", "clarity", "vignette"}
-            };
             char path[128];
-            double value = idx == 4 && s == 0 ? gSlT[gi] * 100.0 : (gSlT[gi] - .5) * 200.0;
-            if (idx == 1) {
-                snprintf(path, sizeof(path), "props.colors.hsl.%d.%s", gHsl, paths[idx][s]);
-                if (s == 0) value = (gSlT[gi] - .5) * 360.0;
-            } else {
-                const char *group = idx == 2 ? "light" : idx == 3 ? "color" : "detail";
-                snprintf(path, sizeof(path), "props.colors.%s.%s", group, paths[idx][s]);
-            }
-            PlutoTimelineSetProperty(path, value);
+            ColorSliderProperty(idx, s, path, sizeof(path));
+            PlutoTimelineSetProperty(path, ColorSliderBackendValue(idx, s, gSlT[gi]));
             sent[gi] = gSlT[gi];
         }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(14)}},
@@ -817,8 +859,16 @@ static void FxParam(int i, int p, const char *label) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
             Tx(label, 13.5f, C_MUTED, 0);
             HSPACE
-            if (isAngle) ValBox(Fmt("%d", (int)roundf((*v - .5f) * 360.f)), "\xC2\xB0", 72, 22, 13.f, 11.f, 10);
-            else         ValBox(Fmt("%d", (int)roundf(*v * 100.f)), NULL, 72, 22, 13.f, 11.f, 12);
+            float displayValue = isAngle ? roundf((*v - .5f) * 360.f) : roundf(*v * 100.f);
+            if (ValBoxEditable(CLAY_IDI("FxValue", i * 2 + p), &displayValue,
+                               isAngle ? "\xC2\xB0" : NULL, 72, 22, 13.f, 11.f, 10,
+                               isAngle ? -180.f : 0.f, isAngle ? 180.f : 100.f, 0)) {
+                *v = isAngle ? .5f + displayValue / 360.f : displayValue / 100.f;
+                *v = fmaxf(0.f, fminf(1.f, *v));
+                double stored = isAngle ? (*v - .5f) * 360.0 : *v * 100.0;
+                PlutoTimelineSetProperty(gFxProp[i][p], stored);
+                gFxSent[i][p] = *v;
+            }
         }
         Clay_ElementId sid = CLAY_IDI("FxSl", i * 2 + p);
         Bs bs = Interact(sid);
@@ -991,7 +1041,12 @@ static void EffectsView(void) {
                         }
                     }
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
-                        Tx("Duration", 13, C_MUTED, 0); HSPACE; Tx(Fmt("%.1f s", gTransitionDuration), 13, C_TEXT, 0);
+                        Tx("Duration", 13, C_MUTED, 0); HSPACE;
+                        float durationValue = gTransitionDuration;
+                        if (ValBoxEditable(CLAY_ID("TransitionDurationValue"), &durationValue, "s", 72, 22, 13, 11, 10, .1f, 2.f, 1)) {
+                            gTransitionDuration = durationValue;
+                            CommitTransition();
+                        }
                     }
                     Clay_ElementId did = CLAY_ID("TransitionDuration");
                     static bool durationDrag;
@@ -1156,7 +1211,7 @@ static void RightPanel(void) {
                                       .cornerRadius = CLAY_CORNER_RADIUS(14),
                                       .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 0)}}) {
                 for (int i = 0; i < 4; i++)
-                    if (TabBtn(CLAY_IDI("InspTab", i), tabs[i], gRightTab == i, 13.5f, 11, true)) {
+                    if (TabBtn(CLAY_IDI("InspTab", i), tabs[i], gRightTab == i, 15.f, 11, true)) {
                         if (gRightTab != i) { gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
                     }
             }

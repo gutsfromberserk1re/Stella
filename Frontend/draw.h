@@ -43,8 +43,10 @@ static void GradRR(Rectangle r, float rad, Color top, Color bot) {
         DrawRectangle((int)(r.x + inset), (int)(r.y + i), (int)(r.width - 2 * inset), 1, LerpC(top, bot, (float)i / fmaxf(1, h - 1)));
     }
 }
-static void RadGrad(Vector2 c, float r, Color inner, Color outer) {
-    for (float rr = r; rr > 0.5f; rr -= 1.f) DrawCircleV(c, rr, LerpC(inner, outer, rr / r));
+static void FilledCapsule(Vector2 a, Vector2 b, float w, Color col) {
+    DrawLineEx(a, b, w, col);
+    DrawCircleV(a, w * .5f, col);
+    DrawCircleV(b, w * .5f, col);
 }
 static void Ring(Vector2 c, float r, float t, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, 0, 360, 40, col); }
 static void Arc(Vector2 c, float r, float t, float a0, float a1, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, a0, a1, 32, col); }
@@ -78,11 +80,12 @@ static void CubicStroke(Vector2 p0, Vector2 p1, Vector2 p2, Vector2 p3, float th
 }
 static void TxtAt(int font, const char *s, float x, float y, float size, Color c) {
     int px = PxOf(font, (float)(int)(size + 2.25f));
-    DrawTextEx(FontPx(font, px), s, (Vector2){roundf(x), roundf(y)}, (float)px, 0, c);
+    float drawSize = (float)px / fmaxf(1.f, gDpiScale);
+    DrawTextEx(FontPx(font, px), s, (Vector2){roundf(x), roundf(y)}, drawSize, 0, c);
 }
 static float TxtW(int font, const char *s, float size) {
     int px = PxOf(font, (float)(int)(size + 2.25f));
-    return MeasureTextEx(FontPx(font, px), s, (float)px, 0).x;
+    return MeasureTextEx(FontPx(font, px), s, (float)px / fmaxf(1.f, gDpiScale), 0).x;
 }
 
 /* ------------------------------------------------------------------ */
@@ -95,31 +98,116 @@ static Vector2 IconPoint(float x, float y, float w, float h, float nx, float ny,
 }
 
 /* User-supplied monochrome tool icons; tint at draw time to match the UI theme. */
-static Texture2D gToolIcons[4];
-static const char *gToolIconFiles[4] = {"color-palette.png", "link.png", "palm.png", "selection.png"};
+static Texture2D gToolIcons[6];
+static const char *gToolIconFiles[6] = {"color-palette.ico", "link.ico", "palm.ico", "selection.ico", "magnet.ico", "library.ico"};
+static Texture2D gKnobTexture;
+
+static void LoadKnobTexture(void) {
+    const int size = 128;
+    Image image = GenImageColor(size, size, (Color){0, 0, 0, 0});
+    if (!image.data) return;
+    Color *pixels = (Color *)image.data;
+    const float center = (size - 1) * .5f;
+    for (int y = 0; y < size; y++) for (int x = 0; x < size; x++) {
+        float dx = (x - center) / 60.f, dy = (y - center) / 60.f;
+        float radius = sqrtf(dx * dx + dy * dy);
+        Color color = {0, 0, 0, 0};
+        if (radius <= .91f) {
+            float t = (float)y / (float)(size - 1);
+            color = (Color){(unsigned char)(48.f - 25.f * t), (unsigned char)(49.f - 25.f * t), (unsigned char)(55.f - 27.f * t), 255};
+            float sx = dx / .57f, sy = (dy + .34f) / .11f;
+            float shine = sx * sx + sy * sy;
+            if (shine < 1.f) {
+                unsigned char add = (unsigned char)(16.f * (1.f - shine));
+                color.r = (unsigned char)fminf(255.f, color.r + add);
+                color.g = (unsigned char)fminf(255.f, color.g + add);
+                color.b = (unsigned char)fminf(255.f, color.b + add);
+            }
+        } else if (radius <= .945f) color = (Color){7, 8, 10, 248};
+        else if (radius <= 1.f) color = (Color){88, 90, 98, 255};
+        else if (radius <= 1.08f) {
+            float alpha = (1.08f - radius) / .08f;
+            color = (Color){0, 0, 0, (unsigned char)(36.f * alpha)};
+        }
+        pixels[y * size + x] = color;
+    }
+    gKnobTexture = LoadTextureFromImage(image);
+    UnloadImage(image);
+    if (gKnobTexture.id) SetTextureFilter(gKnobTexture, TEXTURE_FILTER_BILINEAR);
+}
+
+static Texture2D LoadToolIconIco(const char *path) {
+    Texture2D texture = {0};
+#ifdef _WIN32
+    const int size = 128;
+    HICON icon = (HICON)LoadImageA(NULL, path, IMAGE_ICON, size, size, LR_LOADFROMFILE);
+    if (!icon) return texture;
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) { DestroyIcon(icon); return texture; }
+    BITMAPINFO info = {0};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void *dibPixels = NULL;
+    HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &dibPixels, NULL, 0);
+    if (!dib || !dibPixels) {
+        if (dib) DeleteObject(dib);
+        DeleteDC(dc); DestroyIcon(icon); return texture;
+    }
+    HGDIOBJ previous = SelectObject(dc, dib);
+    RECT bounds = {0, 0, size, size};
+    FillRect(dc, &bounds, (HBRUSH)GetStockObject(WHITE_BRUSH));
+    DrawIconEx(dc, 0, 0, icon, size, size, 0, NULL, DI_NORMAL);
+
+    Color *rgba = (Color *)malloc((size_t)size * size * sizeof(Color));
+    if (rgba) {
+        const unsigned char *bgra = (const unsigned char *)dibPixels;
+        for (int i = 0; i < size * size; i++) {
+            unsigned luminance = (bgra[i * 4 + 2] * 30u + bgra[i * 4 + 1] * 59u + bgra[i * 4] * 11u) / 100u;
+            rgba[i] = (Color){255, 255, 255, (unsigned char)(255u - luminance)};
+        }
+        Image image = {rgba, size, size, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        texture = LoadTextureFromImage(image);
+        free(rgba);
+    }
+    SelectObject(dc, previous);
+    DeleteObject(dib);
+    DeleteDC(dc);
+    DestroyIcon(icon);
+#else
+    (void)path;
+#endif
+    return texture;
+}
 
 static bool DrawAssetIcon(int k, Rectangle r, Color tint) {
-    int slot = k == I_PALETTE ? 0 : k == I_LINK ? 1 : k == I_HAND ? 2 : k == I_POINTER ? 3 : -1;
+    int slot = k == I_PALETTE ? 0 : k == I_LINK ? 1 : k == I_HAND ? 2 : k == I_POINTER ? 3 :
+               k == I_MAGNET ? 4 : k == I_LIBRARY ? 5 : -1;
     if (slot < 0 || gToolIcons[slot].id == 0) return false;
     Texture2D tex = gToolIcons[slot];
+    if (k == I_LINK) { r.x += r.width * .19f; r.y += r.height * .19f; r.width *= .62f; r.height *= .62f; }
     DrawTexturePro(tex, (Rectangle){0, 0, (float)tex.width, (float)tex.height}, r, (Vector2){0, 0}, 0.f, tint);
     return true;
 }
 
 static void LoadUiIcons(void) {
     const char *appDir = GetApplicationDirectory();
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         const char *path = TextFormat("%sIcons/Tools/%s", appDir, gToolIconFiles[i]);
         if (!FileExists(path)) path = TextFormat("Icons/Tools/%s", gToolIconFiles[i]);
         if (FileExists(path)) {
-            gToolIcons[i] = LoadTexture(path);
+            gToolIcons[i] = LoadToolIconIco(path);
             if (gToolIcons[i].id) SetTextureFilter(gToolIcons[i], TEXTURE_FILTER_BILINEAR);
         }
     }
 }
 
 static void UnloadUiIcons(void) {
-    for (int i = 0; i < 4; i++) if (gToolIcons[i].id) UnloadTexture(gToolIcons[i]);
+    for (int i = 0; i < 6; i++) if (gToolIcons[i].id) UnloadTexture(gToolIcons[i]);
+    if (gKnobTexture.id) UnloadTexture(gKnobTexture);
 }
 
 static void DrawIcon(int k, Rectangle r, Color c, float v) {
@@ -253,15 +341,27 @@ static void DrawCustom(Cust *cu, Rectangle r) {
 
     case K_KNOB: {
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
-        float rad = fminf(r.width, r.height) / 2 - 1;
-        DrawCircleV((Vector2){c.x, c.y + 1.5f}, rad + 1.f, (Color){0, 0, 0, 100});
-        DrawCircleV(c, rad, LerpC((Color){52, 53, 59, 255}, (Color){78, 80, 86, 255}, cu->f));
-        RadGrad(c, rad - 1.5f, (Color){47, 48, 54, 255}, (Color){20, 21, 24, 255});
-        Ring(c, rad - 1.f, 1.f, (Color){91, 93, 99, 190});
-        DrawEllipse((int)c.x, (int)(c.y - rad * .36f), rad * .54f, rad * .12f, (Color){255, 255, 255, 13});
+        float scale = cu->b.r;
+        float rad = (fminf(r.width, r.height) / 2 - 1) * scale;
+        float hv = cu->f;
+        float drawSize = fminf(r.width, r.height) * scale;
+        Rectangle dst = {c.x - drawSize * .5f, c.y - drawSize * .5f, drawSize, drawSize};
+        if (gKnobTexture.id)
+            DrawTexturePro(gKnobTexture, (Rectangle){0, 0, (float)gKnobTexture.width, (float)gKnobTexture.height}, dst,
+                           (Vector2){0, 0}, 0.f, WHITE);
+        else {
+            DrawCircleV(c, rad, (Color){31, 32, 36, 255});
+            Ring(c, rad - .5f, 1.2f, (Color){88, 90, 98, 255});
+        }
+        DrawCircleV(c, rad * .43f, (Color){255, 255, 255, U8(10.f * hv)});
         float ang = (cu->v - .5f) * 4.7f;
         Vector2 d = {sinf(ang), -cosf(ang)};
-        DrawLineEx((Vector2){c.x + d.x * rad * .74f, c.y + d.y * rad * .74f}, (Vector2){c.x + d.x * rad * .88f, c.y + d.y * rad * .88f}, 3.f, (Color){228, 229, 233, 255});
+        float iw = fmaxf(3.f, rad * .14f), il = rad * .13f, ir = rad * .78f;
+        Vector2 p0 = {c.x + d.x * (ir - il * .5f), c.y + d.y * (ir - il * .5f)};
+        Vector2 p1 = {c.x + d.x * (ir + il * .5f), c.y + d.y * (ir + il * .5f)};
+        FilledCapsule(p0, p1, iw + 2.f, (Color){0, 0, 0, 70});
+        FilledCapsule(p0, p1, iw, (Color){206, 207, 212, 255});
+        FilledCapsule(p0, p1, iw * .5f, (Color){255, 255, 255, 255});
     } break;
 
     case K_WHEEL: {
@@ -399,25 +499,32 @@ static void DrawCustom(Cust *cu, Rectangle r) {
 
     case K_CLIP: {
         GradRR(r, 6, RC(cu->a), RC(cu->b));
-        float cy = r.y + r.height - 9;
-        Texture2D wave = {0};
         int clipIndex = cu->i >> 1;
-        if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
-            for (int i = 0; i < gImportedCount; i++) {
-                if (gImported[i].waveform.id && strcmp(gImported[i].path, gTimelineClips[clipIndex].path) == 0) {
-                    wave = gImported[i].waveform; break;
-                }
+        TimelineClipUi *clip = clipIndex >= 0 && clipIndex < gTimelineClipCount ? &gTimelineClips[clipIndex] : NULL;
+        Texture2D thumb = {0}, wave = {0};
+        if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
+            ImportedMedia *media = &gImported[clip->mediaIndex];
+            thumb = media->thumbnail;
+            wave = media->waveform;
+        }
+        if (thumb.id && clip && clip->track < 4 && r.width >= 46.f) {
+            float imageY = r.y + 2.f, imageH = fmaxf(4.f, r.height - 18.f);
+            float tileW = imageH * 16.f / 9.f;
+            for (float x = r.x + 2.f; x < r.x + r.width - 2.f; x += tileW) {
+                float drawW = fminf(tileW, r.x + r.width - 2.f - x);
+                float aspect = (float)thumb.width / fmaxf(1.f, (float)thumb.height);
+                float targetAspect = drawW / fmaxf(1.f, imageH);
+                Rectangle source = {0, 0, (float)thumb.width, (float)thumb.height};
+                if (aspect > targetAspect) { source.width = source.height * targetAspect; source.x = (thumb.width - source.width) * .5f; }
+                else if (aspect < targetAspect) { source.height = source.width / targetAspect; source.y = (thumb.height - source.height) * .5f; }
+                DrawTexturePro(thumb, source, (Rectangle){x, imageY, drawW, imageH}, (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 178});
             }
         }
-        if (wave.id) {
-            Rectangle waveformRect = {r.x + 6, r.y + r.height - 19, fmaxf(0.f, r.width - 12), 15};
+        bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
+        if (wave.id && hasAudio) {
+            Rectangle waveformRect = {r.x + 6, r.y + r.height - 15, fmaxf(0.f, r.width - 12), 12};
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
-                           (Vector2){0, 0}, 0.f, (Color){235, 215, 248, 165});
-        } else {
-            for (float px = r.x + 6; px < r.x + r.width - 6; px += 3.f) {
-                float hh = (.2f + .8f * fabsf(sinf(px * .53f) * cosf(px * .17f))) * 11.f;
-                DrawLineEx((Vector2){px, cy - hh / 2}, (Vector2){px, cy + hh / 2}, 1.4f, (Color){226, 205, 240, 170});
-            }
+                           (Vector2){0, 0}, 0.f, (Color){225, 232, 255, 185});
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
@@ -552,7 +659,7 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
             char buf[512]; int n = d->stringContents.length < 511 ? d->stringContents.length : 511;
             memcpy(buf, d->stringContents.chars, n); buf[n] = 0;
             int px = PxOf(d->fontId, (float)d->fontSize);
-            DrawTextEx(FontPx(d->fontId, px), buf, (Vector2){roundf(r.x), roundf(r.y)}, (float)px, d->letterSpacing, RC(d->textColor));
+            DrawTextEx(FontPx(d->fontId, px), buf, (Vector2){roundf(r.x), roundf(r.y)}, (float)px / fmaxf(1.f, gDpiScale), d->letterSpacing, RC(d->textColor));
         } break;
         case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START: {
             float x0 = roundf(r.x), y0 = roundf(r.y), x1 = roundf(r.x + r.width), y1 = roundf(r.y + r.height);
@@ -578,6 +685,10 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         }
     }
     if (gScisN > 0) { gScisN = 0; EndScissorMode(); }
+    if (gMediaDropPreviewVisible && gMediaDropPreview.width > 0.f) {
+        FillRR(gMediaDropPreview, 5.f, (Color){136, 96, 182, 34});
+        StrokeRR(gMediaDropPreview, 5.f, 2.f, (Color){190, 150, 232, 235});
+    }
     if (gPH) {
         Color red = {240, 62, 72, 255};
         DrawLineEx(gPHPos, (Vector2){gPHPos.x, gPHPos.y + gPHLen}, 1.6f, red);
@@ -601,7 +712,8 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
     if (gMediaHoverName[0] && gMediaHoverRect.width > 0.f) {
         Vector2 mouse = GetMousePosition();
         Font font = FontPx(0, PxOf(0, 13.f));
-        Vector2 text = MeasureTextEx(font, gMediaHoverName, (float)font.baseSize, 0.f);
+        Vector2 text = MeasureTextEx(font, gMediaHoverName,
+                                     (float)font.baseSize / fmaxf(1.f, gDpiScale), 0.f);
         float tw = fminf(text.x, 330.f), th = fmaxf(22.f, text.y + 8.f);
         Rectangle tip = {mouse.x + 14.f, mouse.y + 16.f, tw + 18.f, th};
         if (tip.x + tip.width > GetScreenWidth() - 6.f) tip.x = mouse.x - tip.width - 12.f;
@@ -630,7 +742,7 @@ static void DrawPreviewQualityDropdown(void) {
         else if (rowHover) FillRR(row, 6.f, (Color){37, 39, 44, U8(255.f * t)});
         char label[16]; snprintf(label, sizeof(label), "%dp", options[i]);
         Color txt = options[i] == gPreviewRes ? RC(C_TEXT) : RC(C_DIM); txt.a = U8(txt.a * t);
-        TxtAt(0, label, row.x + 12.f, row.y + 6.f, 13.f, txt);
+        TxtAt(0, label, row.x + 12.f, row.y + 6.f, 14.f, txt);
         if (options[i] == gPreviewRes) {
             Color check = (Color){224, 226, 231, U8(255.f * t)};
             DrawLineEx((Vector2){row.x + row.width - 17.f, row.y + 14.f}, (Vector2){row.x + row.width - 13.f, row.y + 18.f}, 1.6f, check);
@@ -644,7 +756,7 @@ static Clay_Dimensions MeasureTxt(Clay_StringSlice t, Clay_TextElementConfig *cf
     char buf[512]; int n = t.length < 511 ? t.length : 511;
     memcpy(buf, t.chars, n); buf[n] = 0;
     int px = PxOf(cfg->fontId, (float)cfg->fontSize);
-    Vector2 v = MeasureTextEx(FontPx(cfg->fontId, px), buf, (float)px, cfg->letterSpacing);
+    Vector2 v = MeasureTextEx(FontPx(cfg->fontId, px), buf, (float)px / fmaxf(1.f, gDpiScale), cfg->letterSpacing);
     return (Clay_Dimensions){v.x, v.y};
 }
 static void OnClayError(Clay_ErrorData e) { printf("Clay error: %.*s\n", e.errorText.length, e.errorText.chars); }

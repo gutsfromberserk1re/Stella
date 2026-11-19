@@ -7,8 +7,9 @@ use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
 mod filters;
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     ffi::{CStr, CString},
+    hash::{Hash, Hasher},
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -85,7 +86,6 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
         path::Path,
-        process::Command,
     };
     let path = Path::new(path);
     if !path.is_file() {
@@ -109,7 +109,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let mut duration = 5.0;
     let mut has_audio = false;
     if kind != "image" {
-        let output = Command::new(multimedia_binary("ffprobe"))
+        let output = media_command(multimedia_binary("ffprobe"))
             .args([
                 "-v",
                 "error",
@@ -158,7 +158,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         let generated = if waveform.is_file() {
             true
         } else {
-            Command::new(&ffmpeg)
+            media_command(&ffmpeg)
                 .args(["-v", "error", "-i"])
                 .arg(path)
                 .args(["-filter_complex", "showwavespic=s=384x216:colors=0x9b70c8", "-frames:v", "1", "-y"])
@@ -174,7 +174,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         let generated = if thumbnail.is_file() {
             true
         } else {
-            let mut command = Command::new(&ffmpeg);
+            let mut command = media_command(&ffmpeg);
             command.args(["-v", "error"]);
             if kind == "video" {
                 command.args(["-ss", &format!("{:.3}", (duration * 0.35).max(0.0))]);
@@ -220,6 +220,43 @@ fn multimedia_binary(name: &str) -> std::path::PathBuf {
     PathBuf::from(filename)
 }
 
+fn media_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
+fn ffmpeg_uses_option_files(binary: &std::path::Path) -> bool {
+    static SUPPORTS_OPTION_FILES: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS_OPTION_FILES.get_or_init(|| {
+        media_command(binary).arg("-version").output().ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|version| {
+                let version = version.split_whitespace().nth(2)?;
+                if version.starts_with("N-") || version.starts_with("git-") { Some(true) }
+                else {
+                    let mut parts = version.split('.');
+                    let major = parts.next()?.parse::<u32>().ok()?;
+                    let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+                    Some(major > 7 || (major == 7 && minor >= 1))
+                }
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn append_filter_graph_arg(command: &mut std::process::Command, binary: &std::path::Path, path: &std::path::Path) {
+    if ffmpeg_uses_option_files(binary) {
+        command.arg("-/filter_complex").arg(path);
+    } else {
+        command.arg("-filter_complex_script").arg(path);
+    }
+}
+
 fn render_inputs(timeline: &Timeline) -> Result<(Vec<(String, bool)>, HashMap<String, usize>), String> {
     let mut clips: Vec<_> = timeline.clips.iter().filter(|clip| clip.extra.get("path").and_then(Value::as_str).is_some()).collect();
     clips.sort_by(|a, b| {
@@ -228,11 +265,18 @@ fn render_inputs(timeline: &Timeline) -> Result<(Vec<(String, bool)>, HashMap<St
     });
     let mut inputs = Vec::with_capacity(clips.len());
     let mut indices = HashMap::with_capacity(clips.len());
+    let mut path_indices = HashMap::with_capacity(clips.len());
     for clip in clips {
         let path = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
         if !std::path::Path::new(path).is_file() { return Err(format!("Media file is missing: {path}")); }
+        if let Some(&input_index) = path_indices.get(path) {
+            indices.insert(clip.id.clone(), input_index);
+            continue;
+        }
         let image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
-        indices.insert(clip.id.clone(), inputs.len());
+        let input_index = inputs.len();
+        indices.insert(clip.id.clone(), input_index);
+        path_indices.insert(path.to_owned(), input_index);
         inputs.push((path.to_owned(), image));
     }
     Ok((inputs, indices))
@@ -318,7 +362,6 @@ fn ffmpeg_error(output: std::process::Output) -> String {
 }
 
 fn export_project(request: &Value, id: u64) -> Result<Value, String> {
-    use std::process::Command;
     let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
     let output_path = request["path"].as_str().ok_or("Export path is required")?;
     let width = request["width"].as_u64().unwrap_or(1920).clamp(320, 3840) as u32;
@@ -326,8 +369,10 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
     let (graph, inputs, duration, has_audio) = export_filter_graph(&timeline, width, height, fps)?;
     let script = filter_script(id, &graph)?;
-    let mut command = Command::new(multimedia_binary("ffmpeg"));
-    command.args(["-hide_banner", "-loglevel", "error", "-filter_complex_script"]).arg(&script);
+    let ffmpeg = multimedia_binary("ffmpeg");
+    let mut command = media_command(&ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error"]);
+    append_filter_graph_arg(&mut command, &ffmpeg, &script);
     for (path, image) in inputs {
         if image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
         command.arg("-i").arg(path);
@@ -343,8 +388,49 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     Ok(json!({"outputPath": output_path, "duration": duration, "width": width, "height": height, "fps": fps}))
 }
 
+fn preview_cache_path(timeline: &Timeline, at: f64, height: u32) -> Result<std::path::PathBuf, String> {
+    let mut hasher = DefaultHasher::new();
+    "stella-preview-v1".hash(&mut hasher);
+    serde_json::to_vec(timeline).map_err(|e| e.to_string())?.hash(&mut hasher);
+    at.to_bits().hash(&mut hasher);
+    height.hash(&mut hasher);
+    for clip in &timeline.clips {
+        if let Some(path) = clip.extra.get("path").and_then(Value::as_str) {
+            path.hash(&mut hasher);
+            if let Ok(metadata) = std::fs::metadata(path) {
+                metadata.len().hash(&mut hasher);
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) { age.as_nanos().hash(&mut hasher); }
+                }
+            }
+        }
+    }
+    let cache_dir = std::env::temp_dir().join("pluto-media-cache");
+    Ok(cache_dir.join(format!("preview-v1-{:016x}.png", hasher.finish())))
+}
+
+fn prune_preview_cache(directory: &std::path::Path, keep: &std::path::Path) {
+    static PRUNE_TICK: AtomicU64 = AtomicU64::new(0);
+    if PRUNE_TICK.fetch_add(1, Ordering::Relaxed) % 32 != 0 { return; }
+    let mut entries: Vec<_> = match std::fs::read_dir(directory) {
+        Ok(items) => items.filter_map(Result::ok).filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("preview-v1-") || path.extension().and_then(|s| s.to_str()) != Some("png") { return None; }
+            let modified = entry.metadata().and_then(|meta| meta.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, path))
+        }).collect(),
+        Err(_) => return,
+    };
+    if entries.len() <= 128 { return; }
+    entries.sort_by_key(|(modified, _)| *modified);
+    let remove_count = entries.len() - 128;
+    for (_, path) in entries.into_iter().filter(|(_, path)| path.as_path() != keep).take(remove_count) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
-    use std::process::Command;
     let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
     let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
     let height = request["height"].as_u64().unwrap_or(720).clamp(240, 1080) as u32;
@@ -360,8 +446,17 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         let order = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
-    let out = std::env::temp_dir().join("pluto-media-cache").join(format!("preview-{id}.png"));
+    for clip in &active {
+        let path = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
+        if !std::path::Path::new(path).is_file() { return Err(format!("Media file is missing: {path}")); }
+    }
+    let out = preview_cache_path(&timeline, at, height)?;
     std::fs::create_dir_all(out.parent().ok_or("Invalid preview cache path")?).map_err(|e| e.to_string())?;
+    if out.metadata().is_ok_and(|meta| meta.len() > 24) {
+        return Ok(json!({"previewPath": out.to_string_lossy(), "at": at, "width": width, "height": height}));
+    }
+    let _ = std::fs::remove_file(&out);
+    let render_out = out.with_file_name(format!("preview-render-{id}.png"));
     let mut graph = vec![format!("color=c=black:s={width}x{height}:r=30:d=1,format=rgba[base0]")];
     let mut inputs: Vec<(String, bool, f64)> = Vec::new();
     let mut base = "base0".to_owned();
@@ -408,17 +503,24 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
     }
     graph.push(format!("[{base}]format=rgba[preview]"));
     let script = filter_script(id, &graph.join(";"))?;
-    let mut command = Command::new(multimedia_binary("ffmpeg"));
-    command.args(["-hide_banner", "-loglevel", "error", "-filter_threads", "1", "-filter_complex_script"]).arg(&script);
+    let ffmpeg = multimedia_binary("ffmpeg");
+    let mut command = media_command(&ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error", "-filter_threads", "1"]);
+    append_filter_graph_arg(&mut command, &ffmpeg, &script);
     for (path, image, source_at) in inputs {
         if !image { command.args(["-ss", &format!("{source_at:.4}")]); }
         else { command.args(["-loop", "1", "-framerate", "30"]); }
         command.arg("-i").arg(path);
     }
-    command.args(["-map", "[preview]", "-frames:v", "1", "-threads", "1", "-y"]).arg(&out);
+    command.args(["-map", "[preview]", "-frames:v", "1", "-threads", "1", "-y"]).arg(&render_out);
     let result = command.output().map_err(|e| format!("Could not start FFmpeg: {e}"))?;
     let _ = std::fs::remove_file(script);
-    if !result.status.success() { return Err(ffmpeg_error(result)); }
+    if !result.status.success() {
+        let _ = std::fs::remove_file(&render_out);
+        return Err(ffmpeg_error(result));
+    }
+    std::fs::rename(&render_out, &out).map_err(|e| format!("Could not cache preview frame: {e}"))?;
+    prune_preview_cache(out.parent().ok_or("Invalid preview cache path")?, &out);
     Ok(json!({"previewPath": out.to_string_lossy(), "at": at, "width": width, "height": height}))
 }
 
@@ -460,6 +562,36 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let clip: Clip =
                 serde_json::from_value(request["clip"].clone()).map_err(|e| e.to_string())?;
             timeline.add_clip(clip).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_group_clips" => {
+            let before = timeline.clone();
+            let ids: Vec<String> = serde_json::from_value(request["ids"].clone()).map_err(|e| e.to_string())?;
+            let group_id = request["groupId"].as_str().ok_or("Group id is required")?;
+            timeline.group_clips(&ids, group_id).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_ungroup_clip" => {
+            let before = timeline.clone();
+            timeline.ungroup_clip(request["id"].as_str().ok_or("Clip id is required")?)
+                .map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_separate_audio" => {
+            let before = timeline.clone();
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let audio_id = request["audioId"].as_str().ok_or("Audio clip id is required")?;
+            timeline.separate_audio(id, audio_id.to_owned()).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_unlink_clip" => {
+            let before = timeline.clone();
+            timeline.unlink_clip(request["id"].as_str().ok_or("Clip id is required")?)
+                .map_err(|e| format!("{e:?}"))?;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }

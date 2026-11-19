@@ -2,8 +2,8 @@
 /* ------------------------------------------------------------------ */
 /* palette                                                             */
 /* ------------------------------------------------------------------ */
-#define RGB(r,g,b)     ((Clay_Color){(r) < 255 ? (r) + 1 : (r), (g), (b) > 4 ? (b) - 4 : (b), 255})
-#define RGBA(r,g,b,a)  ((Clay_Color){(r) < 255 ? (r) + 1 : (r), (g), (b) > 4 ? (b) - 4 : (b), (a)})
+#define RGB(r,g,b)     ((Clay_Color){(r), (g), (b), 255})
+#define RGBA(r,g,b,a)  ((Clay_Color){(r), (g), (b), (a)})
 #define C_BG        RGB(11,11,13)
 #define C_PANEL     RGB(23,24,28)
 #define C_PBORDER   RGB(36,38,43)
@@ -74,7 +74,8 @@ static Cust *NC(int k, Clay_Color a, Clay_Color b, Clay_Color c, float v, float 
 /* ------------------------------------------------------------------ */
 /* globals / state                                                     */
 /* ------------------------------------------------------------------ */
-static float gFK[2] = {1.f, 1.f};   /* per-font size multiplier (normalises em size across fonts) */
+static float gFK[3] = {1.f, 1.f, 1.f};   /* per-weight font metrics normalisation */
+static float gDpiScale = 1.f;
 static float gDt;
 static float gWheelDelta;
 static bool gCtrlDown;
@@ -92,6 +93,8 @@ static Rectangle gPreviewQualityRect;
 static float gMediaZoom = 1.f;
 static char gMediaHoverName[260];
 static Rectangle gMediaHoverRect;
+static Rectangle gMediaDropPreview;
+static bool gMediaDropPreviewVisible;
 static int   gTimelineTool;
 static float gTimelineZoom = 1.f, gTimelinePan, gPlayhead;
 static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineGrid;
@@ -181,14 +184,23 @@ static char gBackendMessage[256];
 
 #define MAX_TIMELINE_CLIPS 256
 typedef struct {
-    char id[64], label[260], path[1024];
-    int track; /* 0 = video 1, 1 = audio 1 */
+    char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
+    int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
     float start, duration;
+    bool hasAudio;
     float keyframes[32];
     int keyframeCount;
 } TimelineClipUi;
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;
+static bool gTimelineMultiSelect[MAX_TIMELINE_CLIPS];
+static int gTimelineSelectionAnchor = -1;
+static bool gTimelineContextOpen;
+static bool gTimelineContextConsumedClick;
+static int gTimelineContextClip = -1;
+static Vector2 gTimelineContextPos;
+static Rectangle gTimelineContextRect;
+static int gTimelineVideoTracks = 1, gTimelineAudioTracks = 1;
 static float TimelinePps(void);
 static float TimelineDuration(void);
 
@@ -210,25 +222,26 @@ static const char *Fmt(const char *f, ...) {
 /* ------------------------------------------------------------------ */
 /* crisp font cache: one atlas per (font, exact pixel size)            */
 /* ------------------------------------------------------------------ */
-static char gFontPath[2][260];
-static bool gFontOK[2];
+static char gFontPath[3][260];
+static bool gFontOK[3];
 static int  gFcps[100], gFcpN;
 typedef struct { int slot, px; Font f; } FontEnt;
-static FontEnt gFC[96];
+static FontEnt gFC[160];
 static int gFCN;
 
 static int PxOf(int slot, float size) {
-    int p = (int)roundf(size * gFK[slot]);
-    return p < 6 ? 6 : p > 96 ? 96 : p;
+    int p = (int)roundf(size * gFK[slot] * gDpiScale);
+    return p < 6 ? 6 : p > 192 ? 192 : p;
 }
 static Font FontPx(int slot, int px) {
+    if (slot < 0 || slot > 2) slot = 0;
     if (!gFontOK[slot]) return GetFontDefault();
     for (int i = 0; i < gFCN; i++)
         if (gFC[i].slot == slot && gFC[i].px == px) return gFC[i].f;
-    if (gFCN >= 96) return GetFontDefault();
+    if (gFCN >= 160) return GetFontDefault();
     Font f = LoadFontEx(gFontPath[slot], px, gFcps, gFcpN);
     if (f.texture.id == 0) { gFontOK[slot] = false; return GetFontDefault(); }
-    SetTextureFilter(f.texture, TEXTURE_FILTER_POINT);
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
     gFC[gFCN].slot = slot; gFC[gFCN].px = px; gFC[gFCN].f = f;
     return gFC[gFCN++].f;
 }
@@ -314,10 +327,13 @@ static Clay_Color BtnBg(Clay_Color base, Clay_Color hov, Bs b) { return Mix(base
 static Clay_String S(const char *s) { return (Clay_String){.isStaticallyAllocated = false, .length = (int32_t)strlen(s), .chars = s}; }
 
 static void Tx(const char *s, float size, Clay_Color c, int font) {
-    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
 }
 static void TxWrap(const char *s, float size, Clay_Color c, int font) {
-    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+}
+static void TxMedium(const char *s, float size, Clay_Color c) {
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = 1, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
 }
 static void IconV(int k, float sz, Clay_Color c, float v) {
     CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},

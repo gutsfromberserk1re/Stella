@@ -119,12 +119,24 @@ impl Timeline {
         tracks
     }
 
-    pub fn add_clip(&mut self, clip: Clip) -> Result<(), TimelineError> {
+    pub fn add_clip(&mut self, mut clip: Clip) -> Result<(), TimelineError> {
         clip.validate()?;
         if self.clips.iter().any(|current| current.id == clip.id) {
             return Err(TimelineError::DuplicateId(clip.id));
         }
+        if clip.track.is_video() && self.snapping {
+            clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25);
+        }
+        let requested_track = clip.track;
+        clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
+            .unwrap_or(requested_track);
+        let needs_ripple = clip.track == requested_track
+            && self.lane_overlaps(&clip.id, clip.track, clip.start, clip.duration);
+        let id = clip.id.clone();
         self.clips.push(clip);
+        if needs_ripple {
+            self.ripple_lane_after(&id)?;
+        }
         self.refresh_duration();
         Ok(())
     }
@@ -151,22 +163,44 @@ impl Timeline {
             return Err(TimelineError::InvalidRange);
         }
         let mut start = desired_start.max(0.0);
-        if self.snapping {
+        if self.snapping && original.track.is_video() {
             start = self.snap_start(id, start, original.duration, playhead, snap_threshold);
         }
-        let lane = self.nearest_free_lane(id, desired_track, start, original.duration)?;
+        let lane = self.nearest_free_lane(id, desired_track, start, original.duration)
+            .unwrap_or(desired_track);
         let delta = start - original.start;
         let mut moved = original.clone();
         moved.start = start;
         moved.track = lane;
         self.replace(moved.clone());
+        if self.lane_overlaps(id, lane, start, moved.duration) {
+            self.ripple_lane_after(id)?;
+            moved = self.find(id)?.clone();
+        }
 
-        if let Some(linked_id) = original.linked_clip_id.as_deref() {
-            if let Some(mut linked) = self.clips.iter().find(|c| c.id == linked_id).cloned() {
-                linked.start = (linked.start + delta).max(0.0);
-                self.replace(linked);
+        let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let mut moved_ids = HashSet::from([id.to_owned()]);
+        if let Some(group_id) = group_id.as_deref() {
+            let members: Vec<_> = self.clips.iter()
+                .filter(|clip| clip.id != id && clip.extra.get("groupId").and_then(serde_json::Value::as_str) == Some(group_id))
+                .cloned().collect();
+            for mut member in members {
+                member.start = (member.start + delta).max(0.0);
+                moved_ids.insert(member.id.clone());
+                self.replace(member);
             }
         }
+
+        if let Some(linked_id) = original.linked_clip_id.as_deref() {
+            if !moved_ids.contains(linked_id) {
+                if let Some(mut linked) = self.clips.iter().find(|c| c.id == linked_id).cloned() {
+                linked.start = (linked.start + delta).max(0.0);
+                self.replace(linked);
+                }
+            }
+        }
+        let moved_group_ids: Vec<_> = moved_ids.into_iter().collect();
+        for moved_id in moved_group_ids { self.ripple_lane_after(&moved_id)?; }
         self.refresh_duration();
         Ok(moved)
     }
@@ -237,6 +271,62 @@ impl Timeline {
         Ok(deleted)
     }
 
+    pub fn group_clips(&mut self, ids: &[String], group_id: &str) -> Result<(), TimelineError> {
+        let unique: HashSet<_> = ids.iter().map(String::as_str).collect();
+        if unique.len() < 2 || group_id.trim().is_empty() { return Err(TimelineError::InvalidRange); }
+        for id in &unique { self.find(id)?; }
+        for id in unique {
+            let clip = self.clips.iter_mut().find(|clip| clip.id == id).ok_or_else(|| TimelineError::ClipNotFound(id.into()))?;
+            clip.extra.insert("groupId".into(), serde_json::json!(group_id));
+        }
+        Ok(())
+    }
+
+    pub fn ungroup_clip(&mut self, id: &str) -> Result<(), TimelineError> {
+        let group_id = self.find(id)?.extra.get("groupId").and_then(serde_json::Value::as_str)
+            .ok_or(TimelineError::InvalidRange)?.to_owned();
+        for clip in &mut self.clips {
+            if clip.extra.get("groupId").and_then(serde_json::Value::as_str) == Some(group_id.as_str()) {
+                clip.extra.remove("groupId");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn separate_audio(&mut self, id: &str, audio_id: String) -> Result<Clip, TimelineError> {
+        if audio_id.trim().is_empty() || self.clips.iter().any(|clip| clip.id == audio_id) {
+            return Err(TimelineError::InvalidRange);
+        }
+        let mut video = self.find(id)?.clone();
+        if !video.track.is_video()
+            || video.extra.get("hasAudio").and_then(serde_json::Value::as_bool) != Some(true)
+            || video.extra.get("kind").and_then(serde_json::Value::as_str) == Some("audio")
+        { return Err(TimelineError::InvalidRange); }
+        let mut audio = video.clone();
+        audio.id = audio_id.clone();
+        audio.track = TrackId::A1;
+        audio.label = format!("{} Audio", video.label);
+        audio.linked_clip_id = Some(video.id.clone());
+        audio.extra.insert("kind".into(), serde_json::json!("audio"));
+        audio.extra.insert("hasAudio".into(), serde_json::json!(true));
+        video.linked_clip_id = Some(audio_id.clone());
+        video.extra.insert("hasAudio".into(), serde_json::json!(false));
+        self.replace(video);
+        self.add_clip(audio)?;
+        Ok(self.find(&audio_id)?.clone())
+    }
+
+    pub fn unlink_clip(&mut self, id: &str) -> Result<(), TimelineError> {
+        let mut clip = self.find(id)?.clone();
+        let linked_id = clip.linked_clip_id.take().ok_or(TimelineError::InvalidRange)?;
+        self.replace(clip);
+        if let Some(mut linked) = self.clips.iter().find(|current| current.id == linked_id).cloned() {
+            linked.linked_clip_id = None;
+            self.replace(linked);
+        }
+        Ok(())
+    }
+
     fn snap_start(
         &self,
         id: &str,
@@ -249,7 +339,7 @@ impl Timeline {
         for candidate in std::iter::once(playhead).chain(
             self.clips
                 .iter()
-                .filter(|c| c.id != id)
+                .filter(|c| c.id != id && c.track.is_video())
                 .flat_map(|c| [c.start, c.end()]),
         ) {
             for (edge, offset) in [(start, 0.0), (start + duration, duration)] {
@@ -260,6 +350,33 @@ impl Timeline {
             }
         }
         best.map_or(start, |(_, value)| value.max(0.0))
+    }
+
+    fn lane_overlaps(&self, id: &str, track: TrackId, start: f64, duration: f64) -> bool {
+        self.clips.iter().any(|c| {
+            c.id != id && c.track == track
+                && start < c.end() - EPSILON
+                && start + duration > c.start + EPSILON
+        })
+    }
+
+    /// Keep the dropped/moved clip at its chosen time and push any clips it
+    /// collides with later on the same lane, preserving their order.
+    fn ripple_lane_after(&mut self, anchor_id: &str) -> Result<(), TimelineError> {
+        let anchor = self.find(anchor_id)?.clone();
+        let group_id = anchor.extra.get("groupId").and_then(serde_json::Value::as_str);
+        let mut followers: Vec<_> = self.clips.iter()
+            .filter(|c| c.id != anchor_id && c.track == anchor.track && c.end() > anchor.start + EPSILON
+                && (group_id.is_none() || c.extra.get("groupId").and_then(serde_json::Value::as_str) != group_id))
+            .cloned().collect();
+        followers.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+        let mut cursor = anchor.end();
+        for mut clip in followers {
+            if clip.start < cursor - EPSILON { clip.start = cursor; }
+            cursor = clip.end();
+            self.replace(clip);
+        }
+        Ok(())
     }
 
     fn nearest_free_lane(
