@@ -2,8 +2,8 @@
 /* ------------------------------------------------------------------ */
 /* palette                                                             */
 /* ------------------------------------------------------------------ */
-#define RGB(r,g,b)     ((Clay_Color){r,g,b,255})
-#define RGBA(r,g,b,a)  ((Clay_Color){r,g,b,a})
+#define RGB(r,g,b)     ((Clay_Color){(r) < 255 ? (r) + 1 : (r), (g), (b) > 4 ? (b) - 4 : (b), 255})
+#define RGBA(r,g,b,a)  ((Clay_Color){(r) < 255 ? (r) + 1 : (r), (g), (b) > 4 ? (b) - 4 : (b), (a)})
 #define C_BG        RGB(11,11,13)
 #define C_PANEL     RGB(23,24,28)
 #define C_PBORDER   RGB(36,38,43)
@@ -113,7 +113,7 @@ static Rectangle gLFadeR; static float gLFadeA;      /* fade overlay while switc
 #define TL_MAX     560.f
 #define CENTER_MIN 400.f     /* preview never gets narrower than this */
 #define MAIN_MIN   300.f     /* panels row never gets shorter than this */
-static float gLeftW = 288.25f, gRightW = 376.25f, gTimeH = 286.25f;
+static float gLeftW = 288.25f, gRightW = 376.25f, gTimeH = 320.25f;
 static int   gSplit;                                  /* 0 none, 1 left, 2 right, 3 timeline */
 static float gSplitM, gSplitV;                        /* mouse + size when the drag started */
 static int   gResize;                                 /* cursor: 0 normal, 1 horizontal, 2 vertical */
@@ -129,6 +129,12 @@ static bool  gTransOpen = true;                       /* effects: transitions ca
 static int   gFilter = 0;                             /* effects: selected preset */
 static uint32_t gDragId;                              /* active drag target (slider/ruler) */
 static int   gDragWheel = -1;
+static uint32_t gEditValueId, gLastValueClickId, gValueDragId;
+static char gEditValueText[32];
+static int gEditValueLen;
+static double gLastValueClickTime;
+static bool gValueDragging;
+static float gValueDragX, gValueDragStart;
 
 /* rotation ruler geometry (inside the 322px wide ruler box) */
 #define RULER_L 22.f
@@ -166,7 +172,7 @@ static Font FontPx(int slot, int px) {
     if (gFCN >= 96) return GetFontDefault();
     Font f = LoadFontEx(gFontPath[slot], px, gFcps, gFcpN);
     if (f.texture.id == 0) { gFontOK[slot] = false; return GetFontDefault(); }
-    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(f.texture, TEXTURE_FILTER_POINT);
     gFC[gFCN].slot = slot; gFC[gFCN].px = px; gFC[gFCN].f = f;
     return gFC[gFCN++].f;
 }
@@ -236,15 +242,15 @@ static Clay_Color Dark(Clay_Color c, float t) { return Mix(c, (Clay_Color){0, 0,
 typedef struct { float hover, press; bool clicked; } Bs;
 static Bs Interact(Clay_ElementId id) {
     bool over = Clay_PointerOver(id);
-    bool down = over && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     if (over) gHand = true;
     Bs b;
     b.hover   = Anim(id.id, over ? 1.f : 0.f, 18.f);
-    b.press   = Anim(id.id ^ 0x9E3779B9u, down ? 1.f : 0.f, 60.f);
+    /* Keep controls calm while clicking; hover remains the interaction cue. */
+    b.press   = 0.f;
     b.clicked = over && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
     return b;
 }
-static Clay_Color BtnBg(Clay_Color base, Clay_Color hov, Bs b) { return Mix(Mix(base, hov, b.hover), RGB(90, 95, 106), b.press * 0.6f); }
+static Clay_Color BtnBg(Clay_Color base, Clay_Color hov, Bs b) { return Mix(base, hov, b.hover * 0.72f); }
 
 /* ------------------------------------------------------------------ */
 /* text + icon helpers                                                 */

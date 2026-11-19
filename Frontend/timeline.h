@@ -7,7 +7,7 @@ static void Timeline(void) {
     float extra = fmaxf(0.f, bodyH - 26.f);
 
     CLAY(CLAY_ID("Timeline"), {.layout = {COLM, .sizing = {GROW, CLAY_SIZING_FIXED(gTimeH)}}, PANEL}) {
-        CLAY(CLAY_ID("TlBar"), {.layout = {.sizing = {GROW, FIX(52)}, .padding = {14, 12, 0, 0}, .childGap = 4, .childAlignment = AL_Y}}) {
+        CLAY(CLAY_ID("TlBar"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 12, 0, 0}, .childGap = 4, .childAlignment = AL_Y}}) {
             IconBtn(CLAY_ID("ToolPtr"),  I_POINTER,  36, 18, C_TEXT, true, 9);
             IconBtn(CLAY_ID("ToolHand"), I_HAND,     36, 18, C_DIM, false, 9);
             IconBtn(CLAY_ID("ToolCut"),  I_SCISSORS, 36, 18, C_DIM, false, 9);
@@ -40,27 +40,27 @@ static void Timeline(void) {
             }
         }
         CLAY(CLAY_ID("TimeBody"), {.layout = {COLM, .sizing = {GROW, GROW}}}) {
-            CLAY(CLAY_ID("RulerRow"), {.layout = {.sizing = {GROW, FIX(26)}}}) {
+            CLAY(CLAY_ID("RulerRow"), {.layout = {.sizing = {GROW, FIX(30)}}}) {
                 GAPX(60)
                 CLAY(CLAY_ID("Ruler"), {.layout = {.sizing = {GROW, GROW}}, .custom = {.customData = NC(K_RULER, C_CARD, C_CARD, C_CARD, 0, extra, 0)}}) {}
             }
-            CLAY(CLAY_ID("TrackV1"), {.layout = {.sizing = {GROW, FIX(47)}, .childAlignment = AL_Y}, .backgroundColor = C_ROW,
+            CLAY(CLAY_ID("TrackV1"), {.layout = {.sizing = {GROW, FIX(56)}, .childAlignment = AL_Y}, .backgroundColor = C_ROW,
                                       .border = {.color = RGB(32, 34, 39), .width = {.top = 1, .bottom = 1}}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
-                    Icon(I_FILM, 12, C_MUTED); Tx("V1", 11, C_MUTED, 0);
+                    Icon(I_FILM, 14, C_MUTED); Tx("V1", 13, C_MUTED, 0);
                 }
                 Clay_ElementId cid = CLAY_ID("Clip");
                 Bs cb = Interact(cid);
-                CLAY(cid, {.layout = {.sizing = {FIX(193), FIX(42)}, .padding = {10, 6, 5, 0}, .childGap = 5},
+                CLAY(cid, {.layout = {.sizing = {FIX(193), FIX(50)}, .padding = {10, 6, 5, 0}, .childGap = 5},
                            .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, cb.hover, 0)}}) {
-                    Icon(I_FILM, 11, C_TEXT);
-                    Tx("City at dusk.mp4", 11, C_TEXT, 1);
+                    Icon(I_FILM, 13, C_TEXT);
+                    Tx("City at dusk.mp4", 13, C_TEXT, 1);
                 }
             }
-            CLAY(CLAY_ID("TrackA1"), {.layout = {.sizing = {GROW, FIX(47)}, .childAlignment = AL_Y}, .backgroundColor = RGB(21, 22, 26),
+            CLAY(CLAY_ID("TrackA1"), {.layout = {.sizing = {GROW, FIX(56)}, .childAlignment = AL_Y}, .backgroundColor = RGB(21, 22, 26),
                                       .border = {.color = RGB(32, 34, 39), .width = {.bottom = 1}}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
-                    Icon(I_NOTE, 12, C_MUTED); Tx("A1", 11, C_MUTED, 0);
+                    Icon(I_NOTE, 14, C_MUTED); Tx("A1", 13, C_MUTED, 0);
                 }
             }
         }

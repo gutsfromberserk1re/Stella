@@ -207,8 +207,11 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     case K_KNOB: {
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        DrawCircleV(c, rad, LerpC((Color){46, 48, 55, 255}, (Color){90, 94, 104, 255}, cu->f));
-        RadGrad(c, rad - 1.5f, (Color){40, 41, 48, 255}, (Color){20, 21, 25, 255});
+        DrawCircleV((Vector2){c.x, c.y + 1.5f}, rad + 1.f, (Color){0, 0, 0, 100});
+        DrawCircleV(c, rad, LerpC((Color){52, 53, 59, 255}, (Color){78, 80, 86, 255}, cu->f));
+        RadGrad(c, rad - 1.5f, (Color){47, 48, 54, 255}, (Color){20, 21, 24, 255});
+        Ring(c, rad - 1.f, 1.f, (Color){91, 93, 99, 190});
+        DrawEllipse((int)c.x, (int)(c.y - rad * .36f), rad * .54f, rad * .12f, (Color){255, 255, 255, 13});
         float ang = (cu->v - .5f) * 4.7f;
         Vector2 d = {sinf(ang), -cosf(ang)};
         DrawLineEx((Vector2){c.x + d.x * rad * .74f, c.y + d.y * rad * .74f}, (Vector2){c.x + d.x * rad * .88f, c.y + d.y * rad * .88f}, 3.f, (Color){228, 229, 233, 255});
@@ -319,7 +322,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             if (px > r.x + r.width) break;
             bool major = (s % 5 == 0);
             DrawLineEx((Vector2){px, bottom - (major ? 10 : 5)}, (Vector2){px, bottom}, 1.f, (Color){72, 75, 84, 255});
-            if (major) { char b[16]; snprintf(b, sizeof b, "%d:%02d", s / 60, s % 60); TxtAt(0, b, px + 3, r.y + 3, 10, RC(C_MUTED)); }
+            if (major) { char b[16]; snprintf(b, sizeof b, "%d:%02d", s / 60, s % 60); TxtAt(0, b, px + 3, r.y + 3, 12, RC(C_MUTED)); }
         }
         gPH = true; gPHPos = (Vector2){r.x, r.y + 4}; gPHLen = r.height - 4 + cu->f;
     } break;

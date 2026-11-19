@@ -88,16 +88,66 @@ static void ValBox(const char *s, const char *unit, float w, float h, float fs, 
     }
 }
 
+static void CommitValueEdit(float *v) {
+    if (gEditValueLen > 0) *v = strtof(gEditValueText, NULL);
+    gEditValueId = 0;
+}
+
+static void ValueFieldLogic(Clay_ElementId id, float *v) {
+    bool over = Clay_PointerOver(id);
+    if (gEditValueId == id.id) {
+        if (IsKeyPressed(KEY_ENTER)) CommitValueEdit(v);
+        else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
+        int ch;
+        while ((ch = GetCharPressed()) != 0) {
+            if (((ch >= '0' && ch <= '9') || ch == '.' || ch == '-') && gEditValueLen < (int)sizeof(gEditValueText) - 1) {
+                gEditValueText[gEditValueLen++] = (char)ch;
+                gEditValueText[gEditValueLen] = 0;
+            }
+        }
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over) CommitValueEdit(v);
+    } else if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        gValueDragId = id.id;
+        gValueDragging = false;
+        gValueDragX = GetMousePosition().x;
+        gValueDragStart = *v;
+    }
+    if (gValueDragId == id.id) {
+        float dx = GetMousePosition().x - gValueDragX;
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && fabsf(dx) > 3.f) {
+            gValueDragging = true;
+            *v = gValueDragStart + dx * 0.2f;
+        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if (!gValueDragging) {
+                double now = GetTime();
+                if (gLastValueClickId == id.id && now - gLastValueClickTime < 0.38) {
+                    gEditValueId = id.id;
+                    gEditValueLen = 0;
+                    gEditValueText[0] = 0;
+                }
+                gLastValueClickId = id.id;
+                gLastValueClickTime = now;
+            }
+            gValueDragId = 0;
+            gValueDragging = false;
+        }
+    }
+}
+
 /* number field (GROW x 39): value + unit + up/down steppers */
 static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId id = CLAY_IDI("NumF", n);
+    Clay_ElementId valueId = CLAY_IDI("NumValue", n);
     Bs b = Interact(id);
+    ValueFieldLogic(valueId, v);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
-              .backgroundColor = Mix(Mix(C_RFIELD, RGB(46, 47, 54), b.hover), RGB(70, 73, 83), b.press * 0.8f), .cornerRadius = CLAY_CORNER_RADIUS(11),
+              .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         HSPACE
-        Tx(Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
-        Tx(unit, 17, C_ICON, 0);
+        CLAY(valueId, {.layout = {.sizing = {FIT, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
+            Tx(gEditValueId == valueId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
+            Tx(unit, 17, C_ICON, 0);
+        }
         GAPX(3)
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}}}) {
             if (Arrow(CLAY_IDI("NumU", n), I_CHEV_UP)) *v += 1.f;
@@ -158,7 +208,7 @@ static bool NavButton(int n, int icon, const char *label, float open) {
     Clay_Color hov  = Mix(RGB(38, 40, 46), RGB(48, 50, 58), open);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(64)}, .padding = {16, 18, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
               .backgroundColor = BtnBg(base, hov, b), .cornerRadius = CLAY_CORNER_RADIUS(20),
-              .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+              .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover * 0.72f, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Icon(icon, 29, Mix(C_ICON, C_TEXT, open));
         Tx(label, 19, C_TEXT, 0);
         HSPACE
@@ -546,7 +596,7 @@ static bool FxHeader(int i, float open) {
     Clay_Color hov  = Mix(RGB(38, 40, 46), RGB(48, 50, 58), open);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(FX_ITEM_H)}, .padding = {14, 10, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
               .backgroundColor = BtnBg(base, hov, b), .cornerRadius = CLAY_CORNER_RADIUS(14),
-              .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+              .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover * 0.72f, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Icon(kFx[i].icon, 22, Mix(C_ICON, C_TEXT, open));
         Tx(kFx[i].name, 16, C_TEXT, 0);
         HSPACE
