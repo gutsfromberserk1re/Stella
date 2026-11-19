@@ -88,11 +88,11 @@ static void ValBox(const char *s, const char *unit, float w, float h, float fs, 
     }
 }
 
-/* number field (112 x 39): value + unit + up/down steppers */
+/* number field (GROW x 39): value + unit + up/down steppers */
 static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId id = CLAY_IDI("NumF", n);
     Bs b = Interact(id);
-    CLAY(id, {.layout = {.sizing = {FIX(112), FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
               .backgroundColor = Mix(Mix(C_RFIELD, RGB(46, 47, 54), b.hover), RGB(70, 73, 83), b.press * 0.8f), .cornerRadius = CLAY_CORNER_RADIUS(11),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         HSPACE
@@ -107,10 +107,10 @@ static void NumField(int n, float *v, const char *unit) {
 }
 
 /* small field used by crop / distort panels (T, L, R, B, TL, TR, BL, BR) */
-static void MiniField(int n, const char *lab) {
+static void MiniFieldW(int n, const char *lab, Clay_SizingAxis w) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Bs b = Interact(id);
-    CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
+    CLAY(id, {.layout = {.sizing = {w, FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
               .backgroundColor = Mix(Mix(C_RFIELD, RGB(46, 47, 54), b.hover), RGB(70, 73, 83), b.press * 0.8f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Tx(lab, 12, RGB(112, 124, 156), 1);
@@ -123,6 +123,9 @@ static void MiniField(int n, const char *lab) {
         }
     }
 }
+
+/* default: fills its row; T/B in the crop panel pass a fixed width to stay compact */
+static void MiniField(int n, const char *lab) { MiniFieldW(n, lab, CLAY_SIZING_GROW(0)); }
 
 /* Position / Scale card: exactly 169 px tall
    12 pad | 24 header | 6 | 39 field | 34 link row | 39 field | 15 pad */
@@ -172,25 +175,23 @@ static bool NavButton(int n, int icon, const char *label, float open) {
 static void CropBody(void) {
     CLAY(CLAY_ID("CropBody"), {.layout = {COLM, .sizing = {GROW, FIX(CROP_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10,
                                           .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}, RCARD}) {
-        MiniField(0, "T");
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
+        MiniFieldW(0, "T", CLAY_SIZING_FIXED(112));
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
             MiniField(1, "L");
-            HSPACE
             if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 30, 20)) gLink[2] = !gLink[2];
-            HSPACE
             MiniField(2, "R");
         }
-        MiniField(3, "B");
+        MiniFieldW(3, "B", CLAY_SIZING_FIXED(112));
     }
 }
 
 static void DistortBody(void) {
     CLAY(CLAY_ID("DistBody"), {.layout = {COLM, .sizing = {GROW, FIX(DIST_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10}, RCARD}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(4, "TL"); HSPACE MiniField(5, "TR"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) { MiniField(4, "TL"); MiniField(5, "TR"); }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
             if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 30, 20)) gLink[3] = !gLink[3];
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(6, "BL"); HSPACE MiniField(7, "BR"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) { MiniField(6, "BL"); MiniField(7, "BR"); }
     }
 }
 
@@ -591,4 +592,3 @@ static void RightPanel(void) {
         }
     }
 }
-
