@@ -95,7 +95,7 @@ static void DurRow(int gi, const char *label) {
         }
         Clay_ElementId sid = CLAY_IDI("Dur", gi);
         Bs bs = Interact(sid);
-        SliderLogic(sid, gi, 7.f);
+        SliderLogic(sid, gi, 9.f);
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(20)}},
                    .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, gSl[gi],
                                                (bs.hover + (gSlDrag[gi] ? 1.f : 0.f)) * 1.5f, 0)}}) {}
@@ -185,3 +185,4 @@ static void LeftPanel(void) {
         }
     }
 }
+

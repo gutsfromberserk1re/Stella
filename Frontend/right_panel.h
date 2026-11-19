@@ -106,11 +106,12 @@ static void NumField(int n, float *v, const char *unit) {
     }
 }
 
-/* small field used by crop / distort panels (T, L, R, B, TL, TR, BL, BR) */
-static void MiniFieldW(int n, const char *lab, Clay_SizingAxis w) {
+/* small field used by crop / distort panels (T, L, R, B, TL, TR, BL, BR).
+   Deliberately fixed-width: these stay compact and the spacers around them absorb extra width. */
+static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Bs b = Interact(id);
-    CLAY(id, {.layout = {.sizing = {w, FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
+    CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
               .backgroundColor = Mix(Mix(C_RFIELD, RGB(46, 47, 54), b.hover), RGB(70, 73, 83), b.press * 0.8f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Tx(lab, 12, RGB(112, 124, 156), 1);
@@ -123,9 +124,6 @@ static void MiniFieldW(int n, const char *lab, Clay_SizingAxis w) {
         }
     }
 }
-
-/* default: fills its row; T/B in the crop panel pass a fixed width to stay compact */
-static void MiniField(int n, const char *lab) { MiniFieldW(n, lab, CLAY_SIZING_GROW(0)); }
 
 /* Position / Scale card: exactly 169 px tall
    12 pad | 24 header | 6 | 39 field | 34 link row | 39 field | 15 pad */
@@ -175,23 +173,25 @@ static bool NavButton(int n, int icon, const char *label, float open) {
 static void CropBody(void) {
     CLAY(CLAY_ID("CropBody"), {.layout = {COLM, .sizing = {GROW, FIX(CROP_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10,
                                           .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}, RCARD}) {
-        MiniFieldW(0, "T", CLAY_SIZING_FIXED(112));
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
+        MiniField(0, "T");
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             MiniField(1, "L");
+            HSPACE
             if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 30, 20)) gLink[2] = !gLink[2];
+            HSPACE
             MiniField(2, "R");
         }
-        MiniFieldW(3, "B", CLAY_SIZING_FIXED(112));
+        MiniField(3, "B");
     }
 }
 
 static void DistortBody(void) {
     CLAY(CLAY_ID("DistBody"), {.layout = {COLM, .sizing = {GROW, FIX(DIST_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10}, RCARD}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) { MiniField(4, "TL"); MiniField(5, "TR"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(4, "TL"); HSPACE MiniField(5, "TR"); }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
             if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 30, 20)) gLink[3] = !gLink[3];
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) { MiniField(6, "BL"); MiniField(7, "BR"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(6, "BL"); HSPACE MiniField(7, "BR"); }
     }
 }
 
@@ -459,8 +459,115 @@ static void FilterThumb(int i) {
               .custom = {.customData = NC(K_FILTER, kFilters[i].a, kFilters[i].b, kFilters[i].sun, 0, b.hover, gFilter == i)}}) {}
 }
 
+/* ---- video effects (accordion: one effect open at a time) ---- */
+#define FX_ITEM_H 44.f
+#define FX_BODY_H 160.f   /* 12 pad | 26 enabled row | 10 | 44 param | 10 | 44 param | 14 pad */
+typedef struct { const char *name; int icon; const char *p1, *p2; bool angle; } FxDef;
+static const FxDef kFx[4] = {
+    {"Chromatic aberration", I_GRADING, "Amount",    "Angle", true},
+    {"Glow",                 I_SUN,     "Intensity", "Radius", false},
+    {"Glitch",               I_SLIDERS, "Amount",    "Speed", false},
+    {"Pixelate",             I_DISTORT, "Size",      "Blend", false},
+};
+static float gFxV[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
+static bool  gFxOn[4];
+static bool  gFxSlDrag[4][2];
+static int   gFxOpen = 0;
+static bool  gVfxOpen = true, gFiltOpen = false;
+
+static void FxSliderLogic(Clay_ElementId id, float *v, bool *drag, float kr) {
+    if (Clay_PointerOver(id) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gDragId = id.id;
+    *drag = false;
+    if (gDragId == id.id) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Clay_BoundingBox bb = Clay_GetElementData(id).boundingBox;
+            if (bb.width > 2 * kr) {
+                float t = (GetMousePosition().x - bb.x - kr) / (bb.width - 2 * kr);
+                *v = t < 0.f ? 0.f : t > 1.f ? 1.f : t;
+            }
+            *drag = true;
+        } else gDragId = 0;
+    }
+}
+
+static void FxParam(int i, int p, const char *label) {
+    float *v = &gFxV[i][p];
+    bool isAngle = (p == 1 && kFx[i].angle);
+    CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
+            Tx(label, 13.5f, C_MUTED, 0);
+            HSPACE
+            if (isAngle) ValBox(Fmt("%d", (int)roundf((*v - .5f) * 360.f)), "\xC2\xB0", 72, 22, 13.f, 11.f, 10);
+            else         ValBox(Fmt("%d", (int)roundf(*v * 100.f)), NULL, 72, 22, 13.f, 11.f, 12);
+        }
+        Clay_ElementId sid = CLAY_IDI("FxSl", i * 2 + p);
+        Bs bs = Interact(sid);
+        FxSliderLogic(sid, v, &gFxSlDrag[i][p], 7.f);
+        CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
+                   .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, *v,
+                                               (bs.hover + (gFxSlDrag[i][p] ? 1.f : 0.f)) * 1.5f, 0)}}) {}
+    }
+}
+
+static void FxBody(int i) {
+    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIX(FX_BODY_H)}, .padding = {14, 14, 12, 14}, .childGap = 10},
+                                 .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
+                                 .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
+            Clay_ElementId swid = CLAY_IDI("FxSw", i);
+            Bs sb = Interact(swid);
+            if (sb.clicked) gFxOn[i] = !gFxOn[i];
+            float on = Anim(swid.id + 5u, gFxOn[i] ? 1.f : 0.f, 22.f);
+            CLAY(swid, {.layout = {.sizing = {FIT, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {FIX(38), FIX(22)}},
+                              .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on, sb.hover * 1.f - sb.press * 1.5f, 0)}}) {}
+                Tx("Enabled", 13.5f, Mix(C_MUTED, C_DIM, sb.hover), 0);
+            }
+            HSPACE
+            Clay_ElementId rid = CLAY_IDI("FxReset", i);
+            Bs rb = Interact(rid);
+            Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
+            CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
+                Icon(I_RESET, 14, rc);
+                Tx("Reset", 14, rc, 0);
+            }
+            if (rb.clicked) { gFxV[i][0] = (i == 0) ? .3f : .5f; gFxV[i][1] = .5f; }
+        }
+        FxParam(i, 0, kFx[i].p1);
+        FxParam(i, 1, kFx[i].p2);
+    }
+}
+
+/* effect row: icon, name, round +/- button (same surface language as the Crop/Distort nav buttons) */
+static bool FxHeader(int i, float open) {
+    Clay_ElementId id = CLAY_IDI("FxHdr", i);
+    Bs b = Interact(id);
+    Clay_Color base = Mix(C_RCARD, RGB(42, 44, 51), open);
+    Clay_Color hov  = Mix(RGB(38, 40, 46), RGB(48, 50, 58), open);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(FX_ITEM_H)}, .padding = {14, 10, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
+              .backgroundColor = BtnBg(base, hov, b), .cornerRadius = CLAY_CORNER_RADIUS(14),
+              .border = {.color = Mix(C_RCARDB, RGB(80, 83, 92), fmaxf(b.hover, open * 0.8f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Icon(kFx[i].icon, 22, Mix(C_ICON, C_TEXT, open));
+        Tx(kFx[i].name, 16, C_TEXT, 0);
+        HSPACE
+        Clay_Color gc = Mix(C_ICON, C_TEXT, fmaxf(b.hover, open));
+        CLAY_AUTO_ID({.layout = {.sizing = {FIX(24), FIX(24)}, .childAlignment = AL_C},
+                      .cornerRadius = CLAY_CORNER_RADIUS(12),
+                      .border = {.color = Mix(RGB(70, 72, 80), RGB(120, 123, 132), fmaxf(b.hover, open * 0.6f)), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+            if (open > 0.5f) {
+                CLAY_AUTO_ID({.layout = {.sizing = {FIX(10), FIX(2)}}, .backgroundColor = gc, .cornerRadius = CLAY_CORNER_RADIUS(1)}) {}
+            } else {
+                Icon(I_PLUS, 12, gc);
+            }
+        }
+    }
+    return b.clicked;
+}
+
 #define TRANS_DESC_H 46.f
+#define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
 static void EffectsView(void) {
+    /* ---- Transitions ---- */
     float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
     float dh = roundf(o * TRANS_DESC_H);
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
@@ -480,30 +587,83 @@ static void EffectsView(void) {
             }
         }
     }
-    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
+
+    /* ---- Filters (collapsible; presets inside) ---- */
+    float fo = EaseIO(AnimLin(CLAY_ID("FiltAnim").id, gFiltOpen ? 1.f : 0.f, 0.2f));
+    bool fOpenFull = fo >= 0.999f;
+    float fh = roundf(fo * FILT_BODY_H);
+    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId fid = CLAY_ID("FiltersHdr");
         Bs b = Interact(fid);
+        if (b.clicked) gFiltOpen = !gFiltOpen;
         CLAY(fid, {.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
             Icon(I_SPARKLE, 20, C_ICON);
             Tx("Filters", 16, C_TEXT, 1);
             HSPACE
-            Icon(I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
+            Icon(gFiltOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
-            Tx("Filter presets", 13, C_MUTED, 0);
-            HSPACE
-            Clay_ElementId rid = CLAY_ID("FiltersReset");
-            Bs rb = Interact(rid);
-            Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
-            CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                Icon(I_RESET, 14, rc);
-                Tx("Reset", 14, rc, 0);
+        if (fOpenFull || fh >= 1.f) {
+            CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, fOpenFull ? FIT : FIX(fh)}}, .clip = {.vertical = !fOpenFull}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
+                    Tx("Filter presets", 13, C_MUTED, 0);
+                    HSPACE
+                    Clay_ElementId rid = CLAY_ID("FiltersReset");
+                    Bs rb = Interact(rid);
+                    Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
+                    CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
+                        Icon(I_RESET, 14, rc);
+                        Tx("Reset", 14, rc, 0);
+                    }
+                    if (rb.clicked) gFilter = 0;
+                }
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY(CLAY_ID("FltRows"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+                    for (int row = 0; row < 2; row++) {
+                        CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
+                            for (int c = 0; c < 4; c++) FilterThumb(row * 4 + c);
+                        }
+                    }
+                }
             }
-            if (rb.clicked) gFilter = 0;
         }
-        for (int row = 0; row < 2; row++) {
-            CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
-                for (int c = 0; c < 4; c++) FilterThumb(row * 4 + c);
+    }
+
+    /* ---- Video Effects ---- */
+    float ov = EaseIO(AnimLin(CLAY_ID("VfxAnim").id, gVfxOpen ? 1.f : 0.f, 0.2f));
+    float oi[4], hb[4], sum = 0.f;
+    for (int i = 0; i < 4; i++) {
+        oi[i] = EaseIO(AnimLin(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 0.2f));
+        hb[i] = roundf(oi[i] * (FX_BODY_H + 8.f));
+        sum += hb[i];
+    }
+    float lh = roundf(ov * (10.f + 4.f * FX_ITEM_H + 3.f * 8.f + sum));
+    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
+        Clay_ElementId vid = CLAY_ID("VfxHdr");
+        Bs vb = Interact(vid);
+        if (vb.clicked) gVfxOpen = !gVfxOpen;
+        CLAY(vid, {.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
+            Icon(I_FILM, 20, C_ICON);
+            Tx("Video Effects", 16, C_TEXT, 1);
+            HSPACE
+            Icon(gVfxOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, vb.hover));
+        }
+        if (lh >= 1.f) {
+            CLAY(CLAY_ID("VfxWrap"), {.layout = {COLM, .sizing = {GROW, FIX(lh)}}, .clip = {.vertical = true}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY(CLAY_ID("VfxList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+                    for (int i = 0; i < 4; i++) {
+                        CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
+                            if (FxHeader(i, oi[i])) gFxOpen = (gFxOpen == i) ? -1 : i;
+                            if (hb[i] >= 1.f) {
+                                CLAY(CLAY_IDI("FxWrap", i), {.layout = {COLM, .sizing = {GROW, FIX(hb[i])}}, .clip = {.vertical = true}}) {
+                                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
+                                    FxBody(i);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -592,3 +752,4 @@ static void RightPanel(void) {
         }
     }
 }
+
