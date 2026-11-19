@@ -1,0 +1,131 @@
+name: Build UI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install UCRT64 build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-ccache
+
+      - name: Cache raylib and clay sources
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            raylib-src
+            clay.h
+          key: deps-raylib-6.2-clay-v0.14
+
+      - name: Download Clay header
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nicbarker/clay/v0.14/clay.h" -OutFile "clay.h"
+
+      - name: Download raylib
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 6.2 https://github.com/raysan5/raylib.git raylib-src
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-raylib-6.2-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-raylib-6.2-
+
+      - name: Build UI
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_COMPRESS: "1"
+          CCACHE_MAXSIZE: 200M
+        run: |
+          set -euo pipefail
+
+          if [ -f UI.c ]; then
+            SOURCE=UI.c
+          elif [ -f pluto_ui.c ]; then
+            SOURCE=pluto_ui.c
+          else
+            echo "ERROR: UI.c or pluto_ui.c not found"
+            exit 1
+          fi
+
+          echo "Building $SOURCE"
+
+          mkdir -p ci-build
+
+          cat > ci-build/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(PlutoUI C)
+
+          set(CMAKE_C_STANDARD 99)
+          set(CMAKE_C_STANDARD_REQUIRED ON)
+
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+          set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(USE_EXTERNAL_GLFW OFF CACHE STRING "" FORCE)
+
+          add_subdirectory(
+              "${CMAKE_CURRENT_LIST_DIR}/../raylib-src"
+              "${CMAKE_CURRENT_BINARY_DIR}/raylib"
+          )
+
+          if(NOT DEFINED UI_SOURCE_FILE)
+              message(FATAL_ERROR "UI_SOURCE_FILE missing")
+          endif()
+
+          add_executable(UI "${CMAKE_CURRENT_LIST_DIR}/../${UI_SOURCE_FILE}")
+
+          target_link_libraries(UI PRIVATE raylib)
+
+          if(MINGW)
+              target_link_options(UI PRIVATE -static -static-libgcc -mwindows)
+              target_link_libraries(UI PRIVATE opengl32 gdi32 winmm)
+          endif()
+
+          set_target_properties(UI PROPERTIES
+              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dist"
+          )
+          CMAKE
+
+          ccache --zero-stats
+
+          cmake -S ci-build -B ci-build/out -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DUI_SOURCE_FILE="$SOURCE"
+
+          cmake --build ci-build/out --parallel
+
+          ccache --show-stats
+
+          test -f ci-build/out/dist/UI.exe
+
+      - name: Upload UI.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlutoUI-Windows
+          path: ci-build/out/dist/UI.exe
+          if-no-files-found: error
