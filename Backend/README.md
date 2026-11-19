@@ -6,7 +6,7 @@ The native raylib interface talks to the Rust `pluto-backend` C ABI DLL. There i
 
 - `timeline-core/` owns clip data, validation, snapping, and timeline mutations.
 - `backend-ffi/` exports a narrow C ABI. Cheap timeline commands are synchronous; FFprobe/media jobs use a background worker and are collected with `pluto_backend_poll` so rendering stays responsive.
-- `Frontend/backend_bridge.h` loads the DLL dynamically. GitHub Actions builds the C UI and Rust DLL together and publishes one `Stella-Windows-x64` artifact.
+- `Frontend/backend_bridge.h` loads the DLL dynamically. GitHub Actions builds the C UI and Rust DLL together and publishes a lightweight artifact plus a full FFmpeg-bundled artifact.
 
 The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend must be released with `pluto_backend_free`. See the exported function signatures in `Frontend/backend_bridge.h` and `Backend/backend-ffi/src/lib.rs`.
 
@@ -17,7 +17,7 @@ The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend 
 - Preview and export both build video and audio filters through `backend-ffi/src/filters.rs`.
 - The UI loads generated media thumbnails and waveforms and displays the current rendered preview frame.
 
-FFmpeg and FFprobe resolve from `PLUTO_FFMPEG_DIR`, the app's adjacent `ffmpeg/` folder, or `PATH`. The Windows artifact contains `Stella.exe`, `pluto_backend.dll`, icons, and FFmpeg/FFprobe with their shared runtime DLLs and notices.
+FFmpeg and FFprobe resolve from `PLUTO_FFMPEG_DIR`, the app's adjacent `ffmpeg/` folder, or `PATH`. `Stella-Windows-x64-lite` contains `Stella.exe`, `pluto_backend.dll`, and icons. `Stella-Windows-x64-full` also contains FFmpeg/FFprobe, their shared runtime DLLs, and notices. The lightweight build can use the `ffmpeg/` folder from an earlier full download by placing it beside `Stella.exe`.
 
 Video effects use the shared FFmpeg filter builder for preview and export. A transition is stored on the outgoing clip at `props.transitionOut` with a type and duration; it is used only when a neighboring video clip follows directly on the same track. The renderer overlaps the incoming clip by that duration and composites it over the outgoing clip.
 
