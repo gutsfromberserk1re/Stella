@@ -542,8 +542,15 @@ static void PlutoPollBackend(void) {
                     (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
                              : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
                 bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
+                /* During playback, decoding can legitimately take longer than
+                   the small freshness window (especially on CPU-only systems).
+                   Rejecting every completed frame then creates a starvation
+                   loop: the playhead advances, the frame is discarded, and the
+                   next request is already stale when it finishes. Present the
+                   newest completed frame as long as it does not move backward;
+                   gPreviewDirty below immediately schedules a catch-up request. */
                 bool currentRequest = gPreviewRequestRes == PlutoPreviewOutputHeight() &&
-                    (gTimelinePlaying ? movingFrameFresh : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
+                    (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
                 if (strstr(event, "\"ok\":true")) {
                     double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
