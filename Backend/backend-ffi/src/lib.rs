@@ -157,6 +157,7 @@ fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
             command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
                 .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                        "-an", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                       "-g", "6", "-keyint_min", "6", "-sc_threshold", "0", "-bf", "0",
                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
                 .arg(&temporary);
             let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
@@ -264,10 +265,10 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let media_hash = media_content_hash(path)?;
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
-    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v2.png"));
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v1.jpg"));
+    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v3.png"));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
     let proxy = if kind == "video" {
-        cache_dir.join(format!("{media_hash:016x}-proxy-720p.mp4"))
+        cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
     } else { std::path::PathBuf::new() };
     if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
@@ -278,7 +279,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             media_command(&ffmpeg)
                 .args(["-v", "error", "-i"])
                 .arg(path)
-                .args(["-filter_complex", "showwavespic=s=1024x256:colors=0x55aaff:scale=sqrt", "-frames:v", "1", "-y"])
+                .args(["-filter_complex", "showwavespic=s=1024x256:colors=0x17364f:scale=sqrt", "-frames:v", "1", "-y"])
                 .arg(&waveform)
                 .status()
                 .is_ok_and(|status| status.success())
@@ -288,9 +289,10 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let thumbnail_path = if kind == "audio" {
         None
     } else {
-        let generated = if thumbnail.is_file() {
+        let generated = if thumbnail.metadata().is_ok_and(|meta| meta.len() > 128) {
             true
         } else {
+            let _ = std::fs::remove_file(&thumbnail);
             let mut command = media_command(&ffmpeg);
             command.args(["-v", "error"]);
             if kind == "video" {
@@ -299,9 +301,21 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             }
             command.arg("-i").arg(path)
                 .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
-                .arg(&thumbnail)
-                .status()
-                .is_ok_and(|status| status.success())
+                .arg(&thumbnail);
+            let first_attempt = command.status().is_ok_and(|status| status.success())
+                && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
+            if first_attempt {
+                true
+            } else {
+                let _ = std::fs::remove_file(&thumbnail);
+                let mut fallback = media_command(&ffmpeg);
+                fallback.args(["-v", "error", "-i"]).arg(path)
+                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                    .arg(&thumbnail)
+                    .status()
+                    .is_ok_and(|status| status.success())
+                    && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
+            }
         };
         generated.then(|| thumbnail.to_string_lossy().into_owned())
     };
@@ -924,9 +938,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let before = timeline.clone();
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let path = request["path"].as_str().ok_or("Property path is required")?;
-            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
-                .ok_or_else(|| format!("Clip {id} was not found"))?;
-            set_clip_property(clip, path, request["value"].clone())?;
+            set_timeline_clip_property(&mut timeline, id, path, request["value"].clone())?;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
@@ -934,14 +946,24 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let before = timeline.clone();
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let updates = request["properties"].as_array().ok_or("Property updates are required")?;
-            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
+            let selected_index = timeline.clips.iter().position(|clip| clip.id == id)
                 .ok_or_else(|| format!("Clip {id} was not found"))?;
-            let mut updated = clip.clone();
+            let group_id = timeline.clips[selected_index].extra.get("groupId")
+                .and_then(Value::as_str).map(str::to_owned);
+            let indices: Vec<_> = group_id.as_deref().map(|group| timeline.clips.iter().enumerate()
+                .filter_map(|(index, clip)| (clip.extra.get("groupId").and_then(Value::as_str) == Some(group)).then_some(index))
+                .collect()).unwrap_or_else(|| vec![selected_index]);
+            let mut working: Vec<_> = indices.iter().map(|&index| (index, timeline.clips[index].clone())).collect();
             for update in updates {
                 let path = update["path"].as_str().ok_or("Property path is required")?;
-                set_clip_property(&mut updated, path, update["value"].clone())?;
+                let shared = is_group_shared_property(path) && group_id.is_some();
+                for (index, clip) in &mut working {
+                    if *index == selected_index || shared {
+                        set_clip_property(clip, path, update["value"].clone())?;
+                    }
+                }
             }
-            *clip = updated;
+            for (index, clip) in working { timeline.clips[index] = clip; }
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
@@ -974,6 +996,29 @@ fn set_clip_property(clip: &mut Clip, path: &str, value: Value) -> Result<(), St
     if !props.is_object() { props = json!({}); }
     set_json_path(&mut props, &parts, value);
     clip.extra.insert("props".into(), props);
+    Ok(())
+}
+
+fn is_group_shared_property(path: &str) -> bool {
+    path.starts_with("props.effects.") || path.starts_with("props.colors.")
+}
+
+fn set_timeline_clip_property(timeline: &mut Timeline, id: &str, path: &str, value: Value) -> Result<(), String> {
+    let selected = timeline.clips.iter().position(|clip| clip.id == id)
+        .ok_or_else(|| format!("Clip {id} was not found"))?;
+    let group_id = timeline.clips[selected].extra.get("groupId").and_then(Value::as_str).map(str::to_owned);
+    let indices: Vec<_> = if is_group_shared_property(path) {
+        group_id.as_deref().map(|group| timeline.clips.iter().enumerate()
+            .filter_map(|(index, clip)| (clip.extra.get("groupId").and_then(Value::as_str) == Some(group)).then_some(index))
+            .collect()).unwrap_or_else(|| vec![selected])
+    } else { vec![selected] };
+    let mut updated = Vec::with_capacity(indices.len());
+    for index in indices {
+        let mut clip = timeline.clips[index].clone();
+        set_clip_property(&mut clip, path, value.clone())?;
+        updated.push((index, clip));
+    }
+    for (index, clip) in updated { timeline.clips[index] = clip; }
     Ok(())
 }
 

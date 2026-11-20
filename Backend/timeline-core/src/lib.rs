@@ -125,9 +125,9 @@ impl Timeline {
             return Err(TimelineError::DuplicateId(clip.id));
         }
         if clip.track.is_video() {
-            clip.start = self.magnetic_start(&clip.id, clip.start.max(0.0));
+            clip.start = self.magnetic_start(&clip.id, clip.start.max(0.0), None);
             if self.snapping {
-                clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25);
+                clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25, None);
             }
         }
         let requested_track = clip.track;
@@ -165,56 +165,75 @@ impl Timeline {
         if original.track.is_video() != desired_track.is_video() {
             return Err(TimelineError::InvalidRange);
         }
-        if original.track.is_video()
-            && (original.track != desired_track || (desired_start - original.start).abs() > EPSILON)
-        {
-            let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str);
-            self.close_lane_gap(id, original.track, original.start, original.end(), group_id);
-        }
+        let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let mut members: Vec<_> = self.clips.iter().filter(|clip| {
+            group_id.as_deref().is_some_and(|group| clip.extra.get("groupId").and_then(serde_json::Value::as_str) == Some(group))
+        }).cloned().collect();
+        if members.is_empty() { members.push(original.clone()); }
         let mut start = desired_start.max(0.0);
         if original.track.is_video() {
-            start = self.magnetic_start(id, start);
+            start = self.magnetic_start(id, start, group_id.as_deref());
         }
         if self.snapping && original.track.is_video() {
-            start = self.snap_start(id, start, original.duration, playhead, snap_threshold);
+            start = self.snap_start(id, start, original.duration, playhead, snap_threshold, group_id.as_deref());
         }
-        let lane = self.nearest_free_lane(id, desired_track, start, original.duration)
+        let lane = self.nearest_free_lane_excluding(id, desired_track, start, original.duration, group_id.as_deref())
             .unwrap_or(desired_track);
         let delta = start - original.start;
-        let mut moved = original.clone();
-        moved.start = start;
-        moved.track = lane;
-        self.replace(moved.clone());
-        if self.lane_overlaps(id, lane, start, moved.duration) {
-            self.ripple_lane_after(id)?;
-            moved = self.find(id)?.clone();
-        }
+        let lanes = original.track.lanes();
+        let old_rank = lanes.iter().position(|track| *track == original.track).unwrap_or(0) as i32;
+        let new_rank = lanes.iter().position(|track| *track == lane).unwrap_or(old_rank as usize) as i32;
+        let requested_track_shift = new_rank - old_rank;
+        let same_kind: Vec<_> = members.iter().filter(|clip| clip.track.is_video() == original.track.is_video()).collect();
+        let min_rank = same_kind.iter().map(|clip| clip.track.lanes().iter().position(|track| *track == clip.track).unwrap_or(0) as i32).min().unwrap_or(old_rank);
+        let max_rank = same_kind.iter().map(|clip| clip.track.lanes().iter().position(|track| *track == clip.track).unwrap_or(0) as i32).max().unwrap_or(old_rank);
+        let max_lane = lanes.len().saturating_sub(1) as i32;
+        let track_shift = requested_track_shift.clamp(-min_rank, max_lane - max_rank);
 
-        let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str).map(str::to_owned);
-        let mut moved_ids = HashSet::from([id.to_owned()]);
-        if let Some(group_id) = group_id.as_deref() {
-            let members: Vec<_> = self.clips.iter()
-                .filter(|clip| clip.id != id && clip.extra.get("groupId").and_then(serde_json::Value::as_str) == Some(group_id))
-                .cloned().collect();
-            for mut member in members {
-                member.start = (member.start + delta).max(0.0);
-                moved_ids.insert(member.id.clone());
-                self.replace(member);
-            }
-        }
-
-        if let Some(linked_id) = original.linked_clip_id.as_deref() {
-            if !moved_ids.contains(linked_id) {
-                if let Some(mut linked) = self.clips.iter().find(|c| c.id == linked_id).cloned() {
-                linked.start = (linked.start + delta).max(0.0);
-                self.replace(linked);
+        if original.track.is_video() {
+            let mut vacated: Vec<_> = members.iter().filter(|clip| clip.track.is_video()).cloned().collect();
+            vacated.sort_by(|a, b| a.track.lanes().iter().position(|t| *t == a.track).cmp(&b.track.lanes().iter().position(|t| *t == b.track)).then_with(|| a.start.total_cmp(&b.start)));
+            for clip in &vacated {
+                if clip.track != lane || (clip.start - (clip.start + delta)).abs() > EPSILON {
+                    self.close_lane_gap(&clip.id, clip.track, clip.start, clip.end(), group_id.as_deref());
                 }
             }
         }
-        let moved_group_ids: Vec<_> = moved_ids.into_iter().collect();
-        for moved_id in moved_group_ids { self.ripple_lane_after(&moved_id)?; }
+
+        let lane_members: HashSet<_> = same_kind.iter().map(|clip| clip.id.as_str()).collect();
+        for mut member in members.iter().cloned() {
+            member.start = (member.start + delta).max(0.0);
+            if lane_members.contains(member.id.as_str()) {
+                let member_rank = member.track.lanes().iter().position(|track| *track == member.track).unwrap_or(0) as i32;
+                if let Some(track) = member.track.lanes().get((member_rank + track_shift) as usize) { member.track = *track; }
+            }
+            self.replace(member);
+        }
+
+        let mut moved_ids: HashSet<String> = members.iter().map(|clip| clip.id.clone()).collect();
+        for member in &members {
+            if let Some(linked_id) = member.linked_clip_id.as_deref() {
+                if moved_ids.insert(linked_id.to_owned()) {
+                    if let Some(mut linked) = self.clips.iter().find(|clip| clip.id == linked_id).cloned() {
+                        linked.start = (linked.start + delta).max(0.0);
+                        self.replace(linked);
+                    }
+                }
+            }
+        }
+        let mut ordered_clips: Vec<_> = moved_ids.into_iter()
+            .filter_map(|moved_id| self.clips.iter().find(|clip| clip.id == moved_id).cloned())
+            .collect();
+        ordered_clips.sort_by(|a, b| {
+            let rank = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
+                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
+            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
+        });
+        for moved in ordered_clips {
+            if moved.track.is_video() { self.ripple_lane_after(&moved.id)?; }
+        }
         self.refresh_duration();
-        Ok(moved)
+        self.find(id).cloned()
     }
 
     pub fn trim_clip(&mut self, id: &str, start: f64, end: f64) -> Result<Clip, TimelineError> {
@@ -356,12 +375,14 @@ impl Timeline {
         duration: f64,
         playhead: f64,
         threshold: f64,
+        exclude_group: Option<&str>,
     ) -> f64 {
         let mut best: Option<(f64, f64)> = None;
         for candidate in std::iter::once(playhead).chain(
             self.clips
                 .iter()
-                .filter(|c| c.id != id && c.track.is_video())
+                .filter(|c| c.id != id && c.track.is_video()
+                    && exclude_group.map_or(true, |group| c.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group)))
                 .flat_map(|c| [c.start, c.end()]),
         ) {
             for (edge, offset) in [(start, 0.0), (start + duration, duration)] {
@@ -377,9 +398,11 @@ impl Timeline {
     /// The video storyline is always magnetic: place a clip at the latest
     /// video edge to its left. This remains active when proximity snapping is
     /// disabled in the UI.
-    fn magnetic_start(&self, id: &str, desired_start: f64) -> f64 {
+    fn magnetic_start(&self, id: &str, desired_start: f64, exclude_group: Option<&str>) -> f64 {
         self.clips.iter()
-            .filter(|clip| clip.id != id && clip.track.is_video() && clip.end() <= desired_start + EPSILON)
+            .filter(|clip| clip.id != id && clip.track.is_video()
+                && exclude_group.map_or(true, |group| clip.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group))
+                && clip.end() <= desired_start + EPSILON)
             .map(Clip::end)
             .max_by(f64::total_cmp)
             .unwrap_or(0.0)
@@ -435,6 +458,17 @@ impl Timeline {
         start: f64,
         duration: f64,
     ) -> Result<TrackId, TimelineError> {
+        self.nearest_free_lane_excluding(id, desired, start, duration, None)
+    }
+
+    fn nearest_free_lane_excluding(
+        &self,
+        id: &str,
+        desired: TrackId,
+        start: f64,
+        duration: f64,
+        exclude_group: Option<&str>,
+    ) -> Result<TrackId, TimelineError> {
         let lanes = desired.lanes();
         let desired_index = lanes.iter().position(|lane| *lane == desired).unwrap_or(0);
         let mut candidates: Vec<_> = lanes.iter().copied().enumerate().collect();
@@ -445,6 +479,7 @@ impl Timeline {
             .find(|lane| {
                 !self.clips.iter().any(|c| {
                     c.id != id
+                        && exclude_group.map_or(true, |group| c.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group))
                         && c.track == *lane
                         && start < c.end() - EPSILON
                         && start + duration > c.start + EPSILON

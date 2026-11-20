@@ -451,20 +451,12 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
         for (int i = 0; i < 72; i++)
-            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .62f));
-        /* darken + desaturate towards the centre (each ring has its own alpha) */
-        for (float rr = rad; rr > 1.f; rr -= 1.f) {
-            float t = 1.f - rr / rad;
-            DrawRing(c, rr - 1.f, rr, 0, 360, 40, (Color){34, 32, 40, U8(225 * powf(t, 1.35f))});
-        }
-        Ring(c, rad, 2, (Color){38, 39, 45, 255});
+            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
+        Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
         float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 4.f, (Color){10, 10, 14, 105});
-        if (cu->v > .5f) {
-            DrawCircleV(p, dot + 2.2f, (Color){235, 236, 240, 255});
-            DrawCircleV(p, dot, RC(cu->c));
-        }
+        DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
+        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
     } break;
 
     case K_SWITCH: {
@@ -580,9 +572,11 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     case K_CLIP: {
         int clipIndex = cu->i >> 1;
         TimelineClipUi *clip = clipIndex >= 0 && clipIndex < gTimelineClipCount ? &gTimelineClips[clipIndex] : NULL;
-        const char *mediaKey = clip ? clip->path : NULL;
+        bool audioOnly = clip && clip->track >= 4;
+        const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
-        GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        if (audioOnly && !clip->groupId[0]) FillRR(r, 6, (Color){63, 119, 158, 230});
+        else GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
         Texture2D wave = {0};
         if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
             ImportedMedia *media = &gImported[clip->mediaIndex];
@@ -590,13 +584,17 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
         if (wave.id && hasAudio) {
-            Rectangle band = {r.x + 6, r.y + r.height - 23, fmaxf(0.f, r.width - 12), 19};
-            FillRR(band, 3.f, (Color){54, 112, 150, 175});
-            DrawLineEx((Vector2){r.x + 6, band.y - 1}, (Vector2){r.x + r.width - 6, band.y - 1},
-                       1.f, (Color){125, 171, 196, 210});
-            Rectangle waveformRect = {r.x + 8, band.y, fmaxf(0.f, r.width - 16), band.height};
+            Rectangle band = audioOnly
+                ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
+                : (Rectangle){r.x, r.y + r.height - 19.f, r.width, 19.f};
+            if (!audioOnly) {
+                FillRR(band, 0.f, (Color){71, 129, 168, 210});
+                DrawLineEx((Vector2){r.x, band.y}, (Vector2){r.x + r.width, band.y},
+                           1.f, (Color){119, 166, 194, 225});
+            }
+            Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
-                           (Vector2){0, 0}, 0.f, (Color){81, 134, 166, 255});
+                           (Vector2){0, 0}, 0.f, WHITE);
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
