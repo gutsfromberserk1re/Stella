@@ -33,6 +33,23 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001 {
         filters.push(format!("eq=brightness={brightness:.5}:contrast={contrast:.5}:saturation={saturation:.5}"));
     }
+    let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0) as usize;
+    let hsl_key = hsl_index.to_string();
+    let hsl = &colors["hsl"][hsl_key.as_str()];
+    let hsl_hue = n(hsl, "hue", 0.0);
+    let hsl_saturation = (1.0 + n(hsl, "saturation", 0.0) / 100.0).clamp(0.0, 2.0);
+    let hsl_lightness = n(hsl, "lightness", 0.0) / 200.0;
+    if hsl_hue.abs() > 0.001 || (hsl_saturation - 1.0).abs() > 0.001 {
+        filters.push(format!("hue=h={hsl_hue:.3}:s={hsl_saturation:.4}"));
+    }
+    if hsl_lightness.abs() > 0.001 {
+        filters.push(format!("eq=brightness={hsl_lightness:.5}"));
+    }
+    let shadow_lift = ((n(light, "shadows", 0.0) + n(light, "blacks", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
+    let highlight_gain = ((n(light, "highlights", 0.0) + n(light, "whites", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
+    if shadow_lift.abs() > 0.001 || highlight_gain.abs() > 0.001 {
+        filters.push(format!("colorbalance=rs={shadow_lift:.4}:gs={shadow_lift:.4}:bs={shadow_lift:.4}:rh={highlight_gain:.4}:gh={highlight_gain:.4}:bh={highlight_gain:.4}"));
+    }
     let temperature = (n(color, "temperature", 0.0) / 100.0).clamp(-1.0, 1.0);
     if temperature.abs() > 0.01 {
         filters.push(format!("colorbalance=rs={temperature:.4}:bs={:.4}", -temperature));

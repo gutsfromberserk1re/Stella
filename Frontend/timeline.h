@@ -17,21 +17,24 @@ static bool TimelineTrackIsVideo(int track) { return track >= 0 && track < 4; }
 
 static float TimelineSnapStart(float start, float duration, bool video, int movingIndex) {
     if (!gTimelineSnap || !video) return fmaxf(0.f, start);
-    float best = .25f, snapped = start;
-    for (int n = -1; n < gTimelineClipCount; n++) {
-        if (n == movingIndex) continue;
-        if (n >= 0 && !TimelineTrackIsVideo(gTimelineClips[n].track)) continue;
-        float edges[2] = {n < 0 ? 0.f : gTimelineClips[n].start,
-                          n < 0 ? 0.f : gTimelineClips[n].start + gTimelineClips[n].duration};
-        for (int edge = 0; edge < 2; edge++) {
-            float candidates[2] = {start, start + duration};
-            for (int c = 0; c < 2; c++) {
-                float distance = fabsf(edges[edge] - candidates[c]);
-                if (distance <= best) { best = distance; snapped = edges[edge] - (c ? duration : 0.f); }
-            }
+
+    /* Magnetic video placement follows the nearest earlier video edge across lanes.
+       Audio stays free, and the magnet toggle still disables all snapping. */
+    float nearestLeft = -1.f;
+    bool hasVideoNeighbor = false;
+    for (int n = 0; n < gTimelineClipCount; n++) {
+        if (n == movingIndex || !TimelineTrackIsVideo(gTimelineClips[n].track)) continue;
+        hasVideoNeighbor = true;
+        float otherStart = gTimelineClips[n].start;
+        float otherEnd = otherStart + gTimelineClips[n].duration;
+        if (start < otherEnd - .0001f && start + duration > otherStart + .0001f) {
+            /* Let lane collision handling place an overlapping drop vertically. */
+            return fmaxf(0.f, start);
         }
+        if (otherEnd <= start + .0001f && otherEnd > nearestLeft) nearestLeft = otherEnd;
     }
-    return fmaxf(0.f, snapped);
+    if (nearestLeft >= 0.f) return nearestLeft;
+    return hasVideoNeighbor ? fmaxf(0.f, start) : 0.f;
 }
 
 static bool TimelineTrackOverlaps(int track, float start, float duration, int excluded) {
@@ -49,11 +52,42 @@ static int TimelineClosestFreeTrack(int requested, float start, float duration, 
     int best = requested, bestDistance = 99;
     for (int track = first; track <= last; track++) {
         int distance = abs(track - requested);
-        if (distance < bestDistance && !TimelineTrackOverlaps(track, start, duration, excluded)) {
+        bool tiePrefersHigherVideoLane = distance == bestDistance && TimelineTrackIsVideo(track) && track > best;
+        if ((distance < bestDistance || tiePrefersHigherVideoLane) && !TimelineTrackOverlaps(track, start, duration, excluded)) {
             best = track; bestDistance = distance;
         }
     }
     return best;
+}
+
+static void TimelineSyncLinkedDragPreview(Vector2 mouse, float pps) {
+    if (gClipDragIndex < 0 || gClipDragIndex >= gTimelineClipCount ||
+        !IsMouseButtonDown(MOUSE_BUTTON_LEFT)) return;
+
+    TimelineClipUi *clip = &gTimelineClips[gClipDragIndex];
+    if (!clip->linkedId[0]) return;
+
+    int hoveredTrack = TimelineTrackUnderPointer();
+    int requestedTrack = hoveredTrack >= 0 &&
+        TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
+        ? hoveredTrack : gClipDragTrack;
+    Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
+    if (lane.width <= 0.f) return;
+
+    float start = fmaxf(0.f, (mouse.x - lane.x - gTimelinePan - gClipDragOffset) / pps);
+    start = TimelineSnapStart(start, clip->duration, TimelineTrackIsVideo(gClipDragTrack), gClipDragIndex);
+    clip->start = start;
+
+    /* Move the paired audio/video preview before any lane is drawn so either
+       clip can be dragged without the other lagging a rendered frame behind. */
+    for (int linked = 0; linked < gTimelineClipCount; linked++) {
+        if (linked != gClipDragIndex &&
+            (strcmp(gTimelineClips[linked].id, clip->linkedId) == 0 ||
+             strcmp(gTimelineClips[linked].linkedId, clip->id) == 0)) {
+            gTimelineClips[linked].start = start;
+            break;
+        }
+    }
 }
 
 static const char *TimelineTrackLabel(int track) {
@@ -345,6 +379,7 @@ static void Timeline(void) {
     float extra = fmaxf(0.f, bodyH - 26.f);
     float pps = TimelinePps();
     Vector2 mouse = GetMousePosition();
+    TimelineSyncLinkedDragPreview(mouse, pps);
     Clay_BoundingBox ruler = Clay_GetElementData(CLAY_ID("Ruler")).boundingBox;
     Clay_BoundingBox body = Clay_GetElementData(CLAY_ID("TimeBody")).boundingBox;
     float playheadX = ruler.x + gTimelinePan + gPlayhead * pps;
@@ -385,7 +420,10 @@ static void Timeline(void) {
             gTimelinePanMouse = mouse.x;
             gTimelinePanOrig = gTimelinePan;
         }
-        if (gTimelinePanning && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) gTimelinePan = gTimelinePanOrig + mouse.x - gTimelinePanMouse;
+        if (gTimelinePanning && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            /* Keep timeline time zero pinned to the left edge; allow panning only into later time. */
+            gTimelinePan = fminf(0.f, gTimelinePanOrig + mouse.x - gTimelinePanMouse);
+        }
         if (gTimelinePanning && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gTimelinePanning = false;
     }
 

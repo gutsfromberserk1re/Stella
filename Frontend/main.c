@@ -412,11 +412,11 @@ int main(void) {
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
-        if (gPreviewDirty) {
+        if (gPreviewDirty && !gPreviewTaskId) {
             gPreviewDebounce += gDt;
-            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying ? .045f : .075f)) {
+            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying ? .016f : .075f)) {
                 if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
-                else { gPreviewTaskId = 0; gPreviewDebounce = .045f; }
+                else { gPreviewDebounce = .045f; }
             }
         } else gPreviewDebounce = 0.f;
 

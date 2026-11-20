@@ -494,12 +494,29 @@ static void DistortBody(void) {
 
 static void NavSection(void) {
     static int bodyKind = -1;
+    static int pendingTool = -1;
     if (gOpenTool >= 0) bodyKind = gOpenTool;
     float open = EaseIO(AnimLin(CLAY_ID("ToolBodyAnim").id, gOpenTool >= 0 ? 1.f : 0.f, 0.2f));
+    if (pendingTool >= 0 && open < 0.005f) {
+        gOpenTool = pendingTool;
+        pendingTool = -1;
+        gFollow = true;
+    }
+    if (gOpenTool >= 0 && pendingTool < 0) bodyKind = gOpenTool;
     CLAY(CLAY_ID("NavCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         CLAY(CLAY_ID("NavRow"), {.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) {
-            if (NavButton(0, I_CROP, "Crop Tools", gOpenTool == 0 ? open : 0.f)) { gOpenTool = (gOpenTool == 0) ? -1 : 0; gFollow = (gOpenTool == 0); }
-            if (NavButton(1, I_DISTORT, "Distort", gOpenTool == 1 ? open : 0.f)) { gOpenTool = (gOpenTool == 1) ? -1 : 1; gFollow = (gOpenTool == 1); }
+            if (NavButton(0, I_CROP, "Crop Tools", gOpenTool == 0 ? open : 0.f)) {
+                int target = gOpenTool == 0 ? -1 : 0;
+                if (target >= 0 && bodyKind >= 0 && bodyKind != target && open > 0.005f) { pendingTool = target; gOpenTool = -1; }
+                else { pendingTool = -1; gOpenTool = target; }
+                gFollow = gOpenTool == 0;
+            }
+            if (NavButton(1, I_DISTORT, "Distort", gOpenTool == 1 ? open : 0.f)) {
+                int target = gOpenTool == 1 ? -1 : 1;
+                if (target >= 0 && bodyKind >= 0 && bodyKind != target && open > 0.005f) { pendingTool = target; gOpenTool = -1; }
+                else { pendingTool = -1; gOpenTool = target; }
+                gFollow = gOpenTool == 1;
+            }
         }
         if (bodyKind >= 0 && open >= 0.005f) {
             float bodyHeight = bodyKind == 0 ? CROP_H : DIST_H;
@@ -995,7 +1012,7 @@ static bool FxHeader(int i, float open) {
     return b.clicked;
 }
 
-#define TRANS_DESC_H 210.f
+#define TRANS_DESC_H 226.f
 #define TRANS_EMPTY_H 46.f
 #define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
 static int TransitionNextClip(int from) {
@@ -1042,7 +1059,7 @@ static void EffectsView(void) {
                     const char *names[5] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris"};
                     const char *keys[5] = {"none", "crossfade", "dip", "wipe", "iris"};
                     for (int row = 0; row < 3; row++) {
-                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 8}}) {
+                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(38)}, .childGap = 10}}) {
                             for (int col = 0; col < 2; col++) {
                                 int i = row * 2 + col;
                                 if (i >= 5) break;
@@ -1053,7 +1070,7 @@ static void EffectsView(void) {
                                 CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
                                           .backgroundColor = BtnBg(selected ? C_SEL : C_CARD, RGB(43, 45, 52), cb),
                                           .cornerRadius = CLAY_CORNER_RADIUS(9),
-                                          .border = {.color = Mix(C_CARDB, C_ACCENT, selected ? .45f : cb.hover * .35f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                                          .border = {.color = Mix(C_CARDB, RGB(80, 83, 91), selected ? .72f : cb.hover * .38f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
                                     Tx(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
                                 }
                             }
@@ -1236,7 +1253,7 @@ static void RightPanel(void) {
             }
         }
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
-                                   .clip = {.vertical = true, .childOffset = {0, -gScroll + (1.f - gTabE) * 18.f}}}) {
+                                   .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gScroll + (1.f - gTabE) * 18.f}}}) {
             CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}}) {
                 if (gTimelineSelected < 0) {
                     CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {

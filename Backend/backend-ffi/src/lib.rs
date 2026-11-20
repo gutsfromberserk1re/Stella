@@ -65,8 +65,9 @@ fn remember_media_proxy(source: &str, proxy: std::path::PathBuf) {
     if let Ok(mut cache) = cache.lock() { cache.insert(source.to_owned(), proxy); }
 }
 
-fn preview_source_path(clip: &Clip) -> String {
+fn preview_source_path(clip: &Clip, preview_height: u32) -> String {
     let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
+    if preview_height > 720 { return source.to_owned(); }
     let Some(cache) = MEDIA_PROXIES.get() else { return source.to_owned(); };
     let Ok(cache) = cache.lock() else { return source.to_owned(); };
     cache.get(source).filter(|proxy| proxy.is_file())
@@ -155,7 +156,7 @@ fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
             let mut command = media_command(&ffmpeg);
             command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
                 .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                       "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                       "-an", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
                 .arg(&temporary);
             let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
@@ -567,12 +568,17 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     for clip in &active {
-        let path = preview_source_path(clip);
+        let path = preview_source_path(clip, height);
         if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
     }
     let out = preview_cache_path(&timeline, at, height)?;
     std::fs::create_dir_all(out.parent().ok_or("Invalid preview cache path")?).map_err(|e| e.to_string())?;
+    if let Some(bytes) = preview_memory_get(&out) {
+        if !out.is_file() { std::fs::write(&out, bytes).map_err(|e| e.to_string())?; }
+        return Ok(json!({"previewPath": out.to_string_lossy(), "at": at, "width": width, "height": height}));
+    }
     if out.metadata().is_ok_and(|meta| meta.len() > 24) {
+        preview_memory_put(&out);
         return Ok(json!({"previewPath": out.to_string_lossy(), "at": at, "width": width, "height": height}));
     }
     let _ = std::fs::remove_file(&out);
@@ -581,7 +587,7 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
     let mut inputs: Vec<(String, bool, f64)> = Vec::new();
     let mut base = "base0".to_owned();
     for (n, clip) in active.iter().enumerate() {
-        let path = preview_source_path(clip);
+        let path = preview_source_path(clip, height);
         if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
         let image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
         let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
@@ -641,6 +647,7 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
     }
     std::fs::rename(&render_out, &out).map_err(|e| format!("Could not cache preview frame: {e}"))?;
     prune_preview_cache(out.parent().ok_or("Invalid preview cache path")?, &out);
+    preview_memory_put(&out);
     Ok(json!({"previewPath": out.to_string_lossy(), "at": at, "width": width, "height": height}))
 }
 

@@ -478,20 +478,48 @@ static void PlutoPollBackend(void) {
         if (!event) break;
         if (strstr(event, "\"command\":\"preview_frame\"")) {
             double requestId = 0.0; char previewPath[1024] = {0};
-            if (PlutoJsonNumber(event, "requestId", &requestId) && (uint64_t)requestId == gPreviewTaskId &&
-                strstr(event, "\"ok\":true") && PlutoJsonString(event, "previewPath", previewPath, sizeof(previewPath))) {
-                if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
-                gPreviewFrame = LoadTexture(previewPath);
-                if (gPreviewFrame.id) SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
-                gPreviewDirty = false;
-            } else if (strstr(event, "\"ok\":false")) {
-                double requestId = 0.0;
-                if (PlutoJsonNumber(event, "requestId", &requestId) && (uint64_t)requestId == gPreviewTaskId) {
-                    PlutoJsonString(event, "error", gBackendMessage, sizeof(gBackendMessage));
-                    gPreviewDirty = false;
+            bool matchingRequest = PlutoJsonNumber(event, "requestId", &requestId) &&
+                                   gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
+            if (matchingRequest) {
+                gPreviewTaskId = 0;
+                bool currentState = (gTimelinePlaying || gTimelineScrubbing) || !gPreviewDirty;
+                bool currentRequest = currentState &&
+                                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f) &&
+                                      gPreviewRequestRes == gPreviewRes;
+                if (strstr(event, "\"ok\":true") && PlutoJsonString(event, "previewPath", previewPath, sizeof(previewPath))) {
+                    double renderedAt = -1.0, renderedHeight = 0.0;
+                    bool currentFrame = currentRequest &&
+                        PlutoJsonNumber(event, "at", &renderedAt) &&
+                        PlutoJsonNumber(event, "height", &renderedHeight) &&
+                        fabs(renderedAt - gPreviewRequestAt) <= (0.5 / 30.0) &&
+                        (int)renderedHeight == gPreviewRes;
+                    if (currentFrame) {
+                        if (strcmp(gPreviewTexturePath, previewPath) != 0) {
+                            Texture2D nextFrame = LoadTexture(previewPath);
+                            if (nextFrame.id) {
+                                SetTextureFilter(nextFrame, TEXTURE_FILTER_BILINEAR);
+                                if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+                                gPreviewFrame = nextFrame;
+                                strncpy(gPreviewTexturePath, previewPath, sizeof(gPreviewTexturePath) - 1);
+                                gPreviewTexturePath[sizeof(gPreviewTexturePath) - 1] = 0;
+                            } else {
+                                snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not load rendered preview frame");
+                            }
+                        }
+                        gPreviewDirty = false;
+                    } else {
+                        gPreviewDirty = true;
+                    }
+                } else if (strstr(event, "\"ok\":false")) {
+                    if (currentRequest) {
+                        PlutoJsonString(event, "error", gBackendMessage, sizeof(gBackendMessage));
+                        gTimelinePlaying = false;
+                        gPreviewDirty = false;
+                    } else {
+                        gPreviewDirty = true;
+                    }
                 }
             }
-            if (previewPath[0]) remove(previewPath);
         } else if (strstr(event, "\"command\":\"export_project\"")) {
             if (strstr(event, "\"ok\":true")) {
                 char path[1024] = {0};
@@ -533,13 +561,19 @@ static void PlutoUnloadMedia(void) {
             UnloadTexture(gImported[i].waveform);
     }
     if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+    gPreviewTexturePath[0] = 0;
 }
 
 static uint64_t PlutoRequestPreview(void) {
-    if (!gBackend.submit) return 0;
+    if (!gBackend.submit || gPreviewTaskId) return 0;
     char request[128];
     snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.4f,\"height\":%d}", gPlayhead, gPreviewRes);
-    gPreviewTaskId = gBackend.submit(request);
+    uint64_t taskId = gBackend.submit(request);
+    if (taskId) {
+        gPreviewTaskId = taskId;
+        gPreviewRequestAt = gPlayhead;
+        gPreviewRequestRes = gPreviewRes;
+    }
     return gPreviewTaskId;
 }
 

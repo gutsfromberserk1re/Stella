@@ -21,4 +21,7 @@
 - Transition buttons align to the visible join between adjacent clips.
 - Added content-addressed thumbnail and waveform caches plus background FFmpeg proxy generation (720p editing copies; originals remain for export).
 - Preview requests use cached proxies when available; linked position/scale values update together while dragging.
-- Next: verify proxy fallback and linked-value behavior; add a bounded hot-frame/effect memory cache and optimize continuous playback with a persistent decoder.
+- Fixed preview request coalescing and hot-frame memory reuse; FFmpeg preview/proxy smoke checks pass.
+- Hand-pan stops at time zero; video snapping defaults on, audio stays free, and linked audio follows before lanes draw.
+- HSL and tonal sliders now feed shared FFmpeg preview/export filters; Crop/Distort switch smoothly and transitions use neutral spacing.
+- Next: GitHub build and app UI verification; persistent decoding for real-time playback.
