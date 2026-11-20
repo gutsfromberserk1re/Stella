@@ -9,12 +9,14 @@ static Color LerpC(Color a, Color b, float t) {
 }
 static Color MediaSwatch(const char *key, int fallback) {
     static const Color palette[] = {
-        {130, 77, 57, 255}, {143, 96, 57, 255}, {126, 76, 72, 255},
-        {91, 112, 77, 255}, {113, 112, 65, 255}, {79, 111, 91, 255},
-        {125, 105, 78, 255}, {102, 91, 72, 255}
+        {91, 72, 126, 255}, {63, 88, 132, 255}, {57, 105, 117, 255},
+        {62, 112, 86, 255}, {82, 76, 132, 255}, {67, 111, 101, 255},
+        {75, 93, 133, 255}, {83, 114, 94, 255}
     };
-    uint32_t hash = 2166136261u ^ (uint32_t)fallback;
-    if (key) for (const unsigned char *p = (const unsigned char *)key; *p; p++) hash = (hash ^ *p) * 16777619u;
+    uint32_t hash = 2166136261u;
+    if (key && *key) {
+        for (const unsigned char *p = (const unsigned char *)key; *p; p++) hash = (hash ^ *p) * 16777619u;
+    } else hash ^= (uint32_t)fallback;
     return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
 static Color ShadeMediaColor(Color color, float amount) {
@@ -46,6 +48,25 @@ static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     DrawRing((Vector2){r.x + r.width - rad, r.y + rad},           rad - t, rad, 270, 360, 16, c);
     DrawRing((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad - t, rad, 0, 90, 16, c);
     DrawRing((Vector2){r.x + rad, r.y + r.height - rad},          rad - t, rad, 90, 180, 16, c);
+}
+static void DottedLine(Vector2 a, Vector2 b, float dash, float gap, float thickness, Color color) {
+    Vector2 d = {b.x - a.x, b.y - a.y};
+    float length = sqrtf(d.x * d.x + d.y * d.y);
+    if (length <= .01f) return;
+    Vector2 dir = {d.x / length, d.y / length};
+    for (float at = 0.f; at < length; at += dash + gap) {
+        float end = fminf(length, at + dash);
+        DrawLineEx((Vector2){a.x + dir.x * at, a.y + dir.y * at},
+                   (Vector2){a.x + dir.x * end, a.y + dir.y * end}, thickness, color);
+    }
+}
+static void DrawDottedRect(Rectangle r, float dash, float gap, float thickness, Color color) {
+    Vector2 tl = {r.x, r.y}, tr = {r.x + r.width, r.y};
+    Vector2 br = {r.x + r.width, r.y + r.height}, bl = {r.x, r.y + r.height};
+    DottedLine(tl, tr, dash, gap, thickness, color);
+    DottedLine(tr, br, dash, gap, thickness, color);
+    DottedLine(br, bl, dash, gap, thickness, color);
+    DottedLine(bl, tl, dash, gap, thickness, color);
 }
 static void GradRR(Rectangle r, float rad, Color top, Color bot) {
     rad = fminf(rad, fminf(r.width, r.height) / 2.f);
@@ -114,7 +135,7 @@ static Vector2 IconPoint(float x, float y, float w, float h, float nx, float ny,
 /* User-supplied monochrome tool icons; tint at draw time to match the UI theme. */
 static Texture2D gToolIcons[6];
 static const char *gToolIconFiles[6] = {"color-palette.ico", "link.ico", "palm.ico", "selection.ico", "magnet.ico", "library.ico"};
-static Texture2D gKnobTexture;
+static Texture2D gKnobTexture, gAppLogo;
 
 static void LoadKnobTexture(void) {
     const int size = 128;
@@ -129,14 +150,6 @@ static void LoadKnobTexture(void) {
         if (radius <= .91f) {
             float t = (float)y / (float)(size - 1);
             color = (Color){(unsigned char)(48.f - 25.f * t), (unsigned char)(49.f - 25.f * t), (unsigned char)(55.f - 27.f * t), 255};
-            float sx = dx / .57f, sy = (dy + .34f) / .11f;
-            float shine = sx * sx + sy * sy;
-            if (shine < 1.f) {
-                unsigned char add = (unsigned char)(16.f * (1.f - shine));
-                color.r = (unsigned char)fminf(255.f, color.r + add);
-                color.g = (unsigned char)fminf(255.f, color.g + add);
-                color.b = (unsigned char)fminf(255.f, color.b + add);
-            }
         } else if (radius <= .945f) color = (Color){7, 8, 10, 248};
         else if (radius <= 1.f) color = (Color){88, 90, 98, 255};
         else if (radius <= 1.08f) {
@@ -197,6 +210,52 @@ static Texture2D LoadToolIconIco(const char *path) {
     return texture;
 }
 
+static Texture2D LoadAppLogoIco(const char *path) {
+    Texture2D texture = {0};
+#ifdef _WIN32
+    const int size = 128;
+    HICON icon = (HICON)LoadImageA(NULL, path, IMAGE_ICON, size, size, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    if (!icon) return texture;
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) { DestroyIcon(icon); return texture; }
+    BITMAPINFO info = {0};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void *dibPixels = NULL;
+    HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &dibPixels, NULL, 0);
+    if (!dib || !dibPixels) {
+        if (dib) DeleteObject(dib);
+        DeleteDC(dc); DestroyIcon(icon); return texture;
+    }
+    HGDIOBJ previous = SelectObject(dc, dib);
+    memset(dibPixels, 0, (size_t)size * size * 4);
+    DrawIconEx(dc, 0, 0, icon, size, size, 0, NULL, DI_NORMAL);
+    Color *rgba = (Color *)malloc((size_t)size * size * sizeof(Color));
+    if (rgba) {
+        const unsigned char *bgra = (const unsigned char *)dibPixels;
+        for (int i = 0; i < size * size; i++) {
+            unsigned char alpha = bgra[i * 4 + 3];
+            if (alpha == 0 && (bgra[i * 4] || bgra[i * 4 + 1] || bgra[i * 4 + 2])) alpha = 255;
+            rgba[i] = (Color){bgra[i * 4 + 2], bgra[i * 4 + 1], bgra[i * 4], alpha};
+        }
+        Image image = {rgba, size, size, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        texture = LoadTextureFromImage(image);
+        free(rgba);
+    }
+    SelectObject(dc, previous);
+    DeleteObject(dib);
+    DeleteDC(dc);
+    DestroyIcon(icon);
+#else
+    (void)path;
+#endif
+    return texture;
+}
+
 static bool DrawAssetIcon(int k, Rectangle r, Color tint) {
     int slot = k == I_PALETTE ? 0 : k == I_LINK ? 1 : k == I_HAND ? 2 : k == I_POINTER ? 3 :
                k == I_MAGNET ? 4 : k == I_LIBRARY ? 5 : -1;
@@ -217,11 +276,18 @@ static void LoadUiIcons(void) {
             if (gToolIcons[i].id) SetTextureFilter(gToolIcons[i], TEXTURE_FILTER_BILINEAR);
         }
     }
+    const char *logoPath = TextFormat("%sIcons/Logo/Stella.ico", appDir);
+    if (!FileExists(logoPath)) logoPath = "Icons/Logo/Stella.ico";
+    if (FileExists(logoPath)) {
+        gAppLogo = LoadAppLogoIco(logoPath);
+        if (gAppLogo.id) SetTextureFilter(gAppLogo, TEXTURE_FILTER_BILINEAR);
+    }
 }
 
 static void UnloadUiIcons(void) {
     for (int i = 0; i < 6; i++) if (gToolIcons[i].id) UnloadTexture(gToolIcons[i]);
     if (gKnobTexture.id) UnloadTexture(gKnobTexture);
+    if (gAppLogo.id) UnloadTexture(gAppLogo);
 }
 
 static void DrawIcon(int k, Rectangle r, Color c, float v) {
@@ -322,6 +388,15 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
 /* custom elements                                                     */
 /* ------------------------------------------------------------------ */
 static void DrawCustom(Cust *cu, Rectangle r) {
+    if (cu->kind == K_APP_LOGO) {
+        if (gAppLogo.id) DrawTexturePro(gAppLogo, (Rectangle){0, 0, (float)gAppLogo.width, (float)gAppLogo.height},
+                                        r, (Vector2){0, 0}, 0.f, WHITE);
+        else {
+            FillRR(r, 7.f, (Color){20, 21, 25, 255});
+            StrokeRR(r, 7.f, 1.f, (Color){64, 66, 73, 255});
+        }
+        return;
+    }
     if (cu->kind < K_THUMB) {
         if (!DrawAssetIcon(cu->kind, r, RC(cu->a))) DrawIcon(cu->kind, r, RC(cu->a), cu->v);
         return;
@@ -332,7 +407,12 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         bool imported = (cu->i & 0x1000) != 0;
         const char *key = imported && idx < gImportedCount ? gImported[idx].path : NULL;
         Color swatch = MediaSwatch(key, idx);
-        GradRR(r, 10, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        Texture2D thumbnail = imported && idx < gImportedCount ? gImported[idx].thumbnail : (Texture2D){0};
+        if (thumbnail.id) {
+            DrawTexturePro(thumbnail, (Rectangle){0, 0, (float)thumbnail.width, (float)thumbnail.height}, r,
+                           (Vector2){0, 0}, 0.f, WHITE);
+            FillRR(r, 10, (Color){10, 12, 16, 25});
+        } else GradRR(r, 10, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
         FillRR(r, 10, (Color){255, 255, 255, U8(20 * cu->f)});
         StrokeRR(r, 10, 1, (Color){255, 255, 255, U8(20 + 60 * cu->f)});
         if (cu->f > .03f) {
@@ -358,15 +438,12 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             DrawCircleV(c, rad, (Color){31, 32, 36, 255});
             Ring(c, rad - .5f, 1.2f, (Color){88, 90, 98, 255});
         }
-        DrawCircleV(c, rad * .43f, (Color){255, 255, 255, U8(10.f * hv)});
         float ang = (cu->v - .5f) * 4.7f;
         Vector2 d = {sinf(ang), -cosf(ang)};
-        float iw = fmaxf(3.f, rad * .14f), il = rad * .13f, ir = rad * .78f;
-        Vector2 p0 = {c.x + d.x * (ir - il * .5f), c.y + d.y * (ir - il * .5f)};
-        Vector2 p1 = {c.x + d.x * (ir + il * .5f), c.y + d.y * (ir + il * .5f)};
-        FilledCapsule(p0, p1, iw + 2.f, (Color){0, 0, 0, 70});
-        FilledCapsule(p0, p1, iw, (Color){206, 207, 212, 255});
-        FilledCapsule(p0, p1, iw * .5f, (Color){255, 255, 255, 255});
+        Vector2 p0 = {c.x + d.x * rad * .66f, c.y + d.y * rad * .66f};
+        Vector2 p1 = {c.x + d.x * rad * .84f, c.y + d.y * rad * .84f};
+        DrawLineEx((Vector2){p0.x + 1.f, p0.y + 1.f}, (Vector2){p1.x + 1.f, p1.y + 1.f}, 2.6f, (Color){0, 0, 0, 125});
+        DrawLineEx(p0, p1, 1.7f, (Color){235, 237, 242, 255});
     } break;
 
     case K_WHEEL: {
@@ -383,9 +460,9 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         Ring(c, rad, 2, (Color){38, 39, 45, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
         float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 4.f, (Color){10, 10, 14, 145});
+        DrawCircleV(p, dot + 4.f, (Color){10, 10, 14, 105});
         if (cu->v > .5f) {
-            DrawCircleV(p, dot + 2.6f, (Color){20, 21, 25, 255});
+            DrawCircleV(p, dot + 2.2f, (Color){235, 236, 240, 255});
             DrawCircleV(p, dot, RC(cu->c));
         }
     } break;
@@ -513,9 +590,13 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
         if (wave.id && hasAudio) {
-            Rectangle waveformRect = {r.x + 8, r.y + r.height - 22, fmaxf(0.f, r.width - 16), 19};
+            Rectangle band = {r.x + 6, r.y + r.height - 23, fmaxf(0.f, r.width - 12), 19};
+            FillRR(band, 3.f, (Color){54, 112, 150, 175});
+            DrawLineEx((Vector2){r.x + 6, band.y - 1}, (Vector2){r.x + r.width - 6, band.y - 1},
+                       1.f, (Color){125, 171, 196, 210});
+            Rectangle waveformRect = {r.x + 8, band.y, fmaxf(0.f, r.width - 16), band.height};
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
-                           (Vector2){0, 0}, 0.f, WHITE);
+                           (Vector2){0, 0}, 0.f, (Color){81, 134, 166, 255});
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
@@ -677,8 +758,7 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
     }
     if (gScisN > 0) { gScisN = 0; EndScissorMode(); }
     if (gMediaDropPreviewVisible && gMediaDropPreview.width > 0.f) {
-        FillRR(gMediaDropPreview, 5.f, (Color){136, 96, 182, 34});
-        StrokeRR(gMediaDropPreview, 5.f, 2.f, (Color){190, 150, 232, 235});
+        DrawDottedRect(gMediaDropPreview, 4.f, 4.f, 2.f, (Color){190, 150, 232, 235});
     }
     if (gPH) {
         Color red = {240, 62, 72, 255};
@@ -687,15 +767,39 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         Tri((Vector2){gPHPos.x - 5, gPHPos.y + 4}, (Vector2){gPHPos.x + 5, gPHPos.y + 4}, (Vector2){gPHPos.x, gPHPos.y + 10}, red);
     }
     for (int i = 0; i < gTransitionButtonCount; i++) {
-        Rectangle r = gTransitionButtons[i].rect;
+        TransitionButton *button = &gTransitionButtons[i];
+        Rectangle r = button->rect;
         bool hover = CheckCollisionPointRec(GetMousePosition(), r);
-        if (hover) gHand = true;
-        DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
-                    hover ? (Color){46, 48, 55, 255} : (Color){30, 31, 36, 255});
-        DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f), r.width * .5f,
-                        hover ? (Color){78, 80, 89, 255} : (Color){52, 54, 61, 255});
-        DrawLineEx((Vector2){r.x + 6.f, r.y + 11.f}, (Vector2){r.x + 16.f, r.y + 11.f}, 1.7f, (Color){237, 237, 240, 255});
-        DrawLineEx((Vector2){r.x + 11.f, r.y + 6.f}, (Vector2){r.x + 11.f, r.y + 16.f}, 1.7f, (Color){237, 237, 240, 255});
+        if (button->applied) {
+            Rectangle span = button->durationRect;
+            if (span.width > 1.f) {
+                FillRR(span, 2.5f, (Color){70, 157, 224, 68});
+                DrawLineEx((Vector2){span.x, span.y + .5f},
+                           (Vector2){span.x + span.width, span.y + .5f}, 1.4f,
+                           (Color){111, 191, 248, 220});
+                DrawLineEx((Vector2){span.x, span.y - 1.f},
+                           (Vector2){span.x, span.y + span.height + 1.f}, 1.2f,
+                           (Color){111, 191, 248, 230});
+                DrawLineEx((Vector2){span.x + span.width, span.y - 1.f},
+                           (Vector2){span.x + span.width, span.y + span.height + 1.f}, 1.2f,
+                           (Color){111, 191, 248, 230});
+            }
+            DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
+                        (Color){245, 246, 249, 255});
+            if (hover) DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f),
+                                       r.width * .5f, (Color){112, 190, 245, 255});
+            DrawIcon(I_BOWTIE, (Rectangle){r.x + 5.f, r.y + 5.f, r.width - 10.f, r.height - 10.f},
+                     (Color){35, 37, 42, 255}, 0.f);
+        } else if (hover) {
+            DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
+                        (Color){43, 45, 51, 255});
+            DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f), r.width * .5f,
+                            (Color){92, 95, 104, 255});
+            DrawLineEx((Vector2){r.x + 6.f, r.y + 12.f}, (Vector2){r.x + 18.f, r.y + 12.f}, 1.7f,
+                       (Color){237, 238, 241, 255});
+            DrawLineEx((Vector2){r.x + 12.f, r.y + 6.f}, (Vector2){r.x + 12.f, r.y + 18.f}, 1.7f,
+                       (Color){237, 238, 241, 255});
+        }
     }
     if (gFadeA > 2.f && gFadeR.width > 0.f)
         GradRR(gFadeR, 22, (Color){28, 29, 32, U8(gFadeA)}, (Color){21, 22, 24, U8(gFadeA)});
@@ -737,6 +841,33 @@ static void DrawPreviewQualityDropdown(void) {
         Color txt = options[i] == gPreviewRes ? RC(C_TEXT) : RC(C_DIM); txt.a = U8(txt.a * t);
         TxtAt(0, label, row.x + 12.f, row.y + 6.f, 14.f, txt);
         if (options[i] == gPreviewRes) {
+            Color check = (Color){224, 226, 231, U8(255.f * t)};
+            DrawLineEx((Vector2){row.x + row.width - 17.f, row.y + 14.f}, (Vector2){row.x + row.width - 13.f, row.y + 18.f}, 1.6f, check);
+            DrawLineEx((Vector2){row.x + row.width - 13.f, row.y + 18.f}, (Vector2){row.x + row.width - 7.f, row.y + 10.f}, 1.6f, check);
+        }
+    }
+}
+
+static void DrawPreviewFpsDropdown(void) {
+    float t = gPreviewFpsMenuT;
+    if (t < .01f || gPreviewFpsRect.width <= 0.f) return;
+    const int options[] = {24, 30, 60};
+    Rectangle box = {gPreviewFpsRect.x + gPreviewFpsRect.width - 88.f,
+                     gPreviewFpsRect.y - 102.f + 8.f * (1.f - t), 88.f, 98.f};
+    Vector2 mouse = GetMousePosition();
+    bool over = mouse.x >= box.x && mouse.x <= box.x + box.width && mouse.y >= box.y && mouse.y <= box.y + box.height;
+    if (over && gPreviewFpsMenuOpen) gHand = true;
+    FillRR(box, 9.f, (Color){24, 25, 28, U8(255.f * t)});
+    StrokeRR(box, 9.f, 1.f, (Color){54, 56, 62, U8(255.f * t)});
+    for (int i = 0; i < 3; i++) {
+        Rectangle row = {box.x + 4.f, box.y + 4.f + i * 30.f, box.width - 8.f, 28.f};
+        bool rowHover = gPreviewFpsMenuOpen && mouse.x >= row.x && mouse.x <= row.x + row.width && mouse.y >= row.y && mouse.y <= row.y + row.height;
+        if (options[i] == gPreviewFps) FillRR(row, 6.f, (Color){45, 47, 53, U8(255.f * t)});
+        else if (rowHover) FillRR(row, 6.f, (Color){37, 39, 44, U8(255.f * t)});
+        char label[16]; snprintf(label, sizeof(label), "%d fps", options[i]);
+        Color txt = options[i] == gPreviewFps ? RC(C_TEXT) : RC(C_DIM); txt.a = U8(txt.a * t);
+        TxtAt(0, label, row.x + 11.f, row.y + 6.f, 13.f, txt);
+        if (options[i] == gPreviewFps) {
             Color check = (Color){224, 226, 231, U8(255.f * t)};
             DrawLineEx((Vector2){row.x + row.width - 17.f, row.y + 14.f}, (Vector2){row.x + row.width - 13.f, row.y + 18.f}, 1.6f, check);
             DrawLineEx((Vector2){row.x + row.width - 13.f, row.y + 18.f}, (Vector2){row.x + row.width - 7.f, row.y + 10.f}, 1.6f, check);

@@ -282,8 +282,10 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonStringRange(begin, end, "groupId", clip->groupId, sizeof(clip->groupId));
             PlutoJsonStringRange(begin, end, "linkedAudioId", clip->linkedId, sizeof(clip->linkedId));
             PlutoJsonStringRange(begin, end, "kind", clip->kind, sizeof(clip->kind));
+            PlutoJsonStringPath(begin, end, "props.transitionOut.type", clip->transitionType, sizeof(clip->transitionType));
             PlutoJsonNumberRange(begin, end, "start", &start);
             PlutoJsonNumberRange(begin, end, "dur", &duration);
+            clip->transitionDuration = PlutoReadNumber(begin, end, "props.transitionOut.duration", 1.f);
             clip->track = PlutoTrackIndex(track);
             const char *hasAudio = strstr(begin, "\"hasAudio\":true");
             clip->hasAudio = hasAudio && hasAudio < end;
@@ -482,9 +484,15 @@ static void PlutoPollBackend(void) {
                                    gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
             if (matchingRequest) {
                 gPreviewTaskId = 0;
-                bool previewMoving = gTimelinePlaying || gTimelineScrubbing;
+                bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
+                float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
+                bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
+                bool newerInDirection = gPreviewDisplayedAt < 0.f ||
+                    (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
+                             : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
+                bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
                 bool currentRequest = gPreviewRequestRes == gPreviewRes &&
-                    (previewMoving || (!gPreviewDirty &&
+                    (previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
                 if (strstr(event, "\"ok\":true") && PlutoJsonString(event, "previewPath", previewPath, sizeof(previewPath))) {
                     double renderedAt = -1.0, renderedHeight = 0.0;
@@ -506,11 +514,12 @@ static void PlutoPollBackend(void) {
                                 snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not load rendered preview frame");
                             }
                         }
+                        gPreviewDisplayedAt = (float)renderedAt;
                         /* Keep showing completed frames during playback/scrubbing even if
-                           the playhead advanced while FFmpeg rendered this one. Request
-                           the newest time immediately after consuming the in-flight task. */
+                           the playhead advanced slightly while FFmpeg rendered this one.
+                           Reject older frames so the picture cannot visibly run backward. */
                         gPreviewDirty = previewMoving &&
-                            fabsf(gPreviewRequestAt - gPlayhead) > (0.5f / 30.f);
+                            fabsf(gPreviewRequestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
                     } else {
                         gPreviewDirty = true;
                     }
@@ -545,6 +554,10 @@ static void PlutoPollBackend(void) {
                     asset->waveform = LoadTexture(asset->waveformPath);
                     if (asset->waveform.id) SetTextureFilter(asset->waveform, TEXTURE_FILTER_BILINEAR);
                 }
+                if (PlutoJsonString(event, "thumbnailPath", asset->thumbnailPath, sizeof(asset->thumbnailPath))) {
+                    asset->thumbnail = LoadTexture(asset->thumbnailPath);
+                    if (asset->thumbnail.id) SetTextureFilter(asset->thumbnail, TEXTURE_FILTER_BILINEAR);
+                }
                 gBackendMessage[0] = 0;
             }
         } else {
@@ -558,6 +571,7 @@ static void PlutoUnloadMedia(void) {
     for (int i = 0; i < gImportedCount; i++)
     {
         if (gImported[i].waveform.id) UnloadTexture(gImported[i].waveform);
+        if (gImported[i].thumbnail.id) UnloadTexture(gImported[i].thumbnail);
     }
     if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
     gPreviewTexturePath[0] = 0;

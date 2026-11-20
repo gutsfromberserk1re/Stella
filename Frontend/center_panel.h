@@ -13,19 +13,31 @@ static void CenterPanel(void) {
     static const int resolutions[] = {240, 360, 480, 720, 1080};
     Clay_BoundingBox qb = Clay_GetElementData(CLAY_ID("PreviewQuality")).boundingBox;
     gPreviewQualityRect = (Rectangle){qb.x, qb.y, qb.width, qb.height};
+    Clay_BoundingBox fb = Clay_GetElementData(CLAY_ID("PreviewFps")).boundingBox;
+    gPreviewFpsRect = (Rectangle){fb.x, fb.y, fb.width, fb.height};
     Rectangle menu = {gPreviewQualityRect.x, gPreviewQualityRect.y - 5 * 32.f - 6.f, 96.f, 5 * 32.f};
+    Rectangle fpsMenu = {gPreviewFpsRect.x + gPreviewFpsRect.width - 88.f, gPreviewFpsRect.y - 3 * 32.f - 6.f, 88.f, 3 * 32.f};
     if (gPreviewMenuOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         Vector2 mouse = GetMousePosition();
         if (mouse.x >= menu.x && mouse.x <= menu.x + menu.width && mouse.y >= menu.y && mouse.y <= menu.y + menu.height) {
             int option = (int)((mouse.y - menu.y) / 32.f);
             if (option >= 0 && option < 5) { gPreviewRes = resolutions[option]; gPreviewDirty = true; }
             gPreviewMenuOpen = false;
-        } else if (mouse.x < gPreviewQualityRect.x || mouse.x > gPreviewQualityRect.x + gPreviewQualityRect.width ||
-                   mouse.y < menu.y || mouse.y > gPreviewQualityRect.y + gPreviewQualityRect.height) {
-            gPreviewMenuOpen = false;
-        }
+        } else if (!(mouse.x >= gPreviewQualityRect.x && mouse.x <= gPreviewQualityRect.x + gPreviewQualityRect.width &&
+                     mouse.y >= gPreviewQualityRect.y && mouse.y <= gPreviewQualityRect.y + gPreviewQualityRect.height)) gPreviewMenuOpen = false;
+    }
+    if (gPreviewFpsMenuOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        Vector2 mouse = GetMousePosition();
+        if (mouse.x >= fpsMenu.x && mouse.x <= fpsMenu.x + fpsMenu.width && mouse.y >= fpsMenu.y && mouse.y <= fpsMenu.y + fpsMenu.height) {
+            static const int rates[] = {24, 30, 60};
+            int option = (int)((mouse.y - fpsMenu.y) / 32.f);
+            if (option >= 0 && option < 3) { gPreviewFps = rates[option]; gPreviewDirty = true; }
+            gPreviewFpsMenuOpen = false;
+        } else if (!(mouse.x >= gPreviewFpsRect.x && mouse.x <= gPreviewFpsRect.x + gPreviewFpsRect.width &&
+                     mouse.y >= gPreviewFpsRect.y && mouse.y <= gPreviewFpsRect.y + gPreviewFpsRect.height)) gPreviewFpsMenuOpen = false;
     }
     gPreviewMenuT = EaseIO(AnimLin(CLAY_ID("PreviewMenuAnim").id, gPreviewMenuOpen ? 1.f : 0.f, .16f));
+    gPreviewFpsMenuT = EaseIO(AnimLin(CLAY_ID("PreviewFpsMenuAnim").id, gPreviewFpsMenuOpen ? 1.f : 0.f, .16f));
     Clay_BoundingBox pb = Clay_GetElementData(CLAY_ID("PreviewArea")).boundingBox;
     float aw = pb.width - 28, ah = pb.height - 28;
     if (aw < 60 || ah < 60) { aw = 640; ah = 360; }
@@ -63,12 +75,22 @@ static void CenterPanel(void) {
             CLAY(CLAY_ID("TransR"), {.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_CENTER}}}) {
                 Clay_ElementId previewQuality = CLAY_ID("PreviewQuality");
                 Bs q = Interact(previewQuality);
-                if (q.clicked) gPreviewMenuOpen = !gPreviewMenuOpen;
+                if (q.clicked) { gPreviewMenuOpen = !gPreviewMenuOpen; gPreviewFpsMenuOpen = false; }
                 CLAY(previewQuality, {.layout = {.sizing = {FIT, FIX(30)}, .padding = {10, 10, 0, 0}, .childGap = 5, .childAlignment = AL_Y},
                                       .backgroundColor = Mix(RGB(30, 31, 36), RGB(44, 46, 52), q.hover * .75f),
                                       .cornerRadius = CLAY_CORNER_RADIUS(8),
                                       .border = {.color = Mix(RGB(42, 44, 50), RGB(72, 76, 86), q.hover * .75f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
                     Tx(Fmt("%dp", gPreviewRes), 13, C_TEXT, 0);
+                    Icon(I_CHEV_DN, 12, C_MUTED);
+                }
+                Clay_ElementId previewFps = CLAY_ID("PreviewFps");
+                Bs f = Interact(previewFps);
+                if (f.clicked) { gPreviewFpsMenuOpen = !gPreviewFpsMenuOpen; gPreviewMenuOpen = false; }
+                CLAY(previewFps, {.layout = {.sizing = {FIT, FIX(30)}, .padding = {10, 10, 0, 0}, .childGap = 5, .childAlignment = AL_Y},
+                                  .backgroundColor = Mix(RGB(30, 31, 36), RGB(44, 46, 52), f.hover * .75f),
+                                  .cornerRadius = CLAY_CORNER_RADIUS(8),
+                                  .border = {.color = Mix(RGB(42, 44, 50), RGB(72, 76, 86), f.hover * .75f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    Tx(Fmt("%d fps", gPreviewFps), 13, C_TEXT, 0);
                     Icon(I_CHEV_DN, 12, C_MUTED);
                 }
                 if (IconBtn(CLAY_ID("GridBtn"), I_GRID, 30, 17, C_DIM, gTimelineGrid, 8)) gTimelineGrid = !gTimelineGrid;

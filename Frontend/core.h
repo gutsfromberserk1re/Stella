@@ -58,6 +58,7 @@ enum {
     I_PAUSE, I_LOOP, I_GRID, I_POINTER, I_HAND, I_SCISSORS, I_TEXT, I_TRASH, I_KF_PREV, I_KF_NEXT,
     I_KF_DIAMOND, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
     I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
+    K_APP_LOGO = 99,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
     K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT, K_ROT_ICON
 };
@@ -85,6 +86,11 @@ static int   gPreviewRes = 720;
 static bool  gPreviewMenuOpen;
 static float gPreviewMenuT;
 static bool  gPreviewDirty;
+static int gPreviewFps = 30;
+static bool gPreviewFpsMenuOpen;
+static float gPreviewFpsMenuT;
+static bool gPreviewNavigating;
+static float gPreviewDisplayedAt = -1.f;
 static bool  gTimelineScrubbing;
 static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
@@ -93,6 +99,7 @@ static int gPreviewRequestRes;
 static Texture2D gPreviewFrame;
 static char gPreviewTexturePath[1024];
 static Rectangle gPreviewQualityRect;
+static Rectangle gPreviewFpsRect;
 static float gMediaZoom = 1.f;
 static char gMediaHoverName[260];
 static Rectangle gMediaHoverRect;
@@ -104,7 +111,12 @@ static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineGrid;
 static int gTransitionFocusClip = -1;
 static char gTransitionType[16] = "none";
 static float gTransitionDuration = 1.f;
-typedef struct { Rectangle rect; int clip; } TransitionButton;
+typedef struct {
+    Rectangle rect;
+    Rectangle durationRect;
+    int clip;
+    bool applied;
+} TransitionButton;
 static TransitionButton gTransitionButtons[64];
 static int gTransitionButtonCount;
 static int   gTimelineSelected = -1, gMediaDragIndex = -1, gClipDragIndex = -1;
@@ -175,8 +187,8 @@ static bool gScrubCursor;
 #define MAX_IMPORTED_MEDIA 64
 typedef struct {
     char path[1024], name[260], kind[16];
-    char waveformPath[1024];
-    Texture2D waveform;
+    char waveformPath[1024], thumbnailPath[1024];
+    Texture2D waveform, thumbnail;
     float duration;
     bool hasAudio;
 } ImportedMedia;
@@ -188,14 +200,17 @@ static char gBackendMessage[256];
 #define MAX_TIMELINE_CLIPS 256
 typedef struct {
     char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
+    char transitionType[16];
     int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
-    float start, duration;
+    float start, duration, transitionDuration;
     bool hasAudio;
     float keyframes[32];
     int keyframeCount;
 } TimelineClipUi;
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;
+static float gClipDragSnapshotStart[MAX_TIMELINE_CLIPS];
+static int gClipDragSnapshotTrack[MAX_TIMELINE_CLIPS];
 static bool gTimelineMultiSelect[MAX_TIMELINE_CLIPS];
 static int gTimelineSelectionAnchor = -1;
 static bool gTimelineContextOpen;

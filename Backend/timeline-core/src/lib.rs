@@ -124,8 +124,11 @@ impl Timeline {
         if self.clips.iter().any(|current| current.id == clip.id) {
             return Err(TimelineError::DuplicateId(clip.id));
         }
-        if clip.track.is_video() && self.snapping {
-            clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25);
+        if clip.track.is_video() {
+            clip.start = self.magnetic_start(&clip.id, clip.start.max(0.0));
+            if self.snapping {
+                clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25);
+            }
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
@@ -162,7 +165,16 @@ impl Timeline {
         if original.track.is_video() != desired_track.is_video() {
             return Err(TimelineError::InvalidRange);
         }
+        if original.track.is_video()
+            && (original.track != desired_track || (desired_start - original.start).abs() > EPSILON)
+        {
+            let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str);
+            self.close_lane_gap(id, original.track, original.start, original.end(), group_id);
+        }
         let mut start = desired_start.max(0.0);
+        if original.track.is_video() {
+            start = self.magnetic_start(id, start);
+        }
         if self.snapping && original.track.is_video() {
             start = self.snap_start(id, start, original.duration, playhead, snap_threshold);
         }
@@ -241,6 +253,11 @@ impl Timeline {
         if at <= left.start + EPSILON || at >= left.end() - EPSILON {
             return Err(TimelineError::InvalidRange);
         }
+        let split_offset = at - left.start;
+        let original_source_offset = left.extra.get("sourceOffset")
+            .and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let mut right_extra = left.extra.clone();
+        right_extra.insert("sourceOffset".into(), serde_json::json!(original_source_offset + split_offset));
         let right = Clip {
             id: right_id,
             track: left.track,
@@ -248,9 +265,14 @@ impl Timeline {
             duration: left.end() - at,
             label: left.label.clone(),
             linked_clip_id: None,
-            extra: left.extra.clone(),
+            extra: right_extra,
         };
         left.duration = at - left.start;
+        /* The original end transition follows the tail segment after a cut. */
+        if let Some(transition) = left.extra.get_mut("props").and_then(serde_json::Value::as_object_mut)
+            .and_then(|props| props.get_mut("transitionOut")).and_then(serde_json::Value::as_object_mut) {
+            transition.insert("type".into(), serde_json::json!("none"));
+        }
         self.replace(left.clone());
         self.clips.push(right.clone());
         self.refresh_duration();
@@ -350,6 +372,33 @@ impl Timeline {
             }
         }
         best.map_or(start, |(_, value)| value.max(0.0))
+    }
+
+    /// The video storyline is always magnetic: place a clip at the latest
+    /// video edge to its left. This remains active when proximity snapping is
+    /// disabled in the UI.
+    fn magnetic_start(&self, id: &str, desired_start: f64) -> f64 {
+        self.clips.iter()
+            .filter(|clip| clip.id != id && clip.track.is_video() && clip.end() <= desired_start + EPSILON)
+            .map(Clip::end)
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0)
+    }
+
+    /// Close the vacated section of a video lane when moving a clip away.
+    /// Followers shift left by the removed duration, preserving their order.
+    fn close_lane_gap(&mut self, moving_id: &str, track: TrackId, start: f64, end: f64, group_id: Option<&str>) {
+        let duration = end - start;
+        if duration <= EPSILON { return; }
+        let mut followers: Vec<_> = self.clips.iter()
+            .filter(|clip| clip.id != moving_id && clip.track == track && clip.start >= end - EPSILON
+                && (group_id.is_none() || clip.extra.get("groupId").and_then(serde_json::Value::as_str) != group_id))
+            .cloned().collect();
+        followers.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+        for mut clip in followers {
+            clip.start = (clip.start - duration).max(start);
+            self.replace(clip);
+        }
     }
 
     fn lane_overlaps(&self, id: &str, track: TrackId, start: f64, duration: f64) -> bool {

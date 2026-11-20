@@ -202,14 +202,19 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         let contrast = n(halftone, "contrast", 48.0).clamp(0.0, 100.0) / 100.0;
         let px = format!("mod(X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.cos(), angle.sin(), size / 2.0, size / 2.0);
         let py = format!("mod(-X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.sin(), angle.cos(), size / 2.0, size / 2.0);
-        let radius = format!("(1-lum(X,Y)/255)*{:.3}*{contrast:.3}", size / 2.0);
+        /* geq's lum(X,Y) accessor is invalid for RGB formats; derive luma from the RGB planes. */
+        let radius = format!("(1-(0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))/255)*{:.3}*{contrast:.3}", size / 2.0);
         filters.push(format!("geq=r='if(lt(hypot({px},{py}),{radius}),0,r(X,Y))':g='if(lt(hypot({px},{py}),{radius}),0,g(X,Y))':b='if(lt(hypot({px},{py}),{radius}),0,b(X,Y))'"));
     }
     if enabled(effects, "posterize") {
         let posterize = &effects["posterize"];
         let blend = n(posterize, "blend", 100.0).clamp(0.0, 100.0) / 100.0;
         let target = n(posterize, "levels", 6.0).clamp(2.0, 16.0);
-        if blend > 0.0 { filters.push(format!("posterize=levels={:.0}", (16.0 - (16.0 - target) * blend).clamp(2.0, 16.0))); }
+        if blend > 0.0 {
+            let steps = target - 1.0;
+            let quantize = format!("(val*{:.5}+floor(val*{steps:.5}/255+0.5)*255/{steps:.5}*{blend:.5})", 1.0 - blend);
+            filters.push(format!("lutrgb=r='{quantize}':g='{quantize}':b='{quantize}'"));
+        }
     }
     if enabled(effects, "mirror") { filters.push("hflip".into()); }
 
@@ -218,9 +223,11 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         if kind == "dip" {
             filters.push(format!("fade=t=in:st={:.5}:d={:.5}", start + d / 2.0, (d / 2.0).max(0.025)));
         } else if kind == "wipe" {
-            filters.push(format!("geq=a='alpha(X,Y)*if(lte(X/W,min(max((T-{start:.5})/{d:.5},0),1)),1,0)'"));
+            filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*if(lte(X/W,min(max((T-{start:.5})/{d:.5},0),1)),1,0)'"));
         } else if kind == "iris" {
-            filters.push(format!("geq=a='alpha(X,Y)*if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.5*min(max((T-{start:.5})/{d:.5},0),1)),1,0)'"));
+            filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.5*min(max((T-{start:.5})/{d:.5},0),1)),1,0)'"));
+        } else if kind == "slide" {
+            /* Slide motion is applied by the shared layer-composite x expression. */
         } else {
             filters.push(format!("fade=t=in:st={start:.5}:d={d:.5}:alpha=1"));
         }

@@ -240,7 +240,7 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
     bool committed = false;
     bool valueChanged = false;
     bool over = Clay_PointerOver(id);
-    if (over || gValueDragId == id.id) gScrubCursor = true;
+    if (dragSensitivity >= 0.f && (over || gValueDragId == id.id)) gScrubCursor = true;
     if (gEditValueId == id.id) {
         if (IsKeyPressed(KEY_ENTER)) { CommitValueEdit(v); committed = true; valueChanged = fabsf(*v - original) > 0.001f; }
         else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
@@ -260,7 +260,7 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
     }
     if (gValueDragId == id.id) {
         float dx = GetMousePosition().x - gValueDragX;
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && fabsf(dx) > 3.f) {
+        if (dragSensitivity >= 0.f && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && fabsf(dx) > 3.f) {
             gValueDragging = true;
             *v = gValueDragStart + dx * dragSensitivity;
         } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
@@ -282,11 +282,10 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
     return committed && valueChanged;
 }
 
-/* Value pills use their full hit area for click-to-type and horizontal scrubbing. */
-static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
+/* Value pills share one visual component; callers choose whether mouse scrubbing is enabled. */
+static bool ValBoxInternal(Clay_ElementId id, float *value, const char *unit,
                            float w, float h, float fs, float ufs, float pad,
-                           float minimum, float maximum, int decimals) {
-    float dragSensitivity = fminf(.2f, fmaxf(.003f, (maximum - minimum) * .2f / 100.f));
+                           float minimum, float maximum, int decimals, float dragSensitivity) {
     bool changed = ValueFieldLogic(id, value, dragSensitivity);
     *value = fmaxf(minimum, fminf(maximum, *value));
     bool over = Clay_PointerOver(id);
@@ -301,6 +300,19 @@ static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
         if (unit) Tx(unit, ufs + 1.f, C_ICON, 0);
     }
     return changed;
+}
+
+static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
+                           float w, float h, float fs, float ufs, float pad,
+                           float minimum, float maximum, int decimals) {
+    float dragSensitivity = fminf(.2f, fmaxf(.003f, (maximum - minimum) * .2f / 100.f));
+    return ValBoxInternal(id, value, unit, w, h, fs, ufs, pad, minimum, maximum, decimals, dragSensitivity);
+}
+
+static bool ValBoxTyped(Clay_ElementId id, float *value, const char *unit,
+                        float w, float h, float fs, float ufs, float pad,
+                        float minimum, float maximum, int decimals) {
+    return ValBoxInternal(id, value, unit, w, h, fs, ufs, pad, minimum, maximum, decimals, -1.f);
 }
 
 /* number field (GROW x 39): value + unit + up/down steppers */
@@ -1016,7 +1028,7 @@ static bool FxHeader(int i, float open) {
     return b.clicked;
 }
 
-#define TRANS_DESC_H 226.f
+#define TRANS_DESC_H 252.f
 #define TRANS_EMPTY_H 46.f
 #define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
 static int TransitionNextClip(int from) {
@@ -1054,7 +1066,7 @@ static void EffectsView(void) {
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
         if (dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}}, .clip = {.vertical = true}}) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
@@ -1064,22 +1076,21 @@ static void EffectsView(void) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
                         TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
                     }
-                    const char *names[5] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris"};
-                    const char *keys[5] = {"none", "crossfade", "dip", "wipe", "iris"};
+                    const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
+                    const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
                     for (int row = 0; row < 3; row++) {
-                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(38)}, .childGap = 10}}) {
+                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 12}}) {
                             for (int col = 0; col < 2; col++) {
                                 int i = row * 2 + col;
-                                if (i >= 5) break;
                                 Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
                                 Bs cb = Interact(cid);
                                 bool selected = strcmp(gTransitionType, keys[i]) == 0;
                                 if (cb.clicked) { strcpy(gTransitionType, keys[i]); CommitTransition(); }
                                 CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
                                           .backgroundColor = BtnBg(selected ? C_SEL : C_CARD, RGB(43, 45, 52), cb),
-                                          .cornerRadius = CLAY_CORNER_RADIUS(9),
+                                          .cornerRadius = CLAY_CORNER_RADIUS(10),
                                           .border = {.color = Mix(C_CARDB, RGB(80, 83, 91), selected ? .72f : cb.hover * .38f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                                    Tx(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
+                                    Tx(names[i], 14, selected ? C_TEXT : C_MUTED, 0);
                                 }
                             }
                         }
@@ -1268,7 +1279,6 @@ static void RightPanel(void) {
                         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
                             Icon(I_FILM, 26, C_MUTED);
                             Tx("Nothing to adjust", 17, C_TEXT, 1);
-                            TxWrap("Select a clip on the timeline to edit its properties.", 14, C_MUTED, 0);
                         }
                     }
                 } else {

@@ -267,6 +267,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v2.png"));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v1.jpg"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-720p.mp4"))
     } else { std::path::PathBuf::new() };
@@ -286,11 +287,31 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         };
         generated.then(|| waveform.to_string_lossy().into_owned())
     } else { None };
+    let thumbnail_path = if kind == "audio" {
+        None
+    } else {
+        let generated = if thumbnail.is_file() {
+            true
+        } else {
+            let mut command = media_command(&ffmpeg);
+            command.args(["-v", "error"]);
+            if kind == "video" {
+                let seek = format!("{:.3}", (duration * 0.1).min(2.0));
+                command.args(["-ss", seek.as_str()]);
+            }
+            command.arg("-i").arg(path)
+                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                .arg(&thumbnail)
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        generated.then(|| thumbnail.to_string_lossy().into_owned())
+    };
     Ok(json!({
         "path": path.to_string_lossy(), "name": name, "duration": duration,
         "kind": kind, "hasAudio": has_audio,
         "proxyPath": proxy.to_string_lossy(),
-        "filmstripPath": Value::Null, "waveformPath": waveform_path
+        "filmstripPath": Value::Null, "waveformPath": waveform_path, "thumbnailPath": thumbnail_path
     }))
 }
 
@@ -391,10 +412,60 @@ fn project_duration(timeline: &Timeline) -> f64 {
 
 fn transition_out(clip: &Clip) -> Option<(String, f64)> {
     let transition = &clip.extra["props"]["transitionOut"];
-    let kind = transition["type"].as_str()?.to_owned();
-    if kind == "none" { return None; }
+    let stored_kind = transition["type"].as_str()?;
+    let kind = match stored_kind {
+        "none" => return None,
+        "crossfade" => "fade",       // projects saved by older Stella builds
+        "dip" => "fadeblack",
+        "wipe" => "wipeleft",
+        "iris" => "circleopen",
+        "slide" => "slideleft",
+        value => value,
+    };
+    if !matches!(kind,
+        "fade" | "dissolve" | "fadeblack" | "fadewhite" |
+        "wipeleft" | "wiperight" | "wipeup" | "wipedown" |
+        "diagtl" | "diagtr" | "diagbl" | "diagbr" |
+        "slideleft" | "slideright" | "slideup" | "slidedown" |
+        "circleopen" | "circleclose" | "radial" | "zoomin" | "squeezeh" | "squeezev")
+    { return None; }
     let duration = transition["duration"].as_f64().filter(|v| v.is_finite()).unwrap_or(1.0).max(0.05).min(clip.duration.min(3.0).max(0.05));
-    Some((kind, duration))
+    Some((kind.to_owned(), duration))
+}
+
+fn transition_between(left: &Clip, right: &Clip) -> Option<(String, f64)> {
+    if left.track != right.track || (left.end() - right.start).abs() > 0.04 { return None; }
+    let (kind, duration) = transition_out(left)?;
+    let duration = duration.min(left.duration * 0.5).min(right.duration * 0.5);
+    (duration > 0.0).then_some((kind, duration))
+}
+
+fn split_source_streams(
+    graph: &mut Vec<String>,
+    clips: &[&Clip],
+    indices: &HashMap<String, usize>,
+    video: bool,
+    prefix: &str,
+) -> HashMap<String, String> {
+    let mut by_input: HashMap<usize, Vec<&Clip>> = HashMap::new();
+    for clip in clips {
+        if let Some(&input) = indices.get(&clip.id) { by_input.entry(input).or_default().push(*clip); }
+    }
+    let stream = if video { "v" } else { "a" };
+    let splitter = if video { "split" } else { "asplit" };
+    let mut labels_by_clip = HashMap::with_capacity(clips.len());
+    for (input, uses) in by_input {
+        let labels: Vec<_> = uses.iter().enumerate()
+            .map(|(ordinal, clip)| format!("{prefix}_{}_{}", clip.id.replace(|c: char| !c.is_ascii_alphanumeric(), "_"), ordinal))
+            .collect();
+        if labels.len() == 1 {
+            graph.push(format!("[{input}:{stream}]null[{}]", labels[0]));
+        } else {
+            graph.push(format!("[{input}:{stream}]{splitter}={}[{}]", labels.len(), labels.join("][")));
+        }
+        for (clip, label) in uses.into_iter().zip(labels) { labels_by_clip.insert(clip.id.clone(), label); }
+    }
+    labels_by_clip
 }
 
 fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<(String, Vec<(String, bool)>, f64, bool), String> {
@@ -407,23 +478,88 @@ fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -
         let order = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
+    let mut outgoing = Vec::with_capacity(video_clips.len());
+    for i in 0..video_clips.len() {
+        outgoing.push(if i + 1 < video_clips.len() {
+            transition_between(video_clips[i], video_clips[i + 1])
+        } else { None });
+    }
+    let mut incoming = vec![None; video_clips.len()];
+    for i in 1..video_clips.len() { incoming[i] = outgoing[i - 1].clone(); }
+    let clip_streams = split_source_streams(&mut graph, &video_clips, &indices, true, "vsrc");
+    let mut video_branches: Vec<(String, Option<String>, Option<String>)> = Vec::with_capacity(video_clips.len());
+    for (i, clip) in video_clips.iter().enumerate() {
+        let source = &clip_streams[&clip.id];
+        let has_incoming = incoming[i].is_some();
+        let has_outgoing = outgoing[i].is_some();
+        let mut labels = Vec::with_capacity(1 + usize::from(has_incoming) + usize::from(has_outgoing));
+        labels.push(format!("v{i}_body_src"));
+        if has_incoming { labels.push(format!("v{i}_in_src")); }
+        if has_outgoing { labels.push(format!("v{i}_out_src")); }
+        if labels.len() == 1 {
+            graph.push(format!("[{source}]null[{}]", labels[0]));
+        } else {
+            graph.push(format!("[{source}]split={}[{}]", labels.len(), labels.join("][")));
+        }
+        let mut at = 1;
+        let incoming_source = if has_incoming { let label = labels[at].clone(); at += 1; Some(label) } else { None };
+        let outgoing_source = if has_outgoing { Some(labels[at].clone()) } else { None };
+        video_branches.push((labels[0].clone(), incoming_source, outgoing_source));
+    }
+    let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
+    for (i, clip) in video_clips.iter().enumerate() {
+        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
+        let label = format!("vbody{i}");
+        graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
+        body_layers[i] = Some((label, x, y));
+    }
+
+    let mut transition_layers = vec![None; video_clips.len()];
+    for i in 0..video_clips.len().saturating_sub(1) {
+        let Some((kind, duration)) = outgoing[i].as_ref() else { continue; };
+        let left = video_clips[i];
+        let right = video_clips[i + 1];
+        let transition_start = right.start - duration;
+        let left_source = left.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0) + left.duration - duration;
+        let right_source = right.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
+        let mut left_value = serde_json::to_value(left).map_err(|e| e.to_string())?;
+        let mut right_value = serde_json::to_value(right).map_err(|e| e.to_string())?;
+        left_value["sourceOffset"] = json!(left_source);
+        right_value["sourceOffset"] = json!(right_source);
+        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None);
+        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
+        let left_raw = format!("tx{i}a_raw");
+        let right_raw = format!("tx{i}b_raw");
+        let left_full = format!("tx{i}a");
+        let right_full = format!("tx{i}b");
+        let output = format!("tx{i}_out");
+        let left_bg = format!("tx{i}a_bg");
+        let right_bg = format!("tx{i}b_bg");
+        graph.push(format!("[{}]{left_filters},fps={fps},settb=AVTB,format=rgba[{left_raw}]", video_branches[i].2.as_ref().unwrap()));
+        graph.push(format!("[{}]{right_filters},fps={fps},settb=AVTB,format=rgba[{right_raw}]", video_branches[i + 1].1.as_ref().unwrap()));
+        graph.push(format!("color=c=black@0:s={width}x{height}:r={fps}:d={duration:.5},format=rgba,settb=AVTB[{left_bg}]"));
+        graph.push(format!("color=c=black@0:s={width}x{height}:r={fps}:d={duration:.5},format=rgba,settb=AVTB[{right_bg}]"));
+        graph.push(format!("[{left_bg}][{left_raw}]overlay=x={left_x}:y={left_y}:shortest=1:repeatlast=0:format=auto,format=rgba,setpts=PTS-STARTPTS[{left_full}]"));
+        graph.push(format!("[{right_bg}][{right_raw}]overlay=x={right_x}:y={right_y}:shortest=1:repeatlast=0:format=auto,format=rgba,setpts=PTS-STARTPTS[{right_full}]"));
+        graph.push(format!("[{left_full}][{right_full}]xfade=transition={kind}:duration={duration:.5}:offset=0,format=rgba,setpts=PTS-STARTPTS+{transition_start:.5}/TB[{output}]"));
+        transition_layers[i] = Some(output);
+    }
+
     let mut base = "base0".to_owned();
-    for (n, clip) in video_clips.iter().enumerate() {
-        let value = serde_json::to_value(*clip).map_err(|e| e.to_string())?;
-        let adjacent = |a: &Clip, b: &Clip| a.track == b.track && (a.end() - b.start).abs() <= 0.04;
-        let incoming = if n > 0 && adjacent(video_clips[n - 1], clip) { transition_out(video_clips[n - 1]) } else { None };
-        let has_next = n + 1 < video_clips.len() && adjacent(clip, video_clips[n + 1]);
-        let outgoing = if has_next { transition_out(clip) } else { None };
-        let (render_start, render_length) = incoming.as_ref().map_or((clip.start, clip.duration), |(_, d)| (clip.start - d, clip.duration + d));
-        let transition_in = incoming.as_ref().map(|(kind, d)| (kind.as_str(), *d));
-        let transition_out = outgoing.as_ref().map(|(kind, d)| (kind.as_str(), *d));
-        let (filters, x, y) = filters::video_filters(&value, width, height, render_start, render_length, transition_in, transition_out);
-        let input = indices[&clip.id];
-        let layer = format!("v{n}");
-        let next = format!("base{}", n + 1);
-        graph.push(format!("[{input}:v]{filters}[{layer}]"));
-        graph.push(format!("[{base}][{layer}]overlay=x={x}:y={y}:eof_action=pass:format=auto[{next}]"));
-        base = next;
+    let mut layer_index = 0;
+    for i in 0..video_clips.len() {
+        if let Some((label, x, y)) = body_layers[i].as_ref() {
+            let next = format!("base{}", layer_index + 1);
+            graph.push(format!("[{base}][{label}]overlay=x={x}:y={y}:eval=frame:eof_action=pass:repeatlast=0:format=auto[{next}]"));
+            base = next;
+            layer_index += 1;
+        }
+        if let Some(label) = transition_layers[i].as_ref() {
+            let next = format!("base{}", layer_index + 1);
+            graph.push(format!("[{base}][{label}]overlay=x=0:y=0:eof_action=pass:repeatlast=0:format=auto[{next}]"));
+            base = next;
+            layer_index += 1;
+        }
     }
     graph.push(format!("[{base}]format=yuv420p[vout]"));
 
@@ -584,9 +720,11 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         if let Some((kind, duration)) = incoming.as_ref().filter(|_| at < clip.start) {
             let progress = ((at - render_start) / duration).clamp(0.0, 1.0);
             if kind.as_str() == "wipe" {
-                vf.push_str(&format!(",geq=a='alpha(X,Y)*if(lte(X/W,{progress:.5}),1,0)'"));
+                vf.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*if(lte(X/W,{progress:.5}),1,0)'"));
             } else if kind.as_str() == "iris" {
-                vf.push_str(&format!(",geq=a='alpha(X,Y)*if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.5*{progress:.5}),1,0)'"));
+                vf.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.5*{progress:.5}),1,0)'"));
+            } else if kind.as_str() == "slide" {
+                /* Match export: the incoming layer starts one frame-width right and slides home. */
             } else if kind.as_str() == "dip" {
                 if progress < 0.5 { vf.push_str(",colorchannelmixer=aa=0"); }
                 else {
@@ -606,7 +744,12 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         let label = format!("pv{n}");
         let next = format!("base{}", n + 1);
         graph.push(format!("[{input}:v]{vf}[{label}]"));
-        graph.push(format!("[{base}][{label}]overlay=x={x}:y={y}:eof_action=pass:format=auto[{next}]"));
+        let overlay_x = if let Some((kind, duration)) = incoming.as_ref()
+            .filter(|(kind, _)| kind.as_str() == "slide" && at < clip.start) {
+            let progress = ((at - render_start) / *duration).clamp(0.0, 1.0);
+            format!("({x})+{:.3}", width as f64 * (1.0 - progress))
+        } else { x.clone() };
+        graph.push(format!("[{base}][{label}]overlay=x={overlay_x}:y={y}:eof_action=pass:format=auto[{next}]"));
         base = next;
     }
     graph.push(format!("[{base}]format=rgba[preview]"));

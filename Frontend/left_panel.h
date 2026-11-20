@@ -5,6 +5,9 @@
 static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
                            float w, float h, float fs, float ufs, float pad,
                            float minimum, float maximum, int decimals);
+static bool ValBoxTyped(Clay_ElementId id, float *value, const char *unit,
+                        float w, float h, float fs, float ufs, float pad,
+                        float minimum, float maximum, int decimals);
 static void SliderLogic(Clay_ElementId id, int gi, float kr);
 
 static void MediaView(void) {
@@ -38,12 +41,6 @@ static void MediaView(void) {
                    .backgroundColor = Mix(RGB(30, 31, 36), RGB(36, 37, 43), sb.hover), .cornerRadius = CLAY_CORNER_RADIUS(12)}) {
             Icon(I_SEARCH, 19, Mix(C_MUTED, C_TEXT, sb.hover * .6f));
             Tx("Search media", 16, C_MUTED, 0);
-        }
-        if (mediaCount == 0) {
-            CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 10, 0, 0}, .childGap = 5}}) {
-                Tx("Your media will appear here", 14, C_MUTED, 0);
-                Tx("Import a file to get started.", 13, C_MUTED, 0);
-            }
         }
         for (int row = 0; row < rows; row++) {
             CLAY(CLAY_IDI("MRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 9}}) {
@@ -122,8 +119,8 @@ static void KnobGroup(int idx, const char *label) {
         const char *unit = idx == 0 ? "%" : idx >= 2 ? "dB" : NULL;
         float minimum = idx == 0 ? 0.f : idx == 1 ? -100.f : -12.f;
         float maximum = idx == 0 ? 200.f : idx == 1 ? 100.f : 12.f;
-        if (ValBoxEditable(CLAY_IDI("KnobValue", idx), &shownValue, unit, 74, 28, 15.5f, 12.5f, 9,
-                           minimum, maximum, 0)) {
+        if (ValBoxTyped(CLAY_IDI("KnobValue", idx), &shownValue, unit, 74, 28, 15.5f, 12.5f, 9,
+                        minimum, maximum, 0)) {
             gKnob[idx] = idx == 0 ? shownValue / 200.f : idx == 1 ? shownValue / 200.f + .5f : shownValue / 24.f + .5f;
             double value = shownValue;
             PlutoTimelineSetProperty(paths[idx], value);

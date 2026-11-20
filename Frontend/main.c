@@ -142,12 +142,12 @@ static void Splitter(int which) {
 static void TopBar(void) {
     CLAY(CLAY_ID("TopBar"), {.layout = {.sizing = {GROW, FIX(48)}, .padding = {12, 12, 0, 0}, .childAlignment = AL_Y}}) {
         CLAY(CLAY_ID("LeftCluster"), {.layout = {.sizing = {FIX(316), FIT}, .childAlignment = AL_Y}}) {
-            CLAY(CLAY_ID("Logo"), {.layout = {.sizing = {FIX(24), FIX(24)}}, .backgroundColor = RGB(20, 21, 25),
-                                   .cornerRadius = CLAY_CORNER_RADIUS(6), .border = {.color = RGB(64, 66, 73), .width = CLAY_BORDER_OUTSIDE(1)}}) {}
+            CLAY(CLAY_ID("Logo"), {.layout = {.sizing = {FIX(34), FIX(34)}},
+                                    .custom = {.customData = NC(K_APP_LOGO, C_TEXT, C_TEXT, C_CARD, 0, 0, 0)}}) {}
             GAPX(14)
-            Tx("Stella", 15, C_TEXT, 1);
+            Tx("Stella", 17, C_TEXT, 0);
             GAPX(40)
-            Tx("Untitled Project", 13, C_DIM, 0);
+            Tx("Untitled Project", 15, C_DIM, 0);
         }
         Clay_ElementId ex = CLAY_ID("Export");
         Bs b = Interact(ex);
@@ -156,7 +156,7 @@ static void TopBar(void) {
                   .backgroundColor = BtnBg(RGB(27, 28, 33), RGB(38, 40, 46), b), .cornerRadius = CLAY_CORNER_RADIUS(9),
                   .border = {.color = Mix(RGB(54, 56, 62), RGB(86, 89, 98), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
             Icon(I_EXPORT, 14, C_TEXT);
-            Tx("Export", 13, C_TEXT, 1);
+            Tx("Export", 14, C_TEXT, 0);
         }
         GAPX(18)
         if (IconBtn(CLAY_ID("Undo"), I_UNDO, 28, 15, C_DIM, false, 8)) PlutoTimelineHistory(false);
@@ -345,14 +345,20 @@ int main(void) {
     Clay_SetMeasureTextFunction(MeasureTxt, NULL);
 
     int observedPreviewRes = gPreviewRes;
+    int observedPreviewFps = gPreviewFps;
     float observedPlayhead = gPlayhead;
     float playbackRemainder = 0.f;
+    float navigationRepeat = 0.f;
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (gPreviewRes != observedPreviewRes) {
             observedPreviewRes = gPreviewRes;
             gPreviewDirty = true;
             gPreviewDebounce = 1.f;
+        }
+        if (gPreviewFps != observedPreviewFps) {
+            observedPreviewFps = gPreviewFps;
+            playbackRemainder = 0.f;
         }
         if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
             observedPlayhead = gPlayhead;
@@ -383,9 +389,24 @@ int main(void) {
             memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
             gTimelineSelected = -1;
         }
-        if (gEditValueId == 0 && !gTimelinePlaying && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))) {
+        bool navLeft = IsKeyDown(KEY_LEFT), navRight = IsKeyDown(KEY_RIGHT);
+        bool navActive = gEditValueId == 0 && !gTimelinePlaying && (navLeft || navRight);
+        gPreviewNavigating = navActive;
+        bool navStep = false;
+        if (navActive) {
+            bool pressed = navLeft ? IsKeyPressed(KEY_LEFT) : IsKeyPressed(KEY_RIGHT);
+            if (pressed) { navigationRepeat = 0.f; navStep = true; }
+            else {
+                navigationRepeat += gDt;
+                if (navigationRepeat >= .24f) {
+                    navigationRepeat -= 1.f / (float)fmaxf(1, gPreviewFps);
+                    navStep = true;
+                }
+            }
+        } else navigationRepeat = 0.f;
+        if (navStep) {
             float frame = floorf(gPlayhead * 30.f + .5f);
-            frame += IsKeyPressed(KEY_RIGHT) ? 1.f : -1.f;
+            frame += navLeft ? -1.f : 1.f;
             gPlayhead = fmaxf(0.f, fminf(TimelineDuration(), frame / 30.f));
             gPreviewDirty = true;
             gPreviewDebounce = 1.f;
@@ -393,7 +414,7 @@ int main(void) {
         if (gTimelinePlaying) {
             float end = TimelineDuration();
             playbackRemainder += gDt;
-            const float frameDuration = 1.f / 30.f;
+            const float frameDuration = 1.f / (float)fmaxf(1, gPreviewFps);
             if (playbackRemainder >= frameDuration) {
                 float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
                 playbackRemainder -= advance;
@@ -421,7 +442,7 @@ int main(void) {
         Clay_RenderCommandArray cmds = BuildUI();
         if (gPreviewDirty && !gPreviewTaskId) {
             gPreviewDebounce += gDt;
-            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying ? .016f : .075f)) {
+            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying || gPreviewNavigating ? .016f : .075f)) {
                 if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
                 else { gPreviewDebounce = .045f; }
             }
@@ -440,6 +461,7 @@ int main(void) {
         ClearBackground((Color){14, 15, 17, 255});
         RenderUI(cmds);
         DrawPreviewQualityDropdown();
+        DrawPreviewFpsDropdown();
         DrawTimelineContextMenu();
         EndDrawing();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
