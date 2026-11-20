@@ -3,7 +3,7 @@
 ## What changed
 
 - FFmpeg stdout is now read continuously on a dedicated `stella-preview-decode` thread.
-- Decoded frames are placed in a bounded six-frame queue. This gives the renderer a small read-ahead buffer without letting memory usage grow with timeline duration.
+- Decoded frames are placed in a bounded eight-frame queue. This gives the renderer a small read-ahead buffer without letting memory usage grow with timeline duration.
 - Each queued frame carries its sequential frame index. The preview worker consumes up to the requested frame and recycles obsolete frames rather than uploading them late.
 - Raw RGBA buffers are recycled between the decoder and consumer to avoid allocating a full frame buffer for every frame.
 - The decoder thread is stopped and joined when the stream is replaced or the preview engine is dropped; the frame receiver is disconnected first so a producer blocked on a full queue can exit.

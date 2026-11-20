@@ -305,7 +305,10 @@ static void TimelineClipLane(int track) {
             int i = order[n];
             float x = gTimelinePan + gTimelineClips[i].start * pps;
             float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
-            if (x + width <= 0.f) continue;
+            /* The lane is clipped by Clay, but creating and measuring every
+               off-screen clip still costs layout and hit-test work each frame.
+               Skip clips beyond either visible edge before creating their nodes. */
+            if (x + width <= 0.f || x >= lane.width) continue;
             float left = fmaxf(0.f, x);
             if (left > cursor) {
                 CLAY_AUTO_ID({.layout = {.sizing = {CLAY_SIZING_FIXED(left - cursor), FIX(1)}}}) {}

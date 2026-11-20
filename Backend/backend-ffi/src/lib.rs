@@ -51,7 +51,9 @@ impl Default for PreviewFrame {
     fn default() -> Self { Self { request_id: 0, width: 0, height: 0, at: 0.0, pixels: Vec::new() } }
 }
 
-const PREVIEW_DECODE_QUEUE_DEPTH: usize = 6;
+// A little more read-ahead absorbs short decode/render scheduling spikes.
+// At 720p this is roughly 29 MiB of queued RGBA frames; the queue remains bounded.
+const PREVIEW_DECODE_QUEUE_DEPTH: usize = 8;
 
 struct PreviewStream {
     signature: u64,

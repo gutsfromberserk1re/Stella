@@ -287,7 +287,7 @@ int main(void) {
     /* Prevent Windows bitmap-scaling the UI on scaled displays. */
     SetProcessDPIAware();
 #endif
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
     Vector2 dpiScale = GetWindowScaleDPI();
     gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));

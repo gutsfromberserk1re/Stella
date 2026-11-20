@@ -13,7 +13,7 @@ The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend 
 ## Implemented engine paths
 
 - Timeline get/add/move/split/delete, snapping, undo/redo, clip properties, and keyframe storage run synchronously in Rust.
-- Media inspection, FFprobe metadata, FFmpeg thumbnails, audio waveforms, and export run on the media worker. A dedicated preview worker owns one persistent FFmpeg raw-frame stream. FFmpeg decodes on a separate thread into a bounded six-frame queue; decoded buffers are recycled, sequential playback consumes ready frames, and timeline changes/backward jumps reopen the stream with input seeking.
+- Media inspection, FFprobe metadata, FFmpeg thumbnails, audio waveforms, and export run on the media worker. A dedicated preview worker owns one persistent FFmpeg raw-frame stream. FFmpeg decodes on a separate thread into a bounded eight-frame queue; decoded buffers are recycled, sequential playback consumes ready frames, and timeline changes/backward jumps reopen the stream with input seeking.
 - Preview RGBA frames cross the C ABI through `pluto_backend_copy_preview_frame` and update the existing raylib texture directly; preview frames no longer pass through per-frame PNG files or image decoding.
 - Preview and export both build video and audio filters through `backend-ffi/src/filters.rs`.
 - When available, the preview worker uses cached editing proxies at every preview size; export continues to read original sources. The shared filters keep effect and transition behavior aligned while proxy resolution controls preview fidelity.

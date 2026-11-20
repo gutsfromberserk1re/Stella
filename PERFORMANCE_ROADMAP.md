@@ -3,14 +3,17 @@
 ## Stage 1 — preview delivery (source patch)
 
 - Persistent FFmpeg process with a dedicated decoder thread.
-- Bounded six-frame read-ahead queue with reusable RGBA buffers.
+- Bounded eight-frame read-ahead queue with reusable RGBA buffers.
 - Wall-clock playback scheduling and obsolete-frame skipping.
 - FFmpeg auto thread sizing and opportunistic hardware decode for video inputs.
 - Direct RGBA upload to the existing raylib preview texture.
 
+- Removed 4x MSAA from the 2D editor window; it adds unnecessary multisample work to a mostly flat UI.
+- Timeline clip nodes are now culled before Clay layout when wholly outside the visible lane, reducing per-frame layout and hit-testing work on long timelines.
+
 ## What Stage 1 does not solve
 
-The current filter graph still downloads/produces CPU RGBA frames and runs effects/compositing through FFmpeg filters. Hardware decode can reduce codec-decoding cost, but it does not turn the current effects pipeline into a GPU renderer. A six-frame queue also cannot compensate for a filter graph that takes longer than the selected frame interval.
+The current filter graph still downloads/produces CPU RGBA frames and runs effects/compositing through FFmpeg filters. Hardware decode can reduce codec-decoding cost, but it does not turn the current effects pipeline into a GPU renderer. A eight-frame queue also cannot compensate for a filter graph that takes longer than the selected frame interval.
 
 ## Stage 2 — GPU-resident preview compositor
 
