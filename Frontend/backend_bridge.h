@@ -347,6 +347,12 @@ static bool PlutoSyncTimeline(const char *json) {
                     if (!ke) break;
                     double kt = 0.0;
                     if (PlutoJsonNumberRange(kb, ke, "time", &kt)) clip->keyframes[clip->keyframeCount++] = (float)kt;
+                    if (clip->keyframeCount > 0 && PlutoJsonNumberRange(kb, ke, "x", &kt)) clip->keyframeValues[clip->keyframeCount - 1][0] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "y", &kt)) clip->keyframeValues[clip->keyframeCount - 1][1] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "scaleW", &kt)) clip->keyframeValues[clip->keyframeCount - 1][2] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "scaleH", &kt)) clip->keyframeValues[clip->keyframeCount - 1][3] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "rotation", &kt)) clip->keyframeValues[clip->keyframeCount - 1][4] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "opacity", &kt)) clip->keyframeValues[clip->keyframeCount - 1][5] = (float)kt;
                 }
             }
             if (selectedId[0] && strcmp(selectedId, clip->id) == 0) { selectedBegin = begin; selectedEnd = end; }
@@ -506,15 +512,53 @@ static bool PlutoTimelineSnap(bool enabled) {
     return okay;
 }
 
+static bool PlutoTimelineHasKeyframes(void) {
+    return gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount
+        && gTimelineClips[gTimelineSelected].keyframeCount > 0;
+}
+
+/* Keyframe edits write through the shared timeline command so preview and
+   export both sample the same interpolated transform. */
+static bool PlutoTimelineSetTransformKeyframe(void) {
+    if (!PlutoTimelineHasKeyframes()) return false;
+    char id[128], request[1024]; PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_keyframe\",\"id\":\"%s\",\"at\":%.4f,\"values\":{\"x\":%.4f,\"y\":%.4f,\"scaleW\":%.4f,\"scaleH\":%.4f,\"rotation\":%.4f,\"opacity\":%.4f}}",
+             id, gPlayhead, gNum[0], gNum[1], gNum[2], gNum[3], gRotT, gSlT[0] * 100.f);
+    bool okay = PlutoTimelineCall(request);
+    if (okay) gPreviewDirty = true;
+    return okay;
+}
+
+static bool PlutoTimelineToggleKeyframe(float at) {
+    if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
+    TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
+    int found = -1;
+    for (int i = 0; i < clip->keyframeCount; i++) {
+        if (fabsf(clip->keyframes[i] - (at - clip->start)) < 0.02f) { found = i; break; }
+    }
+    char id[128], request[1024]; PlutoJsonEscape(clip->id, id, sizeof(id));
+    if (found >= 0) {
+        snprintf(request, sizeof(request), "{\"command\":\"timeline_remove_keyframe\",\"id\":\"%s\",\"at\":%.4f}", id, at);
+    } else {
+        snprintf(request, sizeof(request), "{\"command\":\"timeline_set_keyframe\",\"id\":\"%s\",\"at\":%.4f,\"values\":{\"x\":%.4f,\"y\":%.4f,\"scaleW\":%.4f,\"scaleH\":%.4f,\"rotation\":%.4f,\"opacity\":%.4f}}",
+                 id, at, gNum[0], gNum[1], gNum[2], gNum[3], gRotT, gSlT[0]);
+    }
+    bool okay = PlutoTimelineCall(request);
+    if (okay) gPreviewDirty = true;
+    return okay;
+}
+
 static bool PlutoTimelineAddKeyframe(float at) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
-    char id[128], request[768]; PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
-    snprintf(request, sizeof(request), "{\"command\":\"timeline_add_keyframe\",\"id\":\"%s\",\"at\":%.4f,\"values\":{\"x\":%.4f,\"y\":%.4f,\"scaleW\":%.4f,\"scaleH\":%.4f,\"rotation\":%.4f,\"opacity\":%.4f}}",
+    char id[128], request[1024]; PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_keyframe\",\"id\":\"%s\",\"at\":%.4f,\"values\":{\"x\":%.4f,\"y\":%.4f,\"scaleW\":%.4f,\"scaleH\":%.4f,\"rotation\":%.4f,\"opacity\":%.4f}}",
              id, at, gNum[0], gNum[1], gNum[2], gNum[3], gRotT, gSlT[0]);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
 }
+
+static bool PlutoTimelineToggleKeyframe(float at);
 
 static bool PlutoTimelineHistory(bool redo) {
     return PlutoTimelineCall(redo ? "{\"command\":\"timeline_redo\"}" : "{\"command\":\"timeline_undo\"}");
@@ -758,6 +802,9 @@ static bool PlutoTimelineHistory(bool redo) { (void)redo; return false; }
 static bool PlutoTimelineSetProperty(const char *path, double value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) { (void)propertiesJson; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
+static bool PlutoTimelineHasKeyframes(void) { (void)0; return false; }
+static bool PlutoTimelineSetTransformKeyframe(void) { (void)0; return false; }
+static bool PlutoTimelineToggleKeyframe(float at) { (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetStringProperty(const char *path, const char *value) { (void)path; (void)value; return false; }
 static uint64_t PlutoRequestPreview(void) { return 0; }

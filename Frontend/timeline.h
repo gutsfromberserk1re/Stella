@@ -610,18 +610,20 @@ static void Timeline(void) {
                     float prev = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i] < gPlayhead - .02f && (prev < 0.f || clip->keyframes[i] > prev)) prev = clip->keyframes[i];
-                    gPlayhead = prev >= 0.f ? prev : 0.f; gPreviewDirty = true; gPreviewDebounce = 1.f;
+                        if (clip->keyframes[i] < gPlayhead - clip->start - .02f && (prev < 0.f || clip->keyframes[i] > prev)) prev = clip->keyframes[i];
+                    gPlayhead = clip->start + (prev >= 0.f ? prev : 0.f); gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
-                if (IconBtn(CLAY_ID("KfAdd"), I_KF_DIAMOND, 28, 14, C_DIM, false, 8) && gTimelineSelected >= 0)
-                    PlutoTimelineAddKeyframe(gPlayhead);
+                if (IconBtn(CLAY_ID("KfAdd"), I_KF_DIAMOND, 28, 14, C_DIM, false, 8) &&
+                    gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
+                    PlutoTimelineToggleKeyframe(gPlayhead);
+                }
                 if (IconBtn(CLAY_ID("KfNext"), I_KF_NEXT, 28, 14, RGB(90, 93, 102), false, 8) &&
                     gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
                     float next = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i] > gPlayhead + .02f && (next < 0.f || clip->keyframes[i] < next)) next = clip->keyframes[i];
-                    gPlayhead = next >= 0.f ? next : TimelineDuration(); gPreviewDirty = true; gPreviewDebounce = 1.f;
+                        if (clip->keyframes[i] > gPlayhead - clip->start + .02f && (next < 0.f || clip->keyframes[i] < next)) next = clip->keyframes[i];
+                    gPlayhead = clip->start + (next >= 0.f ? next : clip->duration); gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
             }
             GAPX(14)
