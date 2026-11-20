@@ -586,12 +586,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x, r.y + r.height - 19.f, r.width, 19.f};
-            if (!audioOnly) {
-                FillRR(band, 0.f, (Color){71, 129, 168, 210});
-                DrawLineEx((Vector2){r.x, band.y}, (Vector2){r.x + r.width, band.y},
-                           1.f, (Color){119, 166, 194, 225});
-            }
+                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
@@ -599,12 +594,17 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
         StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){113, 116, 124, 255});
+        if (clip && !audioOnly && r.width >= 18.f) {
+            Color grip = (Color){210, 207, 222, 205};
+            DrawLineEx((Vector2){r.x + 3.5f, r.y + 8.f}, (Vector2){r.x + 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+            DrawLineEx((Vector2){r.x + r.width - 3.5f, r.y + 8.f}, (Vector2){r.x + r.width - 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+        }
         if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
             TimelineClipUi *clip = &gTimelineClips[clipIndex];
             for (int k = 0; k < clip->keyframeCount; k++) {
                 float time = clip->keyframes[k];
-                if (time < clip->start || time > clip->start + clip->duration) continue;
-                float x = r.x + (time - clip->start) / fmaxf(.001f, clip->duration) * r.width;
+                if (time < 0.f || time > clip->duration) continue;
+                float x = r.x + time / fmaxf(.001f, clip->duration) * r.width;
                 float y = r.y + 13.f, half = 5.5f;
                 Color key = fabsf(time - gPlayhead) < (1.f / 60.f) ? (Color){255, 255, 255, 255} : (Color){226, 219, 247, 245};
                 Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};

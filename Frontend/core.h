@@ -96,8 +96,11 @@ static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
 static float gPreviewRequestAt;
 static int gPreviewRequestRes;
+static double gPreviewRequestStartedAt;
+static double gPreviewTelemetryAt;
 static Texture2D gPreviewFrame;
-static char gPreviewTexturePath[1024];
+static uint8_t *gPreviewPixels;
+static size_t gPreviewPixelCapacity;
 static Rectangle gPreviewQualityRect;
 static Rectangle gPreviewFpsRect;
 static float gMediaZoom = 1.f;
@@ -122,6 +125,8 @@ static int gTransitionButtonCount;
 static int   gTimelineSelected = -1, gMediaDragIndex = -1, gClipDragIndex = -1;
 static int   gClipDragTrack;
 static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
+static int   gClipTrimIndex = -1, gClipTrimEdge;
+static float gClipTrimOrigStart, gClipTrimOrigEnd, gClipTrimOrigOffset, gClipTrimSourceDuration;
 static bool  gTimelinePanning;
 static uint64_t gClipSerial = 1;
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
@@ -202,11 +207,44 @@ typedef struct {
     char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
     int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
-    float start, duration, transitionDuration;
+    float start, duration, sourceOffset, sourceDuration, transitionDuration;
     bool hasAudio;
     float keyframes[32];
     int keyframeCount;
+    float keyframeValues[32][6]; /* x, y, scaleW, scaleH, rotation, opacity per keyframe */
 } TimelineClipUi;
+
+/* Interpolated transform values at a clip-relative time. Mirrors the Rust
+   piecewise-linear interpolation shared by preview and export. */
+static void PlutoKeyframeTransform(const TimelineClipUi *clip, float local, float out[6]) {
+    if (!clip) return;
+    for (int i = 0; i < 6; i++) out[i] = 0.f;
+    if (clip->keyframeCount <= 0 || clip->keyframeCount > 32) {
+        out[0] = 0.f; out[1] = 0.f; out[2] = 100.f; out[3] = 100.f; out[4] = 0.f; out[5] = 100.f;
+        return;
+    }
+    float times[32];
+    float values[32][6];
+    for (int i = 0; i < clip->keyframeCount; i++) {
+        times[i] = clip->keyframes[i];
+        for (int v = 0; v < 6; v++) values[i][v] = clip->keyframeValues[i][v];
+    }
+    float duration = clip->duration > 0.f ? clip->duration : 0.f;
+    float t = local < 0.f ? 0.f : (local > duration ? duration : local);
+    if (t <= times[0]) { for (int v = 0; v < 6; v++) out[v] = values[0][v]; return; }
+    float prev = times[0];
+    for (int i = 1; i < clip->keyframeCount; i++) {
+        if (t <= times[i]) {
+            float span = times[i] - prev;
+            float f = span > 0.0001f ? (t - prev) / span : 1.f;
+            for (int v = 0; v < 6; v++) out[v] = values[i - 1][v] + (values[i][v] - values[i - 1][v]) * f;
+            return;
+        }
+        prev = times[i];
+    }
+    for (int v = 0; v < 6; v++) out[v] = values[clip->keyframeCount - 1][v];
+}
+
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;
 static float gClipDragSnapshotStart[MAX_TIMELINE_CLIPS];

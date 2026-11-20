@@ -1,13 +1,64 @@
+use pluto_timeline_core::{Clip, KeyframeSample};
 use serde_json::Value;
 
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
 fn n(value: &Value, key: &str, fallback: f64) -> f64 { number(value, key, fallback) }
-pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
+
+fn transform_samples(clip: &Value) -> Vec<KeyframeSample> {
+    serde_json::from_value::<Clip>(clip.clone())
+        .map(|clip| clip.keyframe_samples())
+        .unwrap_or_default()
+}
+
+/// Build a piecewise-linear expression for one transform component. Returns
+/// `None` when the component does not change, so static clips keep their exact
+/// existing filter graph.
+fn animated_expression(
+    samples: &[KeyframeSample],
+    variable: &str,
+    multiplier: f64,
+    value_of: impl Fn(&KeyframeSample) -> f64,
+) -> Option<String> {
+    if samples.len() < 2 { return None; }
+    let first = value_of(&samples[0]) * multiplier;
+    if first.is_finite() && samples.iter().all(|sample| (value_of(sample) * multiplier - first).abs() < 0.000001) {
+        return None;
+    }
+    let last = &samples[samples.len() - 1];
+    let mut expression = format!("{:.6}", value_of(last) * multiplier);
+    for pair in samples.windows(2).rev() {
+        let (left, right) = (pair[0], pair[1]);
+        let span = right.time - left.time;
+        if !span.is_finite() || span.abs() < 0.000001 { continue; }
+        let left_value = value_of(&left) * multiplier;
+        let right_value = value_of(&right) * multiplier;
+        let segment = format!(
+            "({left_value:.6}+({right_value:.6}-{left_value:.6})*(({variable})-{:.6})/{span:.6})",
+            left.time
+        );
+        expression = format!("if(lt(({variable}),{:.6}),{segment},{expression})", right.time);
+    }
+    Some(format!("if(lt(({variable}),{:.6}),{first:.6},{expression})", samples[0].time))
+}
+
+/// Time, in seconds relative to the clip start, seen by an FFmpeg expression.
+/// `time_origin` is the timeline time corresponding to expression time zero:
+/// zero for normal clip branches, and the transition start for xfade branches.
+fn local_variable(name: &str, time_origin: f64, clip_start: f64) -> String {
+    let offset = time_origin - clip_start;
+    if offset.abs() < 0.000001 { name.to_owned() } else { format!("({name}{offset:+.6})") }
+}
+
+pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>, time_origin: f64) -> (String, String, String) {
     let props = &clip["props"];
     let transform = &props["transform"];
     let effects = &props["effects"];
     let colors = &props["colors"];
+    let keyframes = transform_samples(clip);
+    let clip_start = n(clip, "start", start);
+    let time_expr = local_variable("t", time_origin, clip_start);
+    let alpha_time_expr = local_variable("T", time_origin, clip_start);
     let source_start = n(clip, "sourceOffset", 0.0).max(0.0);
     let mut filters = vec![format!("trim=start={source_start:.5}:duration={length:.5}"), format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
         format!("scale={width}:{height}:force_original_aspect_ratio=decrease"),
@@ -249,20 +300,65 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
 
     let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
     let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
-    if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 { filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}")); }
+    /* Keyframed components become per-frame FFmpeg expressions. Static clips
+       keep the original one-shot filter graph exactly as before. */
+    let animated_scale_w = animated_expression(&keyframes, &time_expr, 1.0 / 100.0, |sample| sample.scale_w);
+    let animated_scale_h = animated_expression(&keyframes, &time_expr, 1.0 / 100.0, |sample| sample.scale_h);
+    let animated_rotation = animated_expression(&keyframes, &time_expr, std::f64::consts::PI / 180.0, |sample| sample.rotation);
+    let animated_opacity = animated_expression(&keyframes, &alpha_time_expr, 1.0 / 100.0, |sample| sample.opacity);
+    let animated_x = animated_expression(&keyframes, &time_expr, width as f64 / 1920.0, |sample| sample.x);
+    let animated_y = animated_expression(&keyframes, &time_expr, height as f64 / 1080.0, |sample| sample.y);
+    let scale_animated = animated_scale_w.is_some() || animated_scale_h.is_some();
     let rotation = n(transform, "rotation", 0.0).to_radians();
-    if rotation.abs() > 0.0001 { filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0")); }
+    /* rotate evaluates its angle per frame but sizes its output once. When the
+       scale also animates, rotate first on the fixed canvas so the changing
+       frame size never reaches rotate's configuration-time output size. */
+    if scale_animated {
+        if let Some(expression) = animated_rotation.as_deref() {
+            filters.push(format!("rotate='{expression}':ow='hypot(iw,ih)':oh=ow:c=black@0"));
+        } else if rotation.abs() > 0.0001 {
+            filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):roth(ih):c=black@0"));
+        }
+    }
+
+    if scale_animated {
+        let axis = |animated: &Option<String>, base: f64, dimension: &str| match animated {
+            Some(expression) => format!("max(2,trunc({dimension}*max(0.01,min(10,({expression})))/2)*2)"),
+            None => format!("max(2,trunc({dimension}*{base:.5}/2)*2)"),
+        };
+        filters.push(format!("scale=w='{}':h='{}':eval=frame", axis(&animated_scale_w, scale_w, "iw"), axis(&animated_scale_h, scale_h, "ih")));
+    } else if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 {
+        filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}"));
+    }
+    if !scale_animated {
+        if let Some(expression) = animated_rotation.as_deref() {
+            filters.push(format!("rotate='{expression}':ow='hypot(iw,ih)':oh=ow:c=black@0"));
+        } else if rotation.abs() > 0.0001 {
+            filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0"));
+        }
+    }
     let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
-    if opacity < 0.999 { filters.push(format!("colorchannelmixer=aa={opacity:.4}")); }
+    let has_animation = animated_scale_w.is_some() || animated_scale_h.is_some() || animated_rotation.is_some()
+        || animated_x.is_some() || animated_y.is_some() || animated_opacity.is_some();
+    if let Some(expression) = animated_opacity {
+        /* geq exposes the frame timestamp as T; keep r/g/b untouched. */
+        filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*max(0,min(1,({expression})))'"));
+    } else if opacity < 0.999 {
+        filters.push(format!("colorchannelmixer=aa={opacity:.4}"));
+    }
     let x = n(&transform["position"], "x", 0.0) * width as f64 / 1920.0;
     let y = n(&transform["position"], "y", 0.0) * height as f64 / 1080.0;
+    let shake_active = has_animation;
+    let shake_time = if shake_active { time_expr.as_str() } else { "t" };
     let (shake_x, shake_y) = if enabled(effects, "shake") {
         let amount = n(&effects["shake"], "amount", 18.0) * width as f64 / 1920.0 * 0.18;
         let freq = (n(&effects["shake"], "frequency", 8.0) * (1.0 - n(&effects["shake"], "smoothness", 35.0) / 120.0)).max(0.5);
-        (format!("+sin(2*PI*t*{freq:.3})*{amount:.3}"), format!("+cos(2*PI*t*{freq:.3})*{amount:.3}"))
+        (format!("+sin(2*PI*{shake_time}*{freq:.3})*{amount:.3}"), format!("+cos(2*PI*{shake_time}*{freq:.3})*{amount:.3}"))
     } else { (String::new(), String::new()) };
-    let overlay_x = format!("(main_w-overlay_w)/2+{x:.3}{shake_x}");
-    let overlay_y = format!("(main_h-overlay_h)/2+{y:.3}{shake_y}");
+    let x_term = animated_x.map_or_else(|| format!("{x:.3}"), |expression| format!("({expression})"));
+    let y_term = animated_y.map_or_else(|| format!("{y:.3}"), |expression| format!("({expression})"));
+    let overlay_x = format!("(main_w-overlay_w)/2+{x_term}{shake_x}");
+    let overlay_y = format!("(main_h-overlay_h)/2+{y_term}{shake_y}");
     (filters.join(","), overlay_x, overlay_y)
 }
 

@@ -34,6 +34,36 @@ impl TrackId {
     }
 }
 
+/// A keyframe as stored on a clip. `time` is relative to the clip start,
+/// which keeps animation attached to the media through moves, trims and cuts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyframeSample {
+    pub time: f64,
+    pub x: f64,
+    pub y: f64,
+    pub scale_w: f64,
+    pub scale_h: f64,
+    pub rotation: f64,
+    pub opacity: f64,
+}
+
+/// Fully sampled transform used by the shared preview/export filter builder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformValues {
+    pub x: f64,
+    pub y: f64,
+    pub scale_w: f64,
+    pub scale_h: f64,
+    pub rotation: f64,
+    pub opacity: f64,
+}
+
+impl Default for TransformValues {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, scale_w: 100.0, scale_h: 100.0, rotation: 0.0, opacity: 100.0 }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
@@ -49,9 +79,128 @@ pub struct Clip {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+fn json_path<'a>(mut value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    for key in path {
+        value = value.get(*key)?;
+    }
+    Some(value)
+}
+
+fn json_number(value: &serde_json::Value, path: &[&str], fallback: f64) -> f64 {
+    json_path(value, path)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|number| number.is_finite())
+        .unwrap_or(fallback)
+}
+
+fn set_json_value(root: &mut serde_json::Value, path: &[&str], value: f64) {
+    let Some((head, tail)) = path.split_first() else { return; };
+    if !root.is_object() { *root = serde_json::json!({}); }
+    let object = root.as_object_mut().unwrap();
+    if tail.is_empty() {
+        object.insert((*head).to_owned(), serde_json::json!(value));
+        return;
+    }
+    let child = object.entry((*head).to_owned()).or_insert_with(|| serde_json::json!({}));
+    set_json_value(child, tail, value);
+}
+
 impl Clip {
     pub fn end(&self) -> f64 {
         self.start + self.duration
+    }
+
+    /// Base (un-keyframed) transform values stored in `props.transform`.
+    pub fn base_transform(&self) -> TransformValues {
+        let props = self.extra.get("props").unwrap_or(&serde_json::Value::Null);
+        let transform = json_path(props, &["transform"]).unwrap_or(&serde_json::Value::Null);
+        TransformValues {
+            x: json_number(transform, &["position", "x"], 0.0),
+            y: json_number(transform, &["position", "y"], 0.0),
+            scale_w: json_number(transform, &["scale", "w"], 100.0),
+            scale_h: json_number(transform, &["scale", "h"], 100.0),
+            rotation: json_number(transform, &["rotation"], 0.0),
+            opacity: json_number(transform, &["opacity"], 100.0),
+        }
+    }
+
+    /// Sorted keyframe samples with missing values filled from the base transform.
+    pub fn keyframe_samples(&self) -> Vec<KeyframeSample> {
+        let base = self.base_transform();
+        let mut samples: Vec<_> = self.extra.get("keyframes")
+            .and_then(serde_json::Value::as_array)
+            .map(|keyframes| keyframes.iter().filter_map(|keyframe| {
+                let time = keyframe.get("time").and_then(serde_json::Value::as_f64)
+                    .filter(|time| time.is_finite())?;
+                let values = keyframe.get("values").unwrap_or(&serde_json::Value::Null);
+                Some(KeyframeSample {
+                    time,
+                    x: json_number(values, &["x"], base.x),
+                    y: json_number(values, &["y"], base.y),
+                    scale_w: json_number(values, &["scaleW"], base.scale_w),
+                    scale_h: json_number(values, &["scaleH"], base.scale_h),
+                    rotation: json_number(values, &["rotation"], base.rotation),
+                    opacity: json_number(values, &["opacity"], base.opacity),
+                })
+            }).collect())
+            .unwrap_or_default();
+        samples.sort_by(|a, b| a.time.total_cmp(&b.time));
+        samples
+    }
+
+    /// Linear transform at `at` seconds relative to the clip start. Values are
+    /// held before the first keyframe and after the last one.
+    pub fn transform_at(&self, at: f64) -> TransformValues {
+        let base = self.base_transform();
+        let samples = self.keyframe_samples();
+        let Some(first) = samples.first().copied() else { return base; };
+        let sample_to_values = |sample: &KeyframeSample| TransformValues {
+            x: sample.x, y: sample.y, scale_w: sample.scale_w, scale_h: sample.scale_h,
+            rotation: sample.rotation, opacity: sample.opacity,
+        };
+        if !at.is_finite() || at <= first.time { return sample_to_values(&first); }
+        for pair in samples.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            if at > right.time { continue; }
+            let span = right.time - left.time;
+            let t = if span.abs() < EPSILON { 1.0 } else { ((at - left.time) / span).clamp(0.0, 1.0) };
+            let lerp = |a: f64, b: f64| a + (b - a) * t;
+            return TransformValues {
+                x: lerp(left.x, right.x),
+                y: lerp(left.y, right.y),
+                scale_w: lerp(left.scale_w, right.scale_w),
+                scale_h: lerp(left.scale_h, right.scale_h),
+                rotation: lerp(left.rotation, right.rotation),
+                opacity: lerp(left.opacity, right.opacity),
+            };
+        }
+        sample_to_values(&samples[samples.len() - 1])
+    }
+
+    pub fn shift_keyframes(&mut self, delta: f64) {
+        if !delta.is_finite() || delta == 0.0 { return; }
+        let Some(keyframes) = self.extra.get_mut("keyframes").and_then(serde_json::Value::as_array_mut) else { return; };
+        for keyframe in keyframes.iter_mut() {
+            if let Some(time) = keyframe.get("time").and_then(serde_json::Value::as_f64) {
+                keyframe["time"] = serde_json::json!(time + delta);
+            }
+        }
+        keyframes.sort_by(|a, b| {
+            a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0))
+        });
+    }
+
+    fn set_base_transform(&mut self, values: TransformValues) {
+        let props = self.extra.entry("props".into()).or_insert_with(|| serde_json::json!({}));
+        if !props.is_object() { *props = serde_json::json!({}); }
+        let transform = props.as_object_mut().unwrap().entry("transform".to_owned()).or_insert_with(|| serde_json::json!({}));
+        if !transform.is_object() { *transform = serde_json::json!({}); }
+        set_json_value(transform, &["position", "x"], values.x);
+        set_json_value(transform, &["position", "y"], values.y);
+        set_json_value(transform, &["scale", "w"], values.scale_w);
+        set_json_value(transform, &["scale", "h"], values.scale_h);
+        set_json_value(transform, &["rotation"], values.rotation);
+        set_json_value(transform, &["opacity"], values.opacity);
     }
 
     fn validate(&self) -> Result<(), TimelineError> {
@@ -236,24 +385,62 @@ impl Timeline {
         self.find(id).cloned()
     }
 
-    pub fn trim_clip(&mut self, id: &str, start: f64, end: f64) -> Result<Clip, TimelineError> {
+    pub fn trim_clip(&mut self, id: &str, start: f64, end: f64, source_duration: Option<f64>) -> Result<Clip, TimelineError> {
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end - start <= EPSILON {
             return Err(TimelineError::InvalidRange);
         }
         let mut clip = self.find(id)?.clone();
+        if let Some(duration) = source_duration.filter(|duration| duration.is_finite() && *duration > 0.0) {
+            clip.extra.insert("sourceDuration".into(), serde_json::json!(duration));
+        }
+        let source_offset = clip.extra.get("sourceOffset")
+            .and_then(serde_json::Value::as_f64).unwrap_or(0.0).max(0.0);
+        let source_duration = clip.extra.get("sourceDuration")
+            .and_then(serde_json::Value::as_f64).filter(|duration| duration.is_finite() && *duration > 0.0);
+        /* A left trim changes source offset. The source start and end stay
+           bounded so dragging a handle back restores already-trimmed media. */
+        let next_start = start.max((clip.start - source_offset).max(0.0));
+        let next_offset = (source_offset + next_start - clip.start).max(0.0);
+        let next_end = source_duration
+            .map(|duration| end.min(next_start + (duration - next_offset).max(0.0)))
+            .unwrap_or_else(|| end.min(clip.end()));
+        if next_end - next_start <= EPSILON { return Err(TimelineError::InvalidRange); }
+
+        let linked_id = clip.linked_clip_id.clone();
+        let linked_track = linked_id.as_deref()
+            .and_then(|linked| self.clips.iter().find(|candidate| candidate.id == linked))
+            .map(|linked| linked.track);
+        let mut changing_ids = vec![id];
+        if let Some(linked) = linked_id.as_deref() { changing_ids.push(linked); }
         if self.clips.iter().any(|other| {
-            other.id != id
-                && other.track == clip.track
-                && start < other.end() - EPSILON
-                && end > other.start + EPSILON
+            !changing_ids.contains(&other.id.as_str())
+                && (other.track == clip.track || Some(other.track) == linked_track)
+                && next_start < other.end() - EPSILON
+                && next_end > other.start + EPSILON
         }) {
             return Err(TimelineError::InvalidRange);
         }
-        clip.start = start;
-        clip.duration = end - start;
+        let trim_delta = next_start - clip.start;
+        clip.start = next_start;
+        clip.duration = next_end - next_start;
+        clip.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
+        /* Keyframes are clip-relative, so a left trim keeps them at the same
+           source frame by moving them back by the trimmed amount. */
+        clip.shift_keyframes(-trim_delta);
         self.replace(clip.clone());
+        if let Some(linked_id) = linked_id {
+            if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
+                let linked_delta = next_start - linked.start;
+                linked.start = next_start;
+                linked.duration = next_end - next_start;
+                linked.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
+                if let Some(duration) = source_duration { linked.extra.insert("sourceDuration".into(), serde_json::json!(duration)); }
+                linked.shift_keyframes(-linked_delta);
+                self.replace(linked);
+            }
+        }
         self.refresh_duration();
-        Ok(clip)
+        self.find(id).cloned()
     }
 
     pub fn split_clip(
@@ -277,7 +464,7 @@ impl Timeline {
             .and_then(serde_json::Value::as_f64).unwrap_or(0.0);
         let mut right_extra = left.extra.clone();
         right_extra.insert("sourceOffset".into(), serde_json::json!(original_source_offset + split_offset));
-        let right = Clip {
+        let mut right = Clip {
             id: right_id,
             track: left.track,
             start: at,
@@ -286,6 +473,9 @@ impl Timeline {
             linked_clip_id: None,
             extra: right_extra,
         };
+        /* The right half starts later in the same media, so its clip-relative
+           keyframes move back by the split offset. */
+        right.shift_keyframes(-split_offset);
         left.duration = at - left.start;
         /* The original end transition follows the tail segment after a cut. */
         if let Some(transition) = left.extra.get_mut("props").and_then(serde_json::Value::as_object_mut)
@@ -365,6 +555,68 @@ impl Timeline {
             linked.linked_clip_id = None;
             self.replace(linked);
         }
+        Ok(())
+    }
+
+    /// Insert or update a transform keyframe. `at` is an absolute timeline
+    /// time; it is stored relative to the clip so the animation follows edits.
+    pub fn set_keyframe(&mut self, id: &str, at: f64, values: &serde_json::Value) -> Result<(), TimelineError> {
+        if !at.is_finite() { return Err(TimelineError::InvalidRange); }
+        let mut clip = self.find(id)?.clone();
+        let local_at = (at - clip.start).clamp(0.0, clip.duration);
+        let sampled = clip.transform_at(local_at);
+        let read = |key: &str, fallback: f64| values.get(key).and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite()).unwrap_or(fallback);
+        let next = TransformValues {
+            x: read("x", sampled.x),
+            y: read("y", sampled.y),
+            scale_w: read("scaleW", sampled.scale_w),
+            scale_h: read("scaleH", sampled.scale_h),
+            rotation: read("rotation", sampled.rotation),
+            opacity: read("opacity", sampled.opacity),
+        };
+        let keyframes = clip.extra.entry("keyframes".into()).or_insert_with(|| serde_json::json!([]));
+        if !keyframes.is_array() { *keyframes = serde_json::json!([]); }
+        let list = keyframes.as_array_mut().unwrap();
+        if let Some(existing) = list.iter_mut().find(|keyframe| {
+            (keyframe["time"].as_f64().unwrap_or(f64::NEG_INFINITY) - local_at).abs() < 0.0001
+        }) {
+            existing["time"] = serde_json::json!(local_at);
+            existing["values"] = serde_json::json!({
+                "x": next.x, "y": next.y, "scaleW": next.scale_w, "scaleH": next.scale_h,
+                "rotation": next.rotation, "opacity": next.opacity
+            });
+        } else {
+            list.push(serde_json::json!({
+                "time": local_at,
+                "values": {
+                    "x": next.x, "y": next.y, "scaleW": next.scale_w, "scaleH": next.scale_h,
+                    "rotation": next.rotation, "opacity": next.opacity
+                }
+            }));
+        }
+        list.sort_by(|a, b| {
+            a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0))
+        });
+        clip.set_base_transform(next);
+        self.replace(clip);
+        Ok(())
+    }
+
+    /// Remove the keyframe closest to the requested absolute time. The base
+    /// transform is kept at the sampled value so removing a key does not jump.
+    pub fn remove_keyframe(&mut self, id: &str, at: f64) -> Result<(), TimelineError> {
+        if !at.is_finite() { return Err(TimelineError::InvalidRange); }
+        let mut clip = self.find(id)?.clone();
+        let local_at = (at - clip.start).clamp(0.0, clip.duration);
+        let sampled = clip.transform_at(local_at);
+        if let Some(list) = clip.extra.get_mut("keyframes").and_then(serde_json::Value::as_array_mut) {
+            list.retain(|keyframe| {
+                (keyframe["time"].as_f64().unwrap_or(f64::NEG_INFINITY) - local_at).abs() >= 0.0001
+            });
+        }
+        clip.set_base_transform(sampled);
+        self.replace(clip);
         Ok(())
     }
 
@@ -518,5 +770,81 @@ impl Timeline {
             .iter()
             .map(Clip::end)
             .fold(MIN_TIMELINE_SECONDS, f64::max);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip_with(keyframes: serde_json::Value) -> Clip {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("props".to_string(), serde_json::json!({ "transform": {} }));
+        extra.insert("keyframes".to_string(), keyframes);
+        Clip {
+            id: "clip-a".to_string(),
+            track: TrackId::V1,
+            start: 2.0,
+            duration: 10.0,
+            label: "Clip".to_string(),
+            linked_clip_id: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn transform_interpolates_piecewise_linearly() {
+        let clip = clip_with(serde_json::json!([
+            {"time": 0.0, "values": {"x": 0.0, "y": 0.0, "scaleW": 100.0, "scaleH": 100.0, "rotation": 0.0, "opacity": 100.0}},
+            {"time": 4.0, "values": {"x": 960.0, "y": 540.0, "scaleW": 150.0, "scaleH": 150.0, "rotation": 30.0, "opacity": 100.0}},
+            {"time": 8.0, "values": {"x": 0.0, "y": 0.0, "scaleW": 100.0, "scaleH": 100.0, "rotation": 0.0, "opacity": 50.0}},
+        ]));
+        let sampled = clip.transform_at(2.0);
+        assert!((sampled.x - 480.0).abs() < 0.01, "x should be mid-segment, got {}", sampled.x);
+        assert!((sampled.y - 270.0).abs() < 0.01, "y should be mid-segment, got {}", sampled.y);
+        assert!((sampled.scale_w - 125.0).abs() < 0.01, "scale should be mid-segment, got {}", sampled.scale_w);
+        assert!((sampled.rotation - 15.0).abs() < 0.01, "rotation should be mid-segment, got {}", sampled.rotation);
+        let end = clip.transform_at(8.0);
+        assert!((end.opacity - 50.0).abs() < 0.0001, "end should hold the last keyframe, got {}", end.opacity);
+        let before = clip.transform_at(0.0);
+        assert!((before.x - 0.0).abs() < 0.0001, "before first keyframe holds first value, got {}", before.x);
+    }
+
+    #[test]
+    fn set_and_remove_keyframe_store_clip_relative_times() {
+        let mut timeline = Timeline::new(vec![clip_with(serde_json::json!([]))]).unwrap();
+        let clip_id = "clip-a".to_string();
+        timeline
+            .set_keyframe(&clip_id, 5.0, &serde_json::json!({"x": 12.0, "y": 24.0, "scaleW": 150.0, "scaleH": 150.0, "rotation": 30.0, "opacity": 80.0}))
+            .unwrap();
+        let clip = &timeline.clips[0];
+        assert_eq!(clip.keyframe_samples().len(), 1);
+        let stored_time = clip.keyframe_samples()[0].time;
+        assert!((stored_time - 3.0).abs() < 0.0001, "absolute time 5.0 on a clip starting at 2.0 stores relative 3.0, got {stored_time}");
+        let sampled = clip.transform_at(3.0);
+        assert!((sampled.x - 12.0).abs() < 0.0001);
+        assert!((sampled.opacity - 80.0).abs() < 0.0001);
+
+        timeline.remove_keyframe(&clip_id, 5.0).unwrap();
+        assert!(timeline.clips[0].keyframe_samples().is_empty());
+        let base = timeline.clips[0].base_transform();
+        assert!((base.x - 12.0).abs() < 0.0001);
+        assert!((base.opacity - 80.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn trim_and_split_keep_keyframes_stable() {
+        let mut timeline = Timeline::new(vec![clip_with(serde_json::json!([
+            {"time": 1.0, "values": {"x": 0.0, "y": 0.0, "scaleW": 100.0, "scaleH": 100.0, "rotation": 0.0, "opacity": 100.0}},
+            {"time": 5.0, "values": {"x": 400.0, "y": 200.0, "scaleW": 120.0, "scaleH": 120.0, "rotation": 10.0, "opacity": 90.0}},
+        ]))]).unwrap();
+        let clip_id = "clip-a".to_string();
+        let trimmed = timeline.trim_clip(&clip_id, 3.0, 6.0, None).unwrap();
+        assert!((trimmed.keyframe_samples()[0].time - 0.0).abs() < 0.0001);
+        assert!((trimmed.keyframe_samples()[1].time - 4.0).abs() < 0.0001);
+
+        let (left, right) = timeline.split_clip(&clip_id, 5.0, "clip-b".to_string()).unwrap();
+        assert!((left.keyframe_samples()[1].time - 4.0).abs() < 0.0001);
+        assert!((right.keyframe_samples()[1].time - 2.0).abs() < 0.0001);
     }
 }

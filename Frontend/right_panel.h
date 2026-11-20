@@ -116,6 +116,17 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     PlutoJsonBoolPath(clipBegin, clipEnd, "props.audio.fadeOut", &gSwOn[1]);
     gSl[40] = gSlT[40] = fmaxf(0.f, fminf(1.f, (PlutoReadNumber(clipBegin, clipEnd, "props.audio.fadeInDuration", 1.f) - 1.f) / 9.f));
     gSl[41] = gSlT[41] = fmaxf(0.f, fminf(1.f, (PlutoReadNumber(clipBegin, clipEnd, "props.audio.fadeOutDuration", 1.f) - 1.f) / 9.f));
+    /* Keyframed clips show the transform sampled at the playhead; editing
+       controls then write through keyframes instead of the base transform. */
+    if (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount && gTimelineClips[gTimelineSelected].keyframeCount > 0) {
+        TimelineClipUi *kf = &gTimelineClips[gTimelineSelected];
+        float values[6];
+        PlutoKeyframeTransform(kf, (float)(gPlayhead - kf->start), values);
+        gNum[0] = values[0]; gNum[1] = values[1];
+        gNum[2] = values[2]; gNum[3] = values[3];
+        gRot = gRotT = values[4];
+        gSl[0] = gSlT[0] = fmaxf(0.f, fminf(1.f, values[5] / 100.f));
+    }
 #else
     (void)clipBegin; (void)clipEnd;
 #endif
@@ -323,6 +334,7 @@ static float gLinkedNumOtherStart;
 static void CommitNumField(int n, float before) {
     if (n < 0 || n >= 4) return;
     int group = n < 2 ? 0 : 1;
+    if (PlutoTimelineHasKeyframes()) { PlutoTimelineSetTransformKeyframe(); return; }
     if (!gLink[group]) { PlutoTimelineSetProperty(kNumPropertyPaths[n], gNum[n]); return; }
     int other = n ^ 1;
     if (n >= 2) {
@@ -427,6 +439,12 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             HSPACE
             if (IconBtn(CLAY_IDI("Reset", n), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) {
                 *a = def; *b = def;
+                if (PlutoTimelineHasKeyframes()) {
+                    if (n == 0) { gNum[0] = def; gNum[1] = def; }
+                    else { gNum[2] = def; gNum[3] = def; }
+                    PlutoTimelineSetTransformKeyframe();
+                    gPreviewDirty = true;
+                } else {
                 char updates[512];
                 if (n == 0) {
                     snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
@@ -437,6 +455,7 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
                 }
                 PlutoTimelineSetPropertiesJson(updates);
                 gPreviewDirty = true;
+                }
             }
         }
         GAPY(6)
@@ -558,14 +577,14 @@ static void TransformView(void) {
         GAPY(10)
         CLAY(CLAY_ID("RotCard"), {.layout = {COLM, .sizing = {GROW, FIX(160)}, .padding = {13, 13, 13, 0}, .childGap = 6}, RCARD}) {
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(35)}, .childGap = 8, .childAlignment = AL_Y}}) {
-                if (IconBtn(CLAY_ID("RotReset"), I_ROT, 34, 24, C_TEXT, false, 17)) { gRotT = 0.f; PlutoTimelineSetProperty("props.transform.rotation", 0.0); sentRotation = 0.f; }
+                if (IconBtn(CLAY_ID("RotReset"), I_ROT, 34, 24, C_TEXT, false, 17)) { gRotT = 0.f; if (PlutoTimelineHasKeyframes()) PlutoTimelineSetTransformKeyframe(); else PlutoTimelineSetProperty("props.transform.rotation", 0.0); sentRotation = 0.f; }
                 Tx("Rotation", 19, C_TEXT, 0);
                 HSPACE
                 float rotationValue = gRot;
                 if (ValBoxEditable(CLAY_ID("RotationValue"), &rotationValue, "\xC2\xB0", 128, 35, 22, 18, 11, -180.f, 180.f, 1)) {
                     gRot = gRotT = rotationValue;
                     sentRotation = rotationValue;
-                    PlutoTimelineSetProperty("props.transform.rotation", rotationValue);
+                    if (PlutoTimelineHasKeyframes()) PlutoTimelineSetTransformKeyframe(); else PlutoTimelineSetProperty("props.transform.rotation", rotationValue);
                     gPreviewDirty = true;
                 }
             }
@@ -587,7 +606,7 @@ static void TransformView(void) {
             }
             CLAY(rid, {.layout = {.sizing = {GROW, FIX(93)}}, .custom = {.customData = NC(K_ROTRULER, C_CARD, C_CARD, C_CARD, (gRot + 180.f) / 360.f, b.hover, 0)}}) {}
             if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
-                PlutoTimelineSetProperty("props.transform.rotation", gRotT);
+                if (PlutoTimelineHasKeyframes()) PlutoTimelineSetTransformKeyframe(); else PlutoTimelineSetProperty("props.transform.rotation", gRotT);
                 sentRotation = gRotT;
             }
         }
@@ -599,7 +618,7 @@ static void TransformView(void) {
                 float opacityValue = gSl[0] * 100.f;
                 if (ValBoxEditable(CLAY_ID("OpacityValue"), &opacityValue, "%", 72, 27, 16, 13, 8, 0.f, 100.f, 0)) {
                     gSl[0] = gSlT[0] = opacityValue / 100.f;
-                    PlutoTimelineSetProperty("props.transform.opacity", opacityValue);
+                    if (PlutoTimelineHasKeyframes()) PlutoTimelineSetTransformKeyframe(); else PlutoTimelineSetProperty("props.transform.opacity", opacityValue);
                     sentOpacity = gSlT[0];
                 }
             }
@@ -607,7 +626,7 @@ static void TransformView(void) {
             Bs b = Interact(sid);
             SliderLogic(sid, 0, 8.5f);
             if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
-                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
+                if (PlutoTimelineHasKeyframes()) PlutoTimelineSetTransformKeyframe(); else PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
                 sentOpacity = gSlT[0];
             }
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},
