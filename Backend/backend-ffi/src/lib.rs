@@ -13,13 +13,13 @@ use std::{
     io::Read,
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
-    process::{Child, ChildStdout, Stdio},
+    process::{Child, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
         Arc, Mutex, OnceLock,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -51,24 +51,38 @@ impl Default for PreviewFrame {
     fn default() -> Self { Self { request_id: 0, width: 0, height: 0, at: 0.0, pixels: Vec::new() } }
 }
 
+const PREVIEW_DECODE_QUEUE_DEPTH: usize = 6;
+
 struct PreviewStream {
     signature: u64,
     width: u32,
     height: u32,
     fps: u32,
     origin_index: u64,
-    child: Child,
-    stdout: ChildStdout,
+    child: Arc<Mutex<Child>>,
     script: std::path::PathBuf,
     next_index: u64,
     last_index: Option<u64>,
     pixels: Vec<u8>,
+    frames: Option<Receiver<Result<(u64, Vec<u8>), String>>>,
+    recycle: SyncSender<Vec<u8>>,
+    stop: Sender<()>,
+    decoder_thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for PreviewStream {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Disconnect the bounded frame queue before joining. This unblocks a
+        // decoder that is currently waiting to publish into a full queue.
+        let _ = self.stop.send(());
+        drop(self.frames.take());
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(worker) = self.decoder_thread.take() {
+            let _ = worker.join();
+        }
         let _ = std::fs::remove_file(&self.script);
     }
 }
@@ -79,7 +93,10 @@ struct PreviewEngine { stream: Option<PreviewStream> }
 fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
     let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
     let mut slot = slot.lock().map_err(|_| "Preview frame lock failed")?;
-    if !reuse_last {
+    // Never allow a "reuse" hint to leave the shared slot uninitialized or
+    // with a mismatched resolution. This also makes first-frame publication
+    // robust if a caller's cache state is reset independently.
+    if !reuse_last || slot.pixels.len() != pixels.len() {
         slot.pixels.resize(pixels.len(), 0);
         std::mem::swap(&mut slot.pixels, pixels);
     }
@@ -765,13 +782,60 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
         let _ = std::fs::remove_file(&script);
         format!("Could not start FFmpeg preview stream: {error}")
     })?;
-    let Some(stdout) = child.stdout.take() else {
+    let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill(); let _ = child.wait(); let _ = std::fs::remove_file(&script);
         return Err("FFmpeg preview stream has no output pipe".into());
     };
+
+    // FFmpeg decodes independently of the UI/request thread. The bounded queue
+    // keeps a small amount of decoded video ready without allowing RAM usage to
+    // grow with the duration of the project.
+    let child = Arc::new(Mutex::new(child));
+    let reader_child = Arc::clone(&child);
+    let frame_bytes = width as usize * height as usize * 4;
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<Result<(u64, Vec<u8>), String>>(PREVIEW_DECODE_QUEUE_DEPTH);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(PREVIEW_DECODE_QUEUE_DEPTH + 1);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let decoder_thread = match thread::Builder::new()
+        .name("stella-preview-decode".into())
+        .spawn(move || {
+            let mut frame_index = 0u64;
+            loop {
+                if stop_rx.try_recv().is_ok() { break; }
+
+                // Reuse buffers returned by the consumer. Allocations therefore
+                // settle after the queue is warm instead of allocating several
+                // megabytes for every decoded frame.
+                let mut pixels = recycle_rx.try_recv()
+                    .unwrap_or_else(|_| vec![0; frame_bytes]);
+                if let Err(error) = stdout.read_exact(&mut pixels) {
+                    let status = reader_child.lock().ok()
+                        .and_then(|mut child| child.try_wait().ok().flatten())
+                        .map(|status| status.to_string());
+                    let message = if let Some(status) = status {
+                        format!("FFmpeg preview stream ended before frame {frame_index} ({status})")
+                    } else {
+                        format!("Could not read preview frame {frame_index}: {error}")
+                    };
+                    let _ = frame_tx.send(Err(message));
+                    break;
+                }
+                if frame_tx.send(Ok((frame_index, pixels))).is_err() { break; }
+                frame_index += 1;
+            }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            if let Ok(mut child) = child.lock() { let _ = child.kill(); let _ = child.wait(); }
+            let _ = std::fs::remove_file(&script);
+            return Err(format!("Could not start preview decoder thread: {error}"));
+        }
+    };
+
     Ok(PreviewStream {
-        signature, width, height, fps, origin_index, child, stdout, script, next_index: 0,
-        last_index: None, pixels: vec![0; width as usize * height as usize * 4],
+        signature, width, height, fps, origin_index, child, script, next_index: 0,
+        last_index: None, pixels: vec![0; frame_bytes], frames: Some(frame_rx),
+        recycle: recycle_tx, stop: stop_tx, decoder_thread: Some(decoder_thread),
     })
 }
 
@@ -843,21 +907,37 @@ impl PreviewEngine {
                 setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
             }
             let stream = self.stream.as_mut().ok_or("Preview stream is unavailable")?;
-            let frame_bytes = stream.pixels.len();
             let local_target_index = target_index.saturating_sub(stream.origin_index);
+
+            // Check whether the requested frame is already the current frame
+            // BEFORE consuming the decoder queue. Checking after decoding made
+            // every newly decoded frame look reusable and skipped publication.
+            let reuse_last = stream.last_index == Some(local_target_index);
             let decode_started = Instant::now();
-            while stream.next_index <= local_target_index {
-                stream.stdout.read_exact(&mut stream.pixels).map_err(|error| {
-                    let status = stream.child.try_wait().ok().flatten().map(|status| status.to_string());
-                    if let Some(status) = status { format!("FFmpeg preview stream ended before frame {} ({status})", stream.next_index) }
-                    else { format!("Could not read preview frame {}: {error}", stream.next_index) }
-                })?;
-                stream.last_index = Some(stream.next_index);
-                stream.next_index += 1;
-                if stream.pixels.len() != frame_bytes { return Err("FFmpeg returned a malformed preview frame".into()); }
+            if !reuse_last {
+                let frames = stream.frames.as_ref().ok_or("Preview decoder queue is unavailable")?;
+                while stream.next_index <= local_target_index {
+                    let decoded = frames.recv()
+                        .map_err(|_| "Preview decoder stopped unexpectedly".to_owned())??;
+                    let (frame_index, mut pixels) = decoded;
+                    if pixels.len() != stream.pixels.len() {
+                        return Err("FFmpeg returned a malformed preview frame".into());
+                    }
+                    stream.next_index = frame_index.saturating_add(1);
+                    if frame_index == local_target_index {
+                        // The old reusable buffer goes back to the decoder;
+                        // the selected frame becomes the stream's current frame.
+                        std::mem::swap(&mut stream.pixels, &mut pixels);
+                        let _ = stream.recycle.try_send(pixels);
+                        stream.last_index = Some(frame_index);
+                    } else {
+                        // Frames skipped because the playhead advanced are
+                        // recycled immediately instead of being uploaded late.
+                        let _ = stream.recycle.try_send(pixels);
+                    }
+                }
             }
             decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-            let reuse_last = stream.last_index == Some(local_target_index);
             publish_preview_buffer(id, width, height, frame_at, &mut stream.pixels, reuse_last)?;
             Ok((width, height, frame_at))
         })();
@@ -1221,6 +1301,19 @@ pub unsafe extern "C" fn pluto_backend_free(value: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_publication_stores_the_first_decoded_frame() {
+        let request_id = 0x5354454c4c41;
+        let mut pixels = vec![10, 20, 30, 255];
+        publish_preview_buffer(request_id, 1, 1, 0.0, &mut pixels, true).unwrap();
+
+        let slot = PREVIEW_FRAME.get().unwrap().lock().unwrap();
+        assert_eq!(slot.request_id, request_id);
+        assert_eq!(slot.width, 1);
+        assert_eq!(slot.height, 1);
+        assert_eq!(slot.pixels, vec![10, 20, 30, 255]);
+    }
 
     #[test]
     fn ffi_dispatch_returns_structured_error_for_unknown_command() {

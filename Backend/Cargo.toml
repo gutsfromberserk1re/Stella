@@ -1,0 +1,3 @@
+[workspace]
+members = ["timeline-core", "backend-ffi"]
+resolver = "2"
