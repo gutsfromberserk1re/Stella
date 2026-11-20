@@ -33,8 +33,10 @@ Build the Windows UI using the repository's `.github/workflows/thing.yml` workfl
 4. A timeline with multiple consecutive clips and a transition.
 5. Pause/resume, frame stepping, backward seek, and forward seek.
 6. Changing preview resolution while playback is stopped and while it is running.
+7. Open Transitions, scroll to the bottom of Effects, and verify every effect card remains clipped inside the inspector; repeat with Transitions closed and with Filters expanded.
+8. On Windows, inspect the debugger trace and Task Manager GPU Video Decode graph to confirm whether hardware decode was actually selected. Compare with `-hwaccel none` if the driver path behaves poorly.
 
-The existing `[Stella preview]` debugger trace reports queue delay, stream setup, frame wait/decode, upload, and total backend time. During normal playback, `decodeWaitMs` should generally fall once the queue has filled. If it remains high, the decoder/effects are still unable to sustain the selected frame rate; if decode wait is low but upload time is high, investigate the raylib texture upload path.
+The existing `[Stella preview]` debugger trace reports queue delay, stream setup, frame wait/decode, upload, and total backend time. During normal playback, `decodeWaitMs` should generally fall once the queue has filled. If it remains high, the decoder/effects are still unable to sustain the selected frame rate; if decode wait is low but upload time is high, investigate the raylib texture upload path. Hardware acceleration is opportunistic: `-hwaccel auto` only helps when the bundled FFmpeg build, codec, and installed driver expose a usable decoder. The current FFmpeg filter graph still processes effects/compositing on the CPU; this patch is not a GPU effects engine.
 
 ## Verification status
 

@@ -451,7 +451,11 @@ int main(void) {
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
         Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, gCtrlDown ? 0.f : gWheelDelta * 28.f}, gDt);
+        /* Stella owns panel scrolling (gScroll / gAudS) and supplies the
+           resulting childOffset directly to Clay. Do not feed the same wheel
+           delta into Clay's independent scroll state as well: that double-
+           scrolls manually managed panes, especially long Effects inspectors. */
+        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, 0}, gDt);
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
         PlutoPollBackend();

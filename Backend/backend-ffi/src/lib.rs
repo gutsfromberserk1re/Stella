@@ -767,12 +767,22 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
     let script = filter_script(id, &graph)?;
     let ffmpeg = multimedia_binary("ffmpeg");
     let mut command = media_command(&ffmpeg);
-    command.args(["-hide_banner", "-loglevel", "error", "-filter_complex_threads", "2"]);
+    /* Let FFmpeg size filter/decoder workers for the host CPU rather than
+       pinning every preview graph to two threads. Video inputs use FFmpeg's
+       automatic hardware decoder selection (e.g. D3D11VA on supported Windows
+       GPUs); unsupported codecs/drivers remain eligible for software decode. */
+    command.args(["-hide_banner", "-loglevel", "error"]);
     append_filter_graph_arg(&mut command, &ffmpeg, &script);
     for input in inputs {
-        if input.image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
-        else if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
-        command.args(["-threads", "2", "-i"]).arg(input.path);
+        if input.image {
+            command.args(["-loop", "1", "-framerate", &fps.to_string()]);
+        } else {
+            if input.seek > 0.0001 {
+                command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]);
+            }
+            command.args(["-hwaccel", "auto", "-threads", "0"]);
+        }
+        command.arg("-i").arg(input.path);
     }
     command.args(["-map", "[vout]", "-an", "-t", &format!("{duration:.5}"),
         "-r", &fps.to_string(), "-fps_mode", "cfr", "-s", &format!("{width}x{height}"),

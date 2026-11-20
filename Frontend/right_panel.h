@@ -1028,8 +1028,6 @@ static bool FxHeader(int i, float open) {
     return b.clicked;
 }
 
-#define TRANS_DESC_H 252.f
-#define TRANS_EMPTY_H 46.f
 #define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
 static int TransitionNextClip(int from) {
     if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track > 3) return -1;
@@ -1053,8 +1051,11 @@ static void EffectsView(void) {
     /* ---- Transitions ---- */
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
-    float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
+    /* The inspector body is the single vertical scroll viewport. Keep the
+       transition details in normal flow rather than creating another nested
+       clipped viewport here. Nested clipping + the inspector's translated
+       content made the following effect cards escape the right panel when
+       scrolling with Transitions expanded. */
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
@@ -1065,8 +1066,8 @@ static void EffectsView(void) {
             HSPACE
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
+        if (gTransOpen) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {

@@ -9,9 +9,9 @@ static Color LerpC(Color a, Color b, float t) {
 }
 static Color MediaSwatch(const char *key, int fallback) {
     static const Color palette[] = {
-        {91, 72, 126, 255}, {63, 88, 132, 255}, {57, 105, 117, 255},
-        {62, 112, 86, 255}, {82, 76, 132, 255}, {67, 111, 101, 255},
-        {75, 93, 133, 255}, {83, 114, 94, 255}
+        {112, 66, 157, 255}, {49, 91, 157, 255}, {35, 119, 126, 255},
+        {43, 125, 83, 255}, {133, 77, 137, 255}, {38, 126, 108, 255},
+        {65, 102, 158, 255}, {113, 126, 55, 255}
     };
     uint32_t hash = 2166136261u;
     if (key && *key) {
@@ -575,8 +575,10 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         bool audioOnly = clip && clip->track >= 4;
         const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
-        if (audioOnly && !clip->groupId[0]) FillRR(r, 6, (Color){63, 119, 158, 230});
-        else GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        if (audioOnly && !clip->groupId[0])
+            GradRR(r, 6, (Color){34, 132, 128, 255}, (Color){20, 83, 91, 255});
+        else
+            GradRR(r, 6, ShadeMediaColor(swatch, .25f), ShadeMediaColor(swatch, -.08f));
         Texture2D wave = {0};
         if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
             ImportedMedia *media = &gImported[clip->mediaIndex];
@@ -687,8 +689,9 @@ static void DrawCustom(Cust *cu, Rectangle r) {
 /* ------------------------------------------------------------------ */
 /* Clay -> raylib renderer (with nested scissor stack)                 */
 /* ------------------------------------------------------------------ */
-static Rectangle gScis[16];
+static Rectangle gScis[64];
 static int gScisN;
+static int gScisOverflowN;
 static void ApplyScissor(void) {
     if (gScisN > 0) {
         Rectangle s = gScis[gScisN - 1];
@@ -699,6 +702,7 @@ static void ApplyScissor(void) {
 static void RenderUI(Clay_RenderCommandArray cmds) {
     gPH = false;
     gScisN = 0;
+    gScisOverflowN = 0;
     for (int i = 0; i < cmds.length; i++) {
         Clay_RenderCommand *rc = Clay_RenderCommandArray_Get(&cmds, i);
         Clay_BoundingBox bb = rc->boundingBox;
@@ -739,13 +743,25 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
                 x1 = fminf(x1, p.x + p.width); y1 = fminf(y1, p.y + p.height);
             }
             Rectangle n = {x0, y0, fmaxf(0.f, x1 - x0), fmaxf(0.f, y1 - y0)};
-            if (gScisN < 16) gScis[gScisN++] = n;
-            ApplyScissor();
+            if (gScisOverflowN > 0) {
+                /* Preserve the active parent clip while skipping an unusually
+                   deep nested clip that exceeds our bounded stack. */
+                gScisOverflowN++;
+            } else if (gScisN < (int)(sizeof(gScis) / sizeof(gScis[0]))) {
+                gScis[gScisN++] = n;
+                ApplyScissor();
+            } else {
+                gScisOverflowN = 1;
+            }
         } break;
         case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END:
-            if (gScisN > 0) gScisN--;
-            EndScissorMode();
-            ApplyScissor();
+            if (gScisOverflowN > 0) {
+                gScisOverflowN--;
+            } else if (gScisN > 0) {
+                gScisN--;
+                EndScissorMode();
+                ApplyScissor();
+            }
             break;
         case CLAY_RENDER_COMMAND_TYPE_CUSTOM: {
             Cust *cu = (Cust *)rc->renderData.custom.customData;
@@ -755,6 +771,7 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         }
     }
     if (gScisN > 0) { gScisN = 0; EndScissorMode(); }
+    gScisOverflowN = 0;
     if (gMediaDropPreviewVisible && gMediaDropPreview.width > 0.f) {
         DrawDottedRect(gMediaDropPreview, 4.f, 4.f, 2.f, (Color){190, 150, 232, 235});
     }
@@ -771,16 +788,16 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         if (button->applied) {
             Rectangle span = button->durationRect;
             if (span.width > 1.f) {
-                FillRR(span, 2.5f, (Color){70, 157, 224, 68});
-                DrawLineEx((Vector2){span.x, span.y + .5f},
-                           (Vector2){span.x + span.width, span.y + .5f}, 1.4f,
-                           (Color){111, 191, 248, 220});
-                DrawLineEx((Vector2){span.x, span.y - 1.f},
-                           (Vector2){span.x, span.y + span.height + 1.f}, 1.2f,
-                           (Color){111, 191, 248, 230});
-                DrawLineEx((Vector2){span.x + span.width, span.y - 1.f},
-                           (Vector2){span.x + span.width, span.y + span.height + 1.f}, 1.2f,
-                           (Color){111, 191, 248, 230});
+                /* A restrained transition ribbon: soft plum glass, not a neon
+                   blue duration line. Its width remains proportional to time. */
+                Rectangle ribbon = {span.x, span.y - 1.f, span.width, 7.f};
+                GradRR(ribbon, 3.f, (Color){190, 157, 218, 218}, (Color){112, 83, 151, 205});
+                StrokeRR(ribbon, 3.f, 1.f, (Color){222, 203, 239, 190});
+                if (span.width > 18.f) {
+                    float mid = ribbon.x + ribbon.width * .5f;
+                    DrawCircleV((Vector2){mid, ribbon.y + ribbon.height * .5f}, 1.8f,
+                                (Color){248, 239, 255, 245});
+                }
             }
             DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
                         (Color){245, 246, 249, 255});

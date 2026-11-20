@@ -10,6 +10,8 @@
 - Timeline snapping, linked audio, grouping, drag previews, frame stepping, and keyframe markers.
 - Shift+K cuts at the playhead; the scissors tool cuts at the pointer.
 - Preview has 24/30/60 fps target controls; library-only low-res thumbnails and cached waveforms.
+- Preview worker continuously decodes ahead into a bounded frame queue, recycles RGBA buffers, and uses automatic FFmpeg decoder/filter threading plus opportunistic hardware decode.
+- Effects inspector uses one explicit scroll offset and one parent clip viewport; transition details no longer create a nested clip that can escape the panel.
 - Timeline swatches stay consistent across cuts and grouped clips; video audio bands are flush, slightly darker blue, and audio-track clips show large, black waveforms only.
 - Grouped clips move together with their offsets preserved, share effects/colors, and can be ungrouped.
 - Color wheels use a brighter hue field and a light, always-visible neutral puck.
@@ -23,5 +25,6 @@
 
 ## Next
 - Finish shared keyframe interpolation.
-- Compile through GitHub Actions, then use the preview timing trace to tune any remaining playback bottlenecks.
+- Compile through GitHub Actions, then use the preview timing trace and Windows GPU Video Decode graph to verify hardware decode and tune remaining bottlenecks.
+- Build the next rendering phase: a GPU-resident compositor/effect graph (Direct3D 11/12 or Vulkan) so transforms, color, masks, blending, and transitions do not have to round-trip through CPU RGBA frames. Keep export parity by sharing effect parameters and reference tests with the FFmpeg export path.
 - Verify smooth playback, seeking, waveform alignment, transitions, effects, and preview/export matching in the GitHub build.

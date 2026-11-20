@@ -18,6 +18,7 @@ The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend 
 - Preview and export both build video and audio filters through `backend-ffi/src/filters.rs`.
 - When available, the preview worker uses cached editing proxies at every preview size; export continues to read original sources. The shared filters keep effect and transition behavior aligned while proxy resolution controls preview fidelity.
 - Playback timing traces are emitted to the Windows debugger once per second with end-to-end, queue, stream setup, decode wait, texture upload, and backend render times. The playhead uses a monotonic wall-clock delta, while preview requests are scheduled at the selected FPS and obsolete frames are skipped instead of queued for late display.
+- Preview inputs request FFmpeg automatic hardware decoding and automatic decoder/filter threading. Actual hardware use depends on the source codec, FFmpeg build, GPU driver, and Windows device; CPU fallback remains possible. The current filter/compositing graph is still CPU-based, so a dedicated GPU effects/render engine remains a separate future phase.
 
 FFmpeg and FFprobe resolve from `PLUTO_FFMPEG_DIR`, the app's adjacent `ffmpeg/` folder, or `PATH`. `Stella-Windows-x64-lite` contains `Stella.exe`, `pluto_backend.dll`, and icons. `Stella-Windows-x64-full` also contains FFmpeg/FFprobe, their shared runtime DLLs, and notices. The lightweight build can use the `ffmpeg/` folder from an earlier full download by placing it beside `Stella.exe`.
 
