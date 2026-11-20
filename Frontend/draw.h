@@ -586,12 +586,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x, r.y + r.height - 19.f, r.width, 19.f};
-            if (!audioOnly) {
-                FillRR(band, 0.f, (Color){71, 129, 168, 210});
-                DrawLineEx((Vector2){r.x, band.y}, (Vector2){r.x + r.width, band.y},
-                           1.f, (Color){119, 166, 194, 225});
-            }
+                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
@@ -599,6 +594,11 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
         StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){113, 116, 124, 255});
+        if (clip && !audioOnly && r.width >= 18.f) {
+            Color grip = (Color){210, 207, 222, 205};
+            DrawLineEx((Vector2){r.x + 3.5f, r.y + 8.f}, (Vector2){r.x + 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+            DrawLineEx((Vector2){r.x + r.width - 3.5f, r.y + 8.f}, (Vector2){r.x + r.width - 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+        }
         if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
             TimelineClipUi *clip = &gTimelineClips[clipIndex];
             for (int k = 0; k < clip->keyframeCount; k++) {

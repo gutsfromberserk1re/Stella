@@ -96,8 +96,11 @@ static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
 static float gPreviewRequestAt;
 static int gPreviewRequestRes;
+static double gPreviewRequestStartedAt;
+static double gPreviewTelemetryAt;
 static Texture2D gPreviewFrame;
-static char gPreviewTexturePath[1024];
+static uint8_t *gPreviewPixels;
+static size_t gPreviewPixelCapacity;
 static Rectangle gPreviewQualityRect;
 static Rectangle gPreviewFpsRect;
 static float gMediaZoom = 1.f;
@@ -122,6 +125,8 @@ static int gTransitionButtonCount;
 static int   gTimelineSelected = -1, gMediaDragIndex = -1, gClipDragIndex = -1;
 static int   gClipDragTrack;
 static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
+static int   gClipTrimIndex = -1, gClipTrimEdge;
+static float gClipTrimOrigStart, gClipTrimOrigEnd, gClipTrimOrigOffset, gClipTrimSourceDuration;
 static bool  gTimelinePanning;
 static uint64_t gClipSerial = 1;
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
@@ -202,7 +207,7 @@ typedef struct {
     char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
     int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
-    float start, duration, transitionDuration;
+    float start, duration, sourceOffset, sourceDuration, transitionDuration;
     bool hasAudio;
     float keyframes[32];
     int keyframeCount;

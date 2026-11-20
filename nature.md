@@ -6,11 +6,11 @@
 
 ## Done
 - Workflow builds lite and FFmpeg-bundled versions.
-- FFmpeg media import, regenerated low-res thumbnail and dark-waveform caches, proxy, preview, export, and shared filters.
+- FFmpeg media import, regenerated low-res thumbnail and black waveform caches, proxy, preview, export, and shared filters.
 - Timeline snapping, linked audio, grouping, drag previews, frame stepping, and keyframe markers.
 - Shift+K cuts at the playhead; the scissors tool cuts at the pointer.
 - Preview has 24/30/60 fps target controls; library-only low-res thumbnails and cached waveforms.
-- Timeline swatches stay consistent across cuts and grouped clips; video audio bands are flush and audio-track clips show large, dark waveforms only.
+- Timeline swatches stay consistent across cuts and grouped clips; video audio bands are flush, slightly darker blue, and audio-track clips show large, black waveforms only.
 - Grouped clips move together with their offsets preserved, share effects/colors, and can be ungrouped.
 - Color wheels use a brighter hue field and a light, always-visible neutral puck.
 - Proxy GOP shortened for faster seeks; new cache key regenerates seek-optimized proxies.
@@ -18,9 +18,10 @@
 - Knob values type on double-click; app branding uses Stella.ico.
 - Posterize and RGB Halftone FFmpeg graphs corrected; core effects and Slide syntax smoke-checked.
 - DPI, icons, value editing, panel animations, and timeline colors refined.
+- Preview uses a dedicated Rust-owned persistent FFmpeg raw-frame stream, cached proxies at all preview sizes, reusable frame buffers, and direct C-to-raylib texture upload.
+- Preview telemetry reports queue, stream setup, decode wait, texture upload, backend time, and end-to-end display latency to the Windows debugger.
 
 ## Next
 - Finish shared keyframe interpolation.
-- Replace per-frame FFmpeg preview processes with persistent decoding for steady playback.
-- Verify thumbnails, waveform alignment, preview playback, and transition-family UI in the GitHub build.
-- Verify playback, effects, and preview/export matching through the GitHub build.
+- Compile through GitHub Actions, then use the preview timing trace to tune any remaining playback bottlenecks.
+- Verify smooth playback, seeking, waveform alignment, transitions, effects, and preview/export matching in the GitHub build.
