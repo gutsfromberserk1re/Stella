@@ -317,7 +317,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         if let Some(expression) = animated_rotation.as_deref() {
             filters.push(format!("rotate='{expression}':ow='hypot(iw,ih)':oh=ow:c=black@0"));
         } else if rotation.abs() > 0.0001 {
-            filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):roth(ih):c=black@0"));
+            filters.push(format!("rotate={rotation:.6}:ow={width}:oh={height}:c=black@0"));
         }
     }
 
@@ -334,7 +334,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         if let Some(expression) = animated_rotation.as_deref() {
             filters.push(format!("rotate='{expression}':ow='hypot(iw,ih)':oh=ow:c=black@0"));
         } else if rotation.abs() > 0.0001 {
-            filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0"));
+            filters.push(format!("rotate={rotation:.6}:ow={width}:oh={height}:c=black@0"));
         }
     }
     let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
