@@ -28,7 +28,7 @@ static void FillRR(Rectangle r, float rad, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
     float m = fminf(r.width, r.height);
     if (rad <= 0.5f) { DrawRectangleRec(r, c); return; }
-    DrawRectangleRounded(r, fminf(1.f, rad * 2.f / m), 20, c);
+    DrawRectangleRounded(r, fminf(1.f, rad * 2.f / m), 48, c);
 }
 static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
@@ -44,10 +44,10 @@ static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     DrawRectangleRec((Rectangle){r.x + rad, r.y + r.height - t, r.width - 2 * rad, t}, c);
     DrawRectangleRec((Rectangle){r.x, r.y + rad, t, r.height - 2 * rad}, c);
     DrawRectangleRec((Rectangle){r.x + r.width - t, r.y + rad, t, r.height - 2 * rad}, c);
-    DrawRing((Vector2){r.x + rad, r.y + rad},                     rad - t, rad, 180, 270, 16, c);
-    DrawRing((Vector2){r.x + r.width - rad, r.y + rad},           rad - t, rad, 270, 360, 16, c);
-    DrawRing((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad - t, rad, 0, 90, 16, c);
-    DrawRing((Vector2){r.x + rad, r.y + r.height - rad},          rad - t, rad, 90, 180, 16, c);
+    DrawRing((Vector2){r.x + rad, r.y + rad},                     rad - t, rad, 180, 270, 32, c);
+    DrawRing((Vector2){r.x + r.width - rad, r.y + rad},           rad - t, rad, 270, 360, 32, c);
+    DrawRing((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad - t, rad, 0, 90, 32, c);
+    DrawRing((Vector2){r.x + rad, r.y + r.height - rad},          rad - t, rad, 90, 180, 32, c);
 }
 static void DottedLine(Vector2 a, Vector2 b, float dash, float gap, float thickness, Color color) {
     Vector2 d = {b.x - a.x, b.y - a.y};
@@ -83,8 +83,8 @@ static void FilledCapsule(Vector2 a, Vector2 b, float w, Color col) {
     DrawCircleV(a, w * .5f, col);
     DrawCircleV(b, w * .5f, col);
 }
-static void Ring(Vector2 c, float r, float t, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, 0, 360, 40, col); }
-static void Arc(Vector2 c, float r, float t, float a0, float a1, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, a0, a1, 32, col); }
+static void Ring(Vector2 c, float r, float t, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, 0, 360, 96, col); }
+static void Arc(Vector2 c, float r, float t, float a0, float a1, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, a0, a1, 64, col); }
 static void Capsule(Vector2 c, float angDeg, float len, float rad, float t, Color col) {
     float a = angDeg * DEG2RAD;
     Vector2 d = {cosf(a), sinf(a)}, n = {-d.y, d.x};
@@ -136,6 +136,52 @@ static Vector2 IconPoint(float x, float y, float w, float h, float nx, float ny,
 static Texture2D gToolIcons[6];
 static const char *gToolIconFiles[6] = {"color-palette.ico", "link.ico", "palm.ico", "selection.ico", "magnet.ico", "library.ico"};
 static Texture2D gKnobTexture, gAppLogo;
+
+/* Baked, anti-aliased colour-grading wheel (muted web look) + AA puck disc. Lazy-loaded on first use. */
+static Texture2D gWheelTex, gDiscTex;
+static float SmoothStep01(float a, float b, float x) { float t = fminf(1.f, fmaxf(0.f, (x - a) / (b - a))); return t * t * (3.f - 2.f * t); }
+static void LoadWheelTextures(void) {
+    if (gWheelTex.id) return;
+    {
+        const int S = 256;
+        Image im = GenImageColor(S, S, (Color){0, 0, 0, 0});
+        if (!im.data) return;
+        Color *px = (Color *)im.data;
+        const float c = (S - 1) * .5f, R = S * .5f - 2.f;
+        for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+            float dx = x - c, dy = y - c, d = sqrtf(dx * dx + dy * dy), rn = fminf(1.f, d / R);
+            float ang = atan2f(dy, dx) * RAD2DEG; if (ang < 0.f) ang += 360.f;
+            Color base = ColorFromHSV(fmodf(ang + 90.f, 360.f), .58f, .62f);   /* muted, red at top, clockwise */
+            float t = SmoothStep01(0.f, .85f, rn);                              /* dark neutral centre */
+            float rim = 1.f - .25f * SmoothStep01(.7f, 1.f, rn);                /* soft rim darkening */
+            float cov = fminf(1.f, fmaxf(0.f, R - d + .5f));                    /* analytic edge AA */
+            px[y * S + x] = (Color){U8((41.f + (base.r - 41.f) * t) * rim), U8((41.f + (base.g - 41.f) * t) * rim),
+                                    U8((48.f + (base.b - 48.f) * t) * rim), U8(cov * 255.f)};
+        }
+        gWheelTex = LoadTextureFromImage(im);
+        UnloadImage(im);
+        if (gWheelTex.id) { GenTextureMipmaps(&gWheelTex); SetTextureFilter(gWheelTex, TEXTURE_FILTER_TRILINEAR); }
+    }
+    {
+        const int S = 64;
+        Image im = GenImageColor(S, S, (Color){255, 255, 255, 0});
+        if (!im.data) return;
+        Color *px = (Color *)im.data;
+        const float c = (S - 1) * .5f, R = S * .5f - 2.f;
+        for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+            float dx = x - c, dy = y - c, d = sqrtf(dx * dx + dy * dy);
+            px[y * S + x] = (Color){255, 255, 255, U8(fminf(1.f, fmaxf(0.f, R - d + .5f)) * 255.f)};
+        }
+        gDiscTex = LoadTextureFromImage(im);
+        UnloadImage(im);
+        if (gDiscTex.id) SetTextureFilter(gDiscTex, TEXTURE_FILTER_BILINEAR);
+    }
+}
+static void DiscAA(Vector2 c, float rad, Color col) {
+    float q = rad * (32.f / 30.f);   /* texture disc fills 30/32 of its quad */
+    DrawTexturePro(gDiscTex, (Rectangle){0, 0, (float)gDiscTex.width, (float)gDiscTex.height},
+                   (Rectangle){c.x - q, c.y - q, q * 2.f, q * 2.f}, (Vector2){0, 0}, 0.f, col);
+}
 
 static void LoadKnobTexture(void) {
     const int size = 128;
@@ -287,6 +333,8 @@ static void LoadUiIcons(void) {
 static void UnloadUiIcons(void) {
     for (int i = 0; i < 6; i++) if (gToolIcons[i].id) UnloadTexture(gToolIcons[i]);
     if (gKnobTexture.id) UnloadTexture(gKnobTexture);
+    if (gWheelTex.id) UnloadTexture(gWheelTex);
+    if (gDiscTex.id) UnloadTexture(gDiscTex);
     if (gAppLogo.id) UnloadTexture(gAppLogo);
 }
 
@@ -447,16 +495,18 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     } break;
 
     case K_WHEEL: {
-        /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured? */
+        /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured?, f = hover/drag */
+        LoadWheelTextures();
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        for (int i = 0; i < 72; i++)
-            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
-        Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
+        float q = rad * ((256.f / 252.f));
+        DrawTexturePro(gWheelTex, (Rectangle){0, 0, (float)gWheelTex.width, (float)gWheelTex.height},
+                       (Rectangle){c.x - q, c.y - q, q * 2.f, q * 2.f}, (Vector2){0, 0}, 0.f, WHITE);
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
-        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
+        float g = 1.f + .12f * fminf(1.f, cu->f);
+        DiscAA((Vector2){p.x, p.y + 1.f}, 9.5f * g, (Color){0, 0, 0, 90});          /* soft shadow */
+        DiscAA(p, 9.f * g, (Color){255, 255, 255, 235});                            /* thin ring   */
+        DiscAA(p, 7.f * g, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255}); /* hue fill (unchanged logic) */
     } break;
 
     case K_SWITCH: {
