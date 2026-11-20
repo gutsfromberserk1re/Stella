@@ -586,7 +586,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
+                : (Rectangle){r.x + 2.f, r.y + r.height - 14.f, fmaxf(0.f, r.width - 4.f), 12.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
