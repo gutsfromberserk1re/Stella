@@ -3,13 +3,21 @@ use serde_json::Value;
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
 fn n(value: &Value, key: &str, fallback: f64) -> f64 { number(value, key, fallback) }
-pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
+pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, fps: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
     let props = &clip["props"];
     let transform = &props["transform"];
     let effects = &props["effects"];
     let colors = &props["colors"];
     let source_start = n(clip, "sourceOffset", 0.0).max(0.0);
-    let mut filters = vec![format!("trim=start={source_start:.5}:duration={length:.5}"), format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
+    /* Downsample to the chosen timeline frame rate before scaling and the
+       expensive effects chain. Previously `-r` ran at the very end of the
+       graph, so selecting 24/30fps still evaluated blur, grain, color and
+       other filters on every decoded source frame. Export and preview share
+       this exact filter order, keeping their frame sampling consistent. */
+    let mut filters = vec![
+        format!("trim=start={source_start:.5}:duration={length:.5}"),
+        format!("fps={fps}"),
+        format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
         format!("scale={width}:{height}:force_original_aspect_ratio=decrease"),
         format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"), "setsar=1".into(), "format=rgba".into()];
 

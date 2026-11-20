@@ -350,6 +350,7 @@ int main(void) {
     double playbackLastTime = GetTime();
     double playbackRequestRemainder = 0.0;
     bool playbackWasPlaying = false;
+    bool observedPlaybackState = gTimelinePlaying;
     float navigationRepeat = 0.f;
     while (!WindowShouldClose() && !gWantQuit) {
         const double frameNow = GetTime();
@@ -374,6 +375,11 @@ int main(void) {
             }
         }
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gTimelinePlaying != observedPlaybackState) {
+            observedPlaybackState = gTimelinePlaying;
+            gPreviewDirty = true;
+            gPreviewDebounce = 1.f;
+        }
         if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
             (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
             int splitCount = 0;

@@ -29,6 +29,7 @@ typedef struct {
 static PlutoBackend gBackend;
 static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd);
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson);
+static int PlutoPreviewOutputHeight(void);
 
 static bool PlutoBackendLoad(void) {
     if (gBackend.module) return true;
@@ -532,14 +533,17 @@ static void PlutoPollBackend(void) {
             if (matchingRequest) {
                 gPreviewTaskId = 0;
                 bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
-                float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
+                /* A frame can be technically valid yet already be far behind
+                   real playback. Bound that visual lag and request the newest
+                   playhead instead of presenting a growing queue of old frames. */
+                float previewLag = fmaxf(.12f, 4.f / (float)fmaxf(1, gPreviewFps));
                 bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
                 bool newerInDirection = gPreviewDisplayedAt < 0.f ||
                     (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
                              : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
                 bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
-                bool currentRequest = gPreviewRequestRes == gPreviewRes &&
-                    (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
+                bool currentRequest = gPreviewRequestRes == PlutoPreviewOutputHeight() &&
+                    (gTimelinePlaying ? movingFrameFresh : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
                 if (strstr(event, "\"ok\":true")) {
                     double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
@@ -548,7 +552,7 @@ static void PlutoPollBackend(void) {
                         PlutoJsonNumber(event, "height", &renderedHeight) &&
                         PlutoJsonNumber(event, "frameId", &frameIdNumber) &&
                         fabs(renderedAt - gPreviewRequestAt) <= (0.5 / (double)fmaxf(1, gPreviewFps)) &&
-                        (int)renderedHeight == gPreviewRes;
+                        (int)renderedHeight == gPreviewRequestRes;
                     if (currentRequest && frameMatchesRequest) {
                         double uploadedAt = renderedAt;
                         double uploadStartedAt = GetTime();
@@ -636,15 +640,23 @@ static void PlutoUnloadMedia(void) {
     gPreviewPixelCapacity = 0;
 }
 
+static int PlutoPreviewOutputHeight(void) {
+    /* Full selected quality is restored as soon as playback pauses. During
+       playback, cap 1080p requests at 720p to reduce FFmpeg work, RGBA memory
+       traffic, and GPU texture uploads per displayed frame. */
+    return gTimelinePlaying && gPreviewRes > 720 ? 720 : gPreviewRes;
+}
+
 static uint64_t PlutoRequestPreview(void) {
     if (!gBackend.submit || gPreviewTaskId) return 0;
+    int outputHeight = PlutoPreviewOutputHeight();
     char request[128];
-    snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d}", gPlayhead, gPreviewRes, gPreviewFps);
+    snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d}", gPlayhead, outputHeight, gPreviewFps);
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
         gPreviewTaskId = taskId;
         gPreviewRequestAt = gPlayhead;
-        gPreviewRequestRes = gPreviewRes;
+        gPreviewRequestRes = outputHeight;
         gPreviewRequestStartedAt = GetTime();
     }
     return gPreviewTaskId;

@@ -586,9 +586,14 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
         if (wave.id && hasAudio) {
+            /* Give embedded audio a genuinely readable waveform instead of
+               compressing it into the old 8px strip. The waveform stays in the
+               lower part of a video clip so the clip label remains legible. */
+            float embeddedWaveHeight = fminf(21.f, fmaxf(14.f, r.height * .38f));
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
+                : (Rectangle){r.x + 2.f, r.y + r.height - embeddedWaveHeight - 2.f,
+                              fmaxf(0.f, r.width - 4.f), embeddedWaveHeight};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
