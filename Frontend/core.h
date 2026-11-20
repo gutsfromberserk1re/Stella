@@ -211,7 +211,40 @@ typedef struct {
     bool hasAudio;
     float keyframes[32];
     int keyframeCount;
+    float keyframeValues[32][6]; /* x, y, scaleW, scaleH, rotation, opacity per keyframe */
 } TimelineClipUi;
+
+/* Interpolated transform values at a clip-relative time. Mirrors the Rust
+   piecewise-linear interpolation shared by preview and export. */
+static void PlutoKeyframeTransform(const TimelineClipUi *clip, float local, float out[6]) {
+    if (!clip) return;
+    for (int i = 0; i < 6; i++) out[i] = 0.f;
+    if (clip->keyframeCount <= 0 || clip->keyframeCount > 32) {
+        out[0] = 0.f; out[1] = 0.f; out[2] = 100.f; out[3] = 100.f; out[4] = 0.f; out[5] = 100.f;
+        return;
+    }
+    float times[32];
+    float values[32][6];
+    for (int i = 0; i < clip->keyframeCount; i++) {
+        times[i] = clip->keyframes[i];
+        for (int v = 0; v < 6; v++) values[i][v] = clip->keyframeValues[i][v];
+    }
+    float duration = clip->duration > 0.f ? clip->duration : 0.f;
+    float t = local < 0.f ? 0.f : (local > duration ? duration : local);
+    if (t <= times[0]) { for (int v = 0; v < 6; v++) out[v] = values[0][v]; return; }
+    float prev = times[0];
+    for (int i = 1; i < clip->keyframeCount; i++) {
+        if (t <= times[i]) {
+            float span = times[i] - prev;
+            float f = span > 0.0001f ? (t - prev) / span : 1.f;
+            for (int v = 0; v < 6; v++) out[v] = values[i - 1][v] + (values[i][v] - values[i - 1][v]) * f;
+            return;
+        }
+        prev = times[i];
+    }
+    for (int v = 0; v < 6; v++) out[v] = values[clip->keyframeCount - 1][v];
+}
+
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;
 static float gClipDragSnapshotStart[MAX_TIMELINE_CLIPS];

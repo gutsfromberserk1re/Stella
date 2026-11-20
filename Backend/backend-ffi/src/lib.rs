@@ -618,7 +618,7 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
     let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
     for (i, clip) in video_clips.iter().enumerate() {
         let value = serde_json::to_value(clip).unwrap_or_default();
-        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
+        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None, 0.0);
         let label = format!("vbody{i}");
         graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
         body_layers[i] = Some((label, x, y));
@@ -636,8 +636,8 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let mut right_value = serde_json::to_value(right).map_err(|e| e.to_string())?;
         left_value["sourceOffset"] = json!(left_source);
         right_value["sourceOffset"] = json!(right_source);
-        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None);
-        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
+        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None, transition_start);
+        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None, transition_start);
         let left_raw = format!("tx{i}a_raw");
         let right_raw = format!("tx{i}b_raw");
         let left_full = format!("tx{i}a");
@@ -997,19 +997,36 @@ fn dispatch(request: Value) -> Result<Value, String> {
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
+        "timeline_set_keyframe" => {
+            let before = timeline.clone();
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).ok_or("Keyframe time is invalid")?;
+            let values = request.get("values").cloned().unwrap_or_else(|| serde_json::Value::Null);
+            timeline
+                .set_keyframe(id, at, &values)
+                .map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_remove_keyframe" => {
+            let before = timeline.clone();
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).ok_or("Keyframe time is invalid")?;
+            timeline
+                .remove_keyframe(id, at)
+                .map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
         "timeline_add_keyframe" => {
             let before = timeline.clone();
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).ok_or("Keyframe time is invalid")?;
-            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
-                .ok_or_else(|| format!("Clip {id} was not found"))?;
-            let keyframes = clip.extra.entry("keyframes".into()).or_insert_with(|| json!([]));
-            let list = keyframes.as_array_mut().ok_or("Clip keyframes are invalid")?;
-            if !list.iter().any(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - at).abs() < 0.0001) {
-                list.push(json!({"time": at, "values": request["values"].clone()}));
-                list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
-                save_history(backend, before)?;
-            }
+            let values = request.get("values").cloned().unwrap_or_else(|| serde_json::Value::Null);
+            timeline
+                .set_keyframe(id, at, &values)
+                .map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_set_clip_property" => {
