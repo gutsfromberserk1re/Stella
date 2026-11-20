@@ -482,18 +482,18 @@ static void PlutoPollBackend(void) {
                                    gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
             if (matchingRequest) {
                 gPreviewTaskId = 0;
-                bool currentState = (gTimelinePlaying || gTimelineScrubbing) || !gPreviewDirty;
-                bool currentRequest = currentState &&
-                                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f) &&
-                                      gPreviewRequestRes == gPreviewRes;
+                bool previewMoving = gTimelinePlaying || gTimelineScrubbing;
+                bool currentRequest = gPreviewRequestRes == gPreviewRes &&
+                    (previewMoving || (!gPreviewDirty &&
+                     fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
                 if (strstr(event, "\"ok\":true") && PlutoJsonString(event, "previewPath", previewPath, sizeof(previewPath))) {
                     double renderedAt = -1.0, renderedHeight = 0.0;
-                    bool currentFrame = currentRequest &&
+                    bool frameMatchesRequest =
                         PlutoJsonNumber(event, "at", &renderedAt) &&
                         PlutoJsonNumber(event, "height", &renderedHeight) &&
                         fabs(renderedAt - gPreviewRequestAt) <= (0.5 / 30.0) &&
                         (int)renderedHeight == gPreviewRes;
-                    if (currentFrame) {
+                    if (currentRequest && frameMatchesRequest) {
                         if (strcmp(gPreviewTexturePath, previewPath) != 0) {
                             Texture2D nextFrame = LoadTexture(previewPath);
                             if (nextFrame.id) {
@@ -506,7 +506,11 @@ static void PlutoPollBackend(void) {
                                 snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not load rendered preview frame");
                             }
                         }
-                        gPreviewDirty = false;
+                        /* Keep showing completed frames during playback/scrubbing even if
+                           the playhead advanced while FFmpeg rendered this one. Request
+                           the newest time immediately after consuming the in-flight task. */
+                        gPreviewDirty = previewMoving &&
+                            fabsf(gPreviewRequestAt - gPlayhead) > (0.5f / 30.f);
                     } else {
                         gPreviewDirty = true;
                     }
@@ -537,11 +541,8 @@ static void PlutoPollBackend(void) {
                 strncpy(asset->kind, kind, sizeof(asset->kind) - 1);
                 asset->duration = (float)duration;
                 asset->hasAudio = strstr(event, "\"hasAudio\":true") != NULL;
-                if (PlutoJsonString(event, "thumbnailPath", asset->thumbnailPath, sizeof(asset->thumbnailPath)))
-                    { asset->thumbnail = LoadTexture(asset->thumbnailPath); if (asset->thumbnail.id) SetTextureFilter(asset->thumbnail, TEXTURE_FILTER_BILINEAR); }
                 if (PlutoJsonString(event, "waveformPath", asset->waveformPath, sizeof(asset->waveformPath))) {
-                    asset->waveform = asset->thumbnailPath[0] && strcmp(asset->thumbnailPath, asset->waveformPath) == 0
-                        ? asset->thumbnail : LoadTexture(asset->waveformPath);
+                    asset->waveform = LoadTexture(asset->waveformPath);
                     if (asset->waveform.id) SetTextureFilter(asset->waveform, TEXTURE_FILTER_BILINEAR);
                 }
                 gBackendMessage[0] = 0;
@@ -556,9 +557,7 @@ static void PlutoPollBackend(void) {
 static void PlutoUnloadMedia(void) {
     for (int i = 0; i < gImportedCount; i++)
     {
-        if (gImported[i].thumbnail.id) UnloadTexture(gImported[i].thumbnail);
-        if (gImported[i].waveform.id && gImported[i].waveform.id != gImported[i].thumbnail.id)
-            UnloadTexture(gImported[i].waveform);
+        if (gImported[i].waveform.id) UnloadTexture(gImported[i].waveform);
     }
     if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
     gPreviewTexturePath[0] = 0;

@@ -346,6 +346,7 @@ int main(void) {
 
     int observedPreviewRes = gPreviewRes;
     float observedPlayhead = gPlayhead;
+    float playbackRemainder = 0.f;
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (gPreviewRes != observedPreviewRes) {
@@ -391,12 +392,18 @@ int main(void) {
         }
         if (gTimelinePlaying) {
             float end = TimelineDuration();
-            gPlayhead = floorf((gPlayhead + gDt) * 30.f + .5f) / 30.f;
-            if (gPlayhead >= end) {
-                gPlayhead = end; gTimelinePlaying = false;
+            playbackRemainder += gDt;
+            const float frameDuration = 1.f / 30.f;
+            if (playbackRemainder >= frameDuration) {
+                float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
+                playbackRemainder -= advance;
+                gPlayhead += advance;
+                if (gPlayhead >= end) {
+                    gPlayhead = end; gTimelinePlaying = false; playbackRemainder = 0.f;
+                }
+                gPreviewDirty = true;
             }
-            gPreviewDirty = true;
-        }
+        } else playbackRemainder = 0.f;
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         Vector2 currentDpi = GetWindowScaleDPI();

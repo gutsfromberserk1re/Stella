@@ -29,56 +29,77 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let detail = &colors["detail"];
     let brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
     let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
-    let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0 + n(color, "vibrance", 0.0) / 150.0).clamp(0.0, 3.0);
+    let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0).clamp(0.0, 3.0);
     if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001 {
         filters.push(format!("eq=brightness={brightness:.5}:contrast={contrast:.5}:saturation={saturation:.5}"));
     }
+    let vibrance = (n(color, "vibrance", 0.0) / 100.0).clamp(-1.0, 1.0);
+    if vibrance.abs() > 0.001 { filters.push(format!("vibrance=intensity={vibrance:.4}")); }
+
     let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0) as usize;
     let hsl_key = hsl_index.to_string();
     let hsl = &colors["hsl"][hsl_key.as_str()];
     let hsl_hue = n(hsl, "hue", 0.0);
-    let hsl_saturation = (1.0 + n(hsl, "saturation", 0.0) / 100.0).clamp(0.0, 2.0);
-    let hsl_lightness = n(hsl, "lightness", 0.0) / 200.0;
-    if hsl_hue.abs() > 0.001 || (hsl_saturation - 1.0).abs() > 0.001 {
-        filters.push(format!("hue=h={hsl_hue:.3}:s={hsl_saturation:.4}"));
+    let hsl_saturation = (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0);
+    let hsl_intensity = (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5);
+    let hsl_range = ["a", "r", "r+y", "y", "g", "c", "b", "b+m", "m+r"][hsl_index];
+    if hsl_hue.abs() > 0.001 || hsl_saturation.abs() > 0.001 || hsl_intensity.abs() > 0.001 {
+        filters.push(format!("huesaturation=colors={hsl_range}:hue={hsl_hue:.3}:saturation={hsl_saturation:.4}:intensity={hsl_intensity:.4}:strength=100:lightness=1"));
     }
-    if hsl_lightness.abs() > 0.001 {
-        filters.push(format!("eq=brightness={hsl_lightness:.5}"));
-    }
+
+    /* Keep all color-balance controls in one shared operation for preview/export. */
+    let preset = effects["preset"]["id"].as_str().unwrap_or("none");
+    let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
+    let mut balance = [0.0_f64; 9]; // shadows RGB, midtones RGB, highlights RGB
     let shadow_lift = ((n(light, "shadows", 0.0) + n(light, "blacks", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
     let highlight_gain = ((n(light, "highlights", 0.0) + n(light, "whites", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
-    if shadow_lift.abs() > 0.001 || highlight_gain.abs() > 0.001 {
-        filters.push(format!("colorbalance=rs={shadow_lift:.4}:gs={shadow_lift:.4}:bs={shadow_lift:.4}:rh={highlight_gain:.4}:gh={highlight_gain:.4}:bh={highlight_gain:.4}"));
-    }
+    for channel in 0..3 { balance[channel] += shadow_lift; }
+    for channel in 6..9 { balance[channel] += highlight_gain; }
+
     let temperature = (n(color, "temperature", 0.0) / 100.0).clamp(-1.0, 1.0);
-    if temperature.abs() > 0.01 {
-        filters.push(format!("colorbalance=rs={temperature:.4}:bs={:.4}", -temperature));
+    for band in [0usize, 3, 6] {
+        balance[band] += temperature;
+        balance[band + 2] -= temperature;
     }
-    for (key, wheel_channel) in [("shadows", "s"), ("tint", "m"), ("highlights", "h")] {
+
+    for (key, band) in [("shadows", 0usize), ("tint", 3usize), ("highlights", 6usize)] {
         if let Some(wheel_data) = colors["grading"][key].as_object() {
             let amount = wheel_data.get("amount").and_then(Value::as_f64).unwrap_or(0.0) / 100.0 * 0.3;
             let angle = wheel_data.get("hue").and_then(Value::as_f64).unwrap_or(0.0).to_radians();
             if amount.abs() > 0.001 {
-                let r = amount * angle.cos(); let b = amount * angle.sin();
-                filters.push(format!("colorbalance=r{wheel_channel}={r:.4}:b{wheel_channel}={b:.4}"));
+                balance[band] += amount * angle.cos();
+                balance[band + 1] += amount * (angle - std::f64::consts::TAU / 3.0).cos();
+                balance[band + 2] += amount * (angle + std::f64::consts::TAU / 3.0).cos();
             }
         }
     }
+
+    match preset {
+        "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * intensity; balance[band + 2] -= 0.10 * intensity; },
+        "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * intensity; balance[band + 2] += 0.12 * intensity; },
+        "retro" => for band in [0usize, 3, 6] { balance[band] += 0.15 * intensity; balance[band + 2] -= 0.12 * intensity; },
+        _ => {}
+    }
+    if balance.iter().any(|value| value.abs() > 0.001) {
+        for value in &mut balance { *value = (*value).clamp(-1.0, 1.0); }
+        filters.push(format!("colorbalance=rs={:.4}:gs={:.4}:bs={:.4}:rm={:.4}:gm={:.4}:bm={:.4}:rh={:.4}:gh={:.4}:bh={:.4}",
+            balance[0], balance[1], balance[2], balance[3], balance[4], balance[5], balance[6], balance[7], balance[8]));
+    }
+
     let sharpness = (n(detail, "sharpness", 0.0) / 100.0).clamp(0.0, 1.0);
     if sharpness > 0.001 { filters.push(format!("unsharp=5:5:{sharpness:.4}:5:5:0")); }
     let color_vignette = n(detail, "vignette", 0.0);
-    if color_vignette.abs() > 1.0 { filters.push(format!("vignette=angle={:.5}", (0.35 + color_vignette.abs() / 100.0 * 0.55).clamp(0.1, 1.2))); }
+    if color_vignette.abs() > 1.0 {
+        let mode = if color_vignette < 0.0 { "backward" } else { "forward" };
+        filters.push(format!("vignette=angle={:.5}:mode={mode}", (0.35 + color_vignette.abs() / 100.0 * 0.55).clamp(0.1, 1.2)));
+    }
 
-    let preset = effects["preset"]["id"].as_str().unwrap_or("none");
-    let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
     match preset {
         "vivid" => filters.push(format!("eq=saturation={:.3}:contrast=1.08", 1.0 + 0.7 * intensity)),
         "noir" => { filters.push(format!("hue=s={:.3}", 1.0 - intensity)); filters.push(format!("eq=contrast={:.3}:brightness={:.3}", 1.0 + 0.2 * intensity, -0.02 * intensity)); },
         "fade" => filters.push(format!("eq=contrast={:.3}:brightness={:.3}:saturation={:.3}", 1.0 - 0.16 * intensity, 0.08 * intensity, 1.0 - 0.2 * intensity)),
-        "warm" => filters.push(format!("colorbalance=rs={:.3}:bs={:.3}", 0.12 * intensity, -0.1 * intensity)),
-        "cool" => filters.push(format!("colorbalance=rs={:.3}:bs={:.3}", -0.08 * intensity, 0.12 * intensity)),
         "cinema" => filters.push(format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.15 * intensity, 1.0 - 0.15 * intensity)),
-        "retro" => { filters.push(format!("colorbalance=rs={:.3}:bs={:.3}", 0.15 * intensity, -0.12 * intensity)); filters.push(format!("noise=alls={:.2}:allf=t+u", 12.0 * intensity)); },
+        "retro" => filters.push(format!("noise=alls={:.2}:allf=t+u", 12.0 * intensity)),
         _ => {}
     }
     if enabled(effects, "blur") {

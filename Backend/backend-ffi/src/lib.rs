@@ -266,14 +266,12 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let media_hash = media_content_hash(path)?;
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.png"));
-    let waveform = cache_dir.join(format!("{media_hash:016x}-wave.png"));
+    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v2.png"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-720p.mp4"))
     } else { std::path::PathBuf::new() };
     if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
-    let scale_filter = "scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=0x17181c";
     let waveform_path = if has_audio {
         let generated = if waveform.is_file() {
             true
@@ -281,34 +279,18 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             media_command(&ffmpeg)
                 .args(["-v", "error", "-i"])
                 .arg(path)
-                .args(["-filter_complex", "showwavespic=s=384x216:colors=0x9b70c8", "-frames:v", "1", "-y"])
+                .args(["-filter_complex", "showwavespic=s=1024x256:colors=0x55aaff:scale=sqrt", "-frames:v", "1", "-y"])
                 .arg(&waveform)
                 .status()
                 .is_ok_and(|status| status.success())
         };
         generated.then(|| waveform.to_string_lossy().into_owned())
     } else { None };
-    let thumbnail_path = if kind == "audio" {
-        waveform_path.clone()
-    } else {
-        let generated = if thumbnail.is_file() {
-            true
-        } else {
-            let mut command = media_command(&ffmpeg);
-            command.args(["-v", "error"]);
-            if kind == "video" {
-                command.args(["-ss", &format!("{:.3}", (duration * 0.35).max(0.0))]);
-            }
-            command.arg("-i").arg(path).args(["-frames:v", "1", "-vf", scale_filter, "-y"]).arg(&thumbnail);
-            command.status().is_ok_and(|status| status.success())
-        };
-        generated.then(|| thumbnail.to_string_lossy().into_owned())
-    };
     Ok(json!({
         "path": path.to_string_lossy(), "name": name, "duration": duration,
         "kind": kind, "hasAudio": has_audio,
         "proxyPath": proxy.to_string_lossy(),
-        "thumbnailPath": thumbnail_path, "filmstripPath": Value::Null, "waveformPath": waveform_path
+        "filmstripPath": Value::Null, "waveformPath": waveform_path
     }))
 }
 

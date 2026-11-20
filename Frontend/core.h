@@ -175,8 +175,8 @@ static bool gScrubCursor;
 #define MAX_IMPORTED_MEDIA 64
 typedef struct {
     char path[1024], name[260], kind[16];
-    char thumbnailPath[1024], waveformPath[1024];
-    Texture2D thumbnail, waveform;
+    char waveformPath[1024];
+    Texture2D waveform;
     float duration;
     bool hasAudio;
 } ImportedMedia;

@@ -173,10 +173,11 @@ static void TickState(void) {
         gRot += (gRotT - gRot) * k;
         if (fabsf(gRotT - gRot) < 0.02f) gRot = gRotT;
     }
+    float wheelFollow = 1.f - expf(-14.f * gDt);
     for (int i = 0; i < 3; i++) {
-        if (gWhDrag[i]) continue;
-        gWh[i].x += (gWhT[i].x - gWh[i].x) * k; gWh[i].y += (gWhT[i].y - gWh[i].y) * k;
-        if (fabsf(gWhT[i].x - gWh[i].x) < 0.002f && fabsf(gWhT[i].y - gWh[i].y) < 0.002f) gWh[i] = gWhT[i];
+        gWh[i].x += (gWhT[i].x - gWh[i].x) * wheelFollow;
+        gWh[i].y += (gWhT[i].y - gWh[i].y) * wheelFollow;
+        if (fabsf(gWhT[i].x - gWh[i].x) < 0.001f && fabsf(gWhT[i].y - gWh[i].y) < 0.001f) gWh[i] = gWhT[i];
     }
 }
 
@@ -213,7 +214,8 @@ static void WheelLogic(int i, Clay_ElementId id) {
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && rad > 1.f) {
             float px = dx / (rad - 1.f), py = dy / (rad - 1.f), l = sqrtf(px * px + py * py);
             if (l > 1.f) { px /= l; py /= l; }
-            gWh[i] = gWhT[i] = (Vector2){px, py};
+            /* Slightly soften the wheel response and let TickState ease the puck into place. */
+            gWhT[i] = (Vector2){px * 0.92f, py * 0.92f};
             gWhDrag[i] = true;
         } else gDragWheel = -1;
     }
@@ -430,11 +432,13 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l1, 19, C_ICON, 0); }
             NumField(n * 2, a, unit);
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_C}}) {
+        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
+            HSPACE
             if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) {
                 gLink[link] = !gLink[link];
                 PlutoTimelineSetBoolProperty(link == 0 ? "props.transform.position.linked" : "props.transform.scale.linked", gLink[link]);
             }
+            HSPACE
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l2, 19, C_ICON, 0); }
@@ -851,7 +855,7 @@ static void FilterThumb(int i) {
 
 /* ---- video effects (accordion: one effect open at a time) ---- */
 #define FX_ITEM_H 44.f
-#define FX_BODY_H 160.f   /* 12 pad | 26 enabled row | 10 | 44 param | 10 | 44 param | 14 pad */
+#define FX_BODY_H 171.f   /* accounts for padded fixed rows, sliders, and both parameter gaps */
 typedef struct { const char *name; const char *p1, *p2; bool angle; } FxDef;
 static const FxDef kFx[4] = {
     {"Chromatic aberration", "Amount",    "Angle", true},
@@ -1053,9 +1057,13 @@ static void EffectsView(void) {
             CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}}, .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
-                    TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                        TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+                    }
                 } else {
-                    TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                        TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                    }
                     const char *names[5] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris"};
                     const char *keys[5] = {"none", "crossfade", "dip", "wipe", "iris"};
                     for (int row = 0; row < 3; row++) {
@@ -1150,10 +1158,10 @@ static void EffectsView(void) {
         oi[i] = Spring(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 680.f, 32.f);
         if (oi[i] < 0.f) oi[i] = 0.f;
         if (oi[i] > 1.04f) oi[i] = 1.04f;
-        hb[i] = roundf(oi[i] * (FX_BODY_H + 8.f));
-        sum += hb[i];
+        hb[i] = roundf(oi[i] * (FX_BODY_H + 12.5f));
+        if (hb[i] >= 1.f) sum += hb[i] + 2.25f; /* wrapper's FIX padding */
     }
-    float lh = roundf(ov * (10.f + (4.f + EXTRA_FX_COUNT) * FX_ITEM_H + 13.f * 8.f + sum));
+    float lh = roundf(ov * (12.25f + (4.f + EXTRA_FX_COUNT) * (FX_ITEM_H + 2.25f) + 13.f * 8.f + sum));
     CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId vid = CLAY_ID("VfxHdr");
         Bs vb = Interact(vid);

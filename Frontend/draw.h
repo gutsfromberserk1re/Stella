@@ -7,6 +7,20 @@ static Color RC(Clay_Color c) { return (Color){U8(c.r), U8(c.g), U8(c.b), U8(c.a
 static Color LerpC(Color a, Color b, float t) {
     return (Color){U8(a.r + (b.r - a.r) * t), U8(a.g + (b.g - a.g) * t), U8(a.b + (b.b - a.b) * t), U8(a.a + (b.a - a.a) * t)};
 }
+static Color MediaSwatch(const char *key, int fallback) {
+    static const Color palette[] = {
+        {130, 77, 57, 255}, {143, 96, 57, 255}, {126, 76, 72, 255},
+        {91, 112, 77, 255}, {113, 112, 65, 255}, {79, 111, 91, 255},
+        {125, 105, 78, 255}, {102, 91, 72, 255}
+    };
+    uint32_t hash = 2166136261u ^ (uint32_t)fallback;
+    if (key) for (const unsigned char *p = (const unsigned char *)key; *p; p++) hash = (hash ^ *p) * 16777619u;
+    return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
+}
+static Color ShadeMediaColor(Color color, float amount) {
+    float scale = 1.f + amount;
+    return (Color){U8(color.r * scale), U8(color.g * scale), U8(color.b * scale), color.a};
+}
 
 static void FillRR(Rectangle r, float rad, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
@@ -316,18 +330,9 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     case K_THUMB: {
         int idx = (cu->i >> 4) & 255;
         bool imported = (cu->i & 0x1000) != 0;
-        bool hasTexture = imported && idx < gImportedCount && gImported[idx].thumbnail.id != 0;
-        if (hasTexture) {
-            Texture2D tex = gImported[idx].thumbnail;
-            float srcW = (float)tex.width, srcH = (float)tex.height;
-            float srcAspect = srcW / fmaxf(1.f, srcH), dstAspect = r.width / fmaxf(1.f, r.height);
-            Rectangle src = {0, 0, srcW, srcH};
-            if (srcAspect > dstAspect) { src.width = srcH * dstAspect; src.x = (srcW - src.width) * 0.5f; }
-            else if (srcAspect < dstAspect) { src.height = srcW / dstAspect; src.y = (srcH - src.height) * 0.5f; }
-            DrawTexturePro(tex, src, r, (Vector2){0, 0}, 0.f, WHITE);
-        } else {
-            GradRR(r, 10, RC(cu->a), RC(cu->b));
-        }
+        const char *key = imported && idx < gImportedCount ? gImported[idx].path : NULL;
+        Color swatch = MediaSwatch(key, idx);
+        GradRR(r, 10, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
         FillRR(r, 10, (Color){255, 255, 255, U8(20 * cu->f)});
         StrokeRR(r, 10, 1, (Color){255, 255, 255, U8(20 + 60 * cu->f)});
         if (cu->f > .03f) {
@@ -377,13 +382,11 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         }
         Ring(c, rad, 2, (Color){38, 39, 45, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 8.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 3.f, (Color){10, 10, 14, 120});
+        float dot = 9.5f + 1.5f * cu->f;
+        DrawCircleV(p, dot + 4.f, (Color){10, 10, 14, 145});
         if (cu->v > .5f) {
-            DrawCircleV(p, dot + 1.8f, (Color){244, 245, 248, 255});
-            DrawCircleV(p, dot - .5f, RC(cu->c));
-        } else {
-            DrawCircleV(p, dot + 1.f, (Color){226, 227, 231, 255});
+            DrawCircleV(p, dot + 2.6f, (Color){20, 21, 25, 255});
+            DrawCircleV(p, dot, RC(cu->c));
         }
     } break;
 
@@ -498,37 +501,25 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     } break;
 
     case K_CLIP: {
-        GradRR(r, 6, RC(cu->a), RC(cu->b));
         int clipIndex = cu->i >> 1;
         TimelineClipUi *clip = clipIndex >= 0 && clipIndex < gTimelineClipCount ? &gTimelineClips[clipIndex] : NULL;
-        Texture2D thumb = {0}, wave = {0};
+        const char *mediaKey = clip ? clip->path : NULL;
+        Color swatch = MediaSwatch(mediaKey, clipIndex);
+        GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        Texture2D wave = {0};
         if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
             ImportedMedia *media = &gImported[clip->mediaIndex];
-            thumb = media->thumbnail;
             wave = media->waveform;
-        }
-        if (thumb.id && clip && clip->track < 4 && r.width >= 46.f) {
-            float imageY = r.y + 2.f, imageH = fmaxf(4.f, r.height - 18.f);
-            float tileW = imageH * 16.f / 9.f;
-            for (float x = r.x + 2.f; x < r.x + r.width - 2.f; x += tileW) {
-                float drawW = fminf(tileW, r.x + r.width - 2.f - x);
-                float aspect = (float)thumb.width / fmaxf(1.f, (float)thumb.height);
-                float targetAspect = drawW / fmaxf(1.f, imageH);
-                Rectangle source = {0, 0, (float)thumb.width, (float)thumb.height};
-                if (aspect > targetAspect) { source.width = source.height * targetAspect; source.x = (thumb.width - source.width) * .5f; }
-                else if (aspect < targetAspect) { source.height = source.width / targetAspect; source.y = (thumb.height - source.height) * .5f; }
-                DrawTexturePro(thumb, source, (Rectangle){x, imageY, drawW, imageH}, (Vector2){0, 0}, 0.f, WHITE);
-            }
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
         if (wave.id && hasAudio) {
-            Rectangle waveformRect = {r.x + 6, r.y + r.height - 15, fmaxf(0.f, r.width - 12), 12};
+            Rectangle waveformRect = {r.x + 8, r.y + r.height - 22, fmaxf(0.f, r.width - 16), 19};
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
-                           (Vector2){0, 0}, 0.f, (Color){225, 232, 255, 185});
+                           (Vector2){0, 0}, 0.f, WHITE);
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
-        StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){148, 105, 178, 255});
+        StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){113, 116, 124, 255});
         if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
             TimelineClipUi *clip = &gTimelineClips[clipIndex];
             for (int k = 0; k < clip->keyframeCount; k++) {
