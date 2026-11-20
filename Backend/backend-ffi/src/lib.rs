@@ -200,8 +200,6 @@ fn media_content_hash(path: &std::path::Path) -> Result<u64, String> {
 
 fn inspect_media(path: &str) -> Result<Value, String> {
     use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
         path::Path,
     };
     let path = Path::new(path);
@@ -508,6 +506,7 @@ fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -
     }
     let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
     for (i, clip) in video_clips.iter().enumerate() {
+        let value = to_value(clip);
         let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
         let label = format!("vbody{i}");
         graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
@@ -744,7 +743,7 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         let label = format!("pv{n}");
         let next = format!("base{}", n + 1);
         graph.push(format!("[{input}:v]{vf}[{label}]"));
-        let overlay_x = if let Some((kind, duration)) = incoming.as_ref()
+        let overlay_x = if let Some((_kind, duration)) = incoming.as_ref()
             .filter(|(kind, _)| kind.as_str() == "slide" && at < clip.start) {
             let progress = ((at - render_start) / *duration).clamp(0.0, 1.0);
             format!("({x})+{:.3}", width as f64 * (1.0 - progress))
