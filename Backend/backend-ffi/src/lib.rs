@@ -7,7 +7,7 @@ use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
 mod filters;
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     ffi::{CStr, CString},
     hash::{Hash, Hasher},
     os::raw::c_char,
@@ -26,39 +26,99 @@ struct Backend {
     redo: Mutex<Vec<Timeline>>,
     next_task: AtomicU64,
     task_tx: Sender<(u64, Value)>,
+    proxy_task_tx: Sender<(u64, Value)>,
     event_rx: Mutex<Receiver<String>>,
     preview_inflight: Arc<AtomicBool>,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
+static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
+static PREVIEW_MEMORY: OnceLock<Mutex<VecDeque<(std::path::PathBuf, Vec<u8>)>>> = OnceLock::new();
+const PREVIEW_MEMORY_LIMIT: usize = 24 * 1024 * 1024;
+
+fn preview_memory_get(path: &std::path::Path) -> Option<Vec<u8>> {
+    let cache = PREVIEW_MEMORY.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut cache = cache.lock().ok()?;
+    let index = cache.iter().position(|(key, _)| key == path)?;
+    let entry = cache.remove(index)?;
+    let bytes = entry.1.clone();
+    cache.push_front(entry);
+    Some(bytes)
+}
+
+fn preview_memory_put(path: &std::path::Path) {
+    let Ok(bytes) = std::fs::read(path) else { return; };
+    if bytes.is_empty() || bytes.len() > PREVIEW_MEMORY_LIMIT { return; }
+    let cache = PREVIEW_MEMORY.get_or_init(|| Mutex::new(VecDeque::new()));
+    let Ok(mut cache) = cache.lock() else { return; };
+    cache.retain(|(key, _)| key != path);
+    let mut size: usize = cache.iter().map(|(_, data)| data.len()).sum();
+    while size + bytes.len() > PREVIEW_MEMORY_LIMIT {
+        let Some((_, old)) = cache.pop_back() else { break; };
+        size = size.saturating_sub(old.len());
+    }
+    cache.push_front((path.to_path_buf(), bytes));
+}
+
+fn remember_media_proxy(source: &str, proxy: std::path::PathBuf) {
+    let cache = MEDIA_PROXIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut cache) = cache.lock() { cache.insert(source.to_owned(), proxy); }
+}
+
+fn preview_source_path(clip: &Clip) -> String {
+    let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
+    let Some(cache) = MEDIA_PROXIES.get() else { return source.to_owned(); };
+    let Ok(cache) = cache.lock() else { return source.to_owned(); };
+    cache.get(source).filter(|proxy| proxy.is_file())
+        .map(|proxy| proxy.to_string_lossy().into_owned())
+        .unwrap_or_else(|| source.to_owned())
+}
 
 fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
+        let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
         let (event_tx, event_rx) = mpsc::channel::<String>();
         let preview_inflight = Arc::new(AtomicBool::new(false));
         let worker_preview_inflight = Arc::clone(&preview_inflight);
+        let proxy_events = event_tx.clone();
+        let proxy_tasks = proxy_task_tx.clone();
         thread::Builder::new()
             .name("pluto-media-worker".into())
-            .spawn(move || media_worker(task_rx, event_tx, worker_preview_inflight))
+            .spawn(move || media_worker(task_rx, event_tx, worker_preview_inflight, proxy_tasks))
             .expect("failed to start Pluto media worker");
+        thread::Builder::new()
+            .name("stella-proxy-worker".into())
+            .spawn(move || proxy_worker(proxy_task_rx, proxy_events))
+            .expect("failed to start Stella proxy worker");
         Backend {
             timeline: Mutex::new(Timeline::default()),
             undo: Mutex::new(Vec::new()),
             redo: Mutex::new(Vec::new()),
             next_task: AtomicU64::new(1),
             task_tx,
+            proxy_task_tx,
             event_rx: Mutex::new(event_rx),
             preview_inflight,
         }
     })
 }
 
-fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
+fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>, proxy_tasks: Sender<(u64, Value)>) {
     while let Ok((id, request)) = tasks.recv() {
         let command = request["command"].as_str().unwrap_or_default().to_owned();
         let result = match command.as_str() {
-            "inspect_media" => inspect_media(request["path"].as_str().unwrap_or_default()),
+            "inspect_media" => {
+                let source = request["path"].as_str().unwrap_or_default();
+                let result = inspect_media(source);
+                if let Ok(metadata) = &result {
+                    if let Some(proxy_path) = metadata["proxyPath"].as_str().filter(|value| !value.is_empty()) {
+                        let proxy_request = json!({"command":"generate_proxy", "path":source, "proxyPath":proxy_path});
+                        let _ = proxy_tasks.send((id | (1u64 << 63), proxy_request));
+                    }
+                }
+                result
+            }
             "preview_frame" => render_preview(&request, id),
             "export_project" => export_project(&request, id),
             "" => Err("Background command is required".into()),
@@ -79,6 +139,62 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_i
             break;
         }
     }
+}
+
+fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
+    while let Ok((id, request)) = tasks.recv() {
+        let source = request["path"].as_str().unwrap_or_default();
+        let proxy = request["proxyPath"].as_str().unwrap_or_default();
+        let result = (|| -> Result<Value, String> {
+            if source.is_empty() || proxy.is_empty() { return Err("Proxy source and destination are required".into()); }
+            let destination = std::path::Path::new(proxy);
+            if destination.is_file() { return Ok(json!({"proxyPath": proxy, "cached": true})); }
+            if !std::path::Path::new(source).is_file() { return Err(format!("Media file is missing: {source}")); }
+            let ffmpeg = multimedia_binary("ffmpeg");
+            let temporary = destination.with_file_name(format!("proxy-render-{id}.mp4"));
+            let mut command = media_command(&ffmpeg);
+            command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
+                .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                       "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                       "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
+                .arg(&temporary);
+            let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
+            if !output.status.success() {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(ffmpeg_error(output));
+            }
+            if !destination.exists() {
+                std::fs::rename(&temporary, destination).map_err(|e| format!("Could not finalize media proxy: {e}"))?;
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            Ok(json!({"proxyPath": proxy, "cached": false}))
+        })();
+        let response = match result {
+            Ok(value) => {
+                let mut fields = value.as_object().cloned().unwrap_or_default();
+                fields.insert("requestId".into(), json!(id));
+                fields.insert("command".into(), json!("generate_proxy"));
+                fields.insert("ok".into(), json!(true));
+                Value::Object(fields)
+            }
+            Err(error) => json!({"requestId": id, "command": "generate_proxy", "ok": false, "error": error}),
+        };
+        if events.send(response.to_string()).is_err() { break; }
+    }
+}
+
+fn media_content_hash(path: &std::path::Path) -> Result<u64, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Could not read media for cache: {e}"))?;
+    let mut hasher = DefaultHasher::new();
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut block).map_err(|e| format!("Could not hash media: {e}"))?;
+        if read == 0 { break; }
+        block[..read].hash(&mut hasher);
+    }
+    Ok(hasher.finish())
 }
 
 fn inspect_media(path: &str) -> Result<Value, String> {
@@ -146,14 +262,17 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     }
 
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Media");
-    let mut hasher = DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
+    let media_hash = media_content_hash(path)?;
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
-    let thumbnail = cache_dir.join(format!("{:016x}-thumb.png", hasher.finish()));
-    let waveform = cache_dir.join(format!("{:016x}-wave.png", hasher.finish()));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.png"));
+    let waveform = cache_dir.join(format!("{media_hash:016x}-wave.png"));
+    let proxy = if kind == "video" {
+        cache_dir.join(format!("{media_hash:016x}-proxy-720p.mp4"))
+    } else { std::path::PathBuf::new() };
+    if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
-    let scale_filter = "scale=384:216:force_original_aspect_ratio=decrease,pad=384:216:(ow-iw)/2:(oh-ih)/2:color=0x17181c";
+    let scale_filter = "scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=0x17181c";
     let waveform_path = if has_audio {
         let generated = if waveform.is_file() {
             true
@@ -187,6 +306,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     Ok(json!({
         "path": path.to_string_lossy(), "name": name, "duration": duration,
         "kind": kind, "hasAudio": has_audio,
+        "proxyPath": proxy.to_string_lossy(),
         "thumbnailPath": thumbnail_path, "filmstripPath": Value::Null, "waveformPath": waveform_path
     }))
 }
@@ -268,7 +388,7 @@ fn render_inputs(timeline: &Timeline) -> Result<(Vec<(String, bool)>, HashMap<St
     let mut path_indices = HashMap::with_capacity(clips.len());
     for clip in clips {
         let path = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
-        if !std::path::Path::new(path).is_file() { return Err(format!("Media file is missing: {path}")); }
+        if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
         if let Some(&input_index) = path_indices.get(path) {
             indices.insert(clip.id.clone(), input_index);
             continue;
@@ -447,8 +567,8 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     for clip in &active {
-        let path = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
-        if !std::path::Path::new(path).is_file() { return Err(format!("Media file is missing: {path}")); }
+        let path = preview_source_path(clip);
+        if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
     }
     let out = preview_cache_path(&timeline, at, height)?;
     std::fs::create_dir_all(out.parent().ok_or("Invalid preview cache path")?).map_err(|e| e.to_string())?;
@@ -461,7 +581,7 @@ fn render_preview(request: &Value, id: u64) -> Result<Value, String> {
     let mut inputs: Vec<(String, bool, f64)> = Vec::new();
     let mut base = "base0".to_owned();
     for (n, clip) in active.iter().enumerate() {
-        let path = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let path = preview_source_path(clip);
         if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
         let image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
         let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
@@ -781,7 +901,8 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             };
         }
         let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
-        if backend.task_tx.send((id, request)).is_ok() {
+        let sender = if command == "generate_proxy" { &backend.proxy_task_tx } else { &backend.task_tx };
+        if sender.send((id, request)).is_ok() {
             id
         } else {
             if is_preview { backend.preview_inflight.store(false, Ordering::Release); }

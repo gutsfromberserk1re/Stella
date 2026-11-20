@@ -344,9 +344,38 @@ int main(void) {
     Clay_Initialize(arena, (Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()}, (Clay_ErrorHandler){OnClayError, 0});
     Clay_SetMeasureTextFunction(MeasureTxt, NULL);
 
+    int observedPreviewRes = gPreviewRes;
+    float observedPlayhead = gPlayhead;
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
+        if (gPreviewRes != observedPreviewRes) {
+            observedPreviewRes = gPreviewRes;
+            gPreviewDirty = true;
+            gPreviewDebounce = 1.f;
+        }
+        if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
+            observedPlayhead = gPlayhead;
+            if (!gTimelinePlaying && !gTimelineScrubbing) {
+                gPreviewDirty = true;
+                gPreviewDebounce = 1.f;
+            }
+        }
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
+            (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
+            int splitCount = 0;
+            for (int i = 0; i < gTimelineClipCount; i++) {
+                if (gTimelineMultiSelect[i] && gPlayhead > gTimelineClips[i].start + .001f &&
+                    gPlayhead < gTimelineClips[i].start + gTimelineClips[i].duration - .001f) {
+                    PlutoTimelineSplit(i, gPlayhead);
+                    splitCount++;
+                }
+            }
+            if (!splitCount && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount &&
+                gPlayhead > gTimelineClips[gTimelineSelected].start + .001f &&
+                gPlayhead < gTimelineClips[gTimelineSelected].start + gTimelineClips[gTimelineSelected].duration - .001f)
+                PlutoTimelineSplit(gTimelineSelected, gPlayhead);
+        }
         if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
             gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
             PlutoTimelineDelete(gTimelineSelected);
@@ -358,6 +387,7 @@ int main(void) {
             frame += IsKeyPressed(KEY_RIGHT) ? 1.f : -1.f;
             gPlayhead = fmaxf(0.f, fminf(TimelineDuration(), frame / 30.f));
             gPreviewDirty = true;
+            gPreviewDebounce = 1.f;
         }
         if (gTimelinePlaying) {
             float end = TimelineDuration();

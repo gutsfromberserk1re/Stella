@@ -303,6 +303,8 @@ static bool ValBoxEditable(Clay_ElementId id, float *value, const char *unit,
 
 /* number field (GROW x 39): value + unit + up/down steppers */
 static const char *kNumPropertyPaths[4] = {"props.transform.position.x", "props.transform.position.y", "props.transform.scale.w", "props.transform.scale.h"};
+static int gLinkedNumDragField = -1;
+static float gLinkedNumOtherStart;
 
 static void CommitNumField(int n, float before) {
     if (n < 0 || n >= 4) return;
@@ -311,12 +313,14 @@ static void CommitNumField(int n, float before) {
     int other = n ^ 1;
     if (n >= 2) {
         float ratio = fabsf(before) > 0.0001f ? gNum[n] / before : 1.f;
-        gNum[other] = fmaxf(0.f, gNum[other] * ratio);
+        float otherStart = gLinkedNumDragField == n ? gLinkedNumOtherStart : gNum[other];
+        gNum[other] = fmaxf(0.f, otherStart * ratio);
     } else gNum[other] = gNum[n];
     char updates[384];
     snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
              kNumPropertyPaths[n], gNum[n], kNumPropertyPaths[other], gNum[other]);
     PlutoTimelineSetPropertiesJson(updates);
+    if (gLinkedNumDragField == n) gLinkedNumDragField = -1;
 }
 
 static void NumField(int n, float *v, const char *unit) {
@@ -325,7 +329,22 @@ static void NumField(int n, float *v, const char *unit) {
     Bs b = Interact(id);
     float before = gValueDragId == scrubId.id ? gValueDragStart : *v;
     bool changed = ValueFieldLogic(scrubId, v, .2f);
+    int linkedGroup = n < 2 ? 0 : 1;
+    bool linkedDrag = gLink[linkedGroup] && gValueDragId == scrubId.id && gValueDragging;
+    if (linkedDrag) {
+        int other = n ^ 1;
+        if (gLinkedNumDragField != n) {
+            gLinkedNumDragField = n;
+            gLinkedNumOtherStart = gNum[other];
+        }
+        if (n < 2) gNum[other] = *v;
+        else {
+            float ratio = fabsf(before) > 0.0001f ? *v / before : 1.f;
+            gNum[other] = fmaxf(0.f, gLinkedNumOtherStart * ratio);
+        }
+    }
     if (changed) CommitNumField(n, before);
+    else if (gLinkedNumDragField == n && gValueDragId != scrubId.id) gLinkedNumDragField = -1;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {

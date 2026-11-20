@@ -517,7 +517,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                 Rectangle source = {0, 0, (float)thumb.width, (float)thumb.height};
                 if (aspect > targetAspect) { source.width = source.height * targetAspect; source.x = (thumb.width - source.width) * .5f; }
                 else if (aspect < targetAspect) { source.height = source.width / targetAspect; source.y = (thumb.height - source.height) * .5f; }
-                DrawTexturePro(thumb, source, (Rectangle){x, imageY, drawW, imageH}, (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 178});
+                DrawTexturePro(thumb, source, (Rectangle){x, imageY, drawW, imageH}, (Vector2){0, 0}, 0.f, WHITE);
             }
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
@@ -699,10 +699,12 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         Rectangle r = gTransitionButtons[i].rect;
         bool hover = CheckCollisionPointRec(GetMousePosition(), r);
         if (hover) gHand = true;
-        DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f, hover ? (Color){62, 67, 78, 255} : (Color){30, 32, 38, 245});
-        DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f), r.width * .5f, (Color){112, 116, 126, 255});
-        DrawLineEx((Vector2){r.x + 6.f, r.y + 11.f}, (Vector2){r.x + 16.f, r.y + 11.f}, 1.7f, WHITE);
-        DrawLineEx((Vector2){r.x + 11.f, r.y + 6.f}, (Vector2){r.x + 11.f, r.y + 16.f}, 1.7f, WHITE);
+        DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
+                    hover ? (Color){46, 48, 55, 255} : (Color){30, 31, 36, 255});
+        DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f), r.width * .5f,
+                        hover ? (Color){78, 80, 89, 255} : (Color){52, 54, 61, 255});
+        DrawLineEx((Vector2){r.x + 6.f, r.y + 11.f}, (Vector2){r.x + 16.f, r.y + 11.f}, 1.7f, (Color){237, 237, 240, 255});
+        DrawLineEx((Vector2){r.x + 11.f, r.y + 6.f}, (Vector2){r.x + 11.f, r.y + 16.f}, 1.7f, (Color){237, 237, 240, 255});
     }
     if (gFadeA > 2.f && gFadeR.width > 0.f)
         GradRR(gFadeR, 22, (Color){28, 29, 32, U8(gFadeA)}, (Color){21, 22, 24, U8(gFadeA)});

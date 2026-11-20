@@ -91,6 +91,7 @@ static void TimelineClipLane(int track) {
     Clay_ElementId laneId = CLAY_IDI("TrackLane", track);
     Clay_BoundingBox lane = Clay_GetElementData(laneId).boundingBox;
     float pps = TimelinePps();
+    if (gTimelineTool == 2 && Clay_PointerOver(laneId)) gCross = true;
     bool transitionPressed = false;
     int order[MAX_TIMELINE_CLIPS], count = 0;
     for (int i = 0; i < gTimelineClipCount; i++) {
@@ -107,8 +108,11 @@ static void TimelineClipLane(int track) {
             int left = order[n], right = order[n + 1];
             float end = gTimelineClips[left].start + gTimelineClips[left].duration;
             if (fabsf(end - gTimelineClips[right].start) > .04f) continue;
-            Rectangle rect = {lane.x + gTimelinePan + end * TimelinePps() - 11.f,
-                              lane.y + (lane.height - 22.f) * .5f, 22.f, 22.f};
+            float leftEdge = lane.x + gTimelinePan + gTimelineClips[left].start * TimelinePps();
+            float rightEdge = lane.x + gTimelinePan + gTimelineClips[right].start * TimelinePps();
+            float leftVisibleEnd = leftEdge + fmaxf(46.f, gTimelineClips[left].duration * TimelinePps());
+            float joinX = fmaxf(rightEdge, leftVisibleEnd);
+            Rectangle rect = {joinX - 11.f, lane.y + (lane.height - 22.f) * .5f, 22.f, 22.f};
             gTransitionButtons[gTransitionButtonCount++] = (TransitionButton){rect, left};
             if (CheckCollisionPointRec(GetMousePosition(), rect) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 transitionPressed = true;
@@ -227,7 +231,12 @@ static void TimelineClipLane(int track) {
                     gMediaDropPreviewVisible = false;
                 }
             }
-            if (b.clicked && gTimelineTool == 2) PlutoTimelineSplit(i, gPlayhead);
+            if (b.clicked && gTimelineTool == 2) {
+                float cutAt = (GetMousePosition().x - lane.x - gTimelinePan) / pps;
+                cutAt = fmaxf(gTimelineClips[i].start + .001f,
+                              fminf(gTimelineClips[i].start + gTimelineClips[i].duration - .001f, cutAt));
+                PlutoTimelineSplit(i, cutAt);
+            }
             float cardWidth = fmaxf(1.f, width);
             bool clipSelected = gTimelineSelected == i || gTimelineMultiSelect[i];
             CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fminf(48.f, lane.height - 6.f))}, .padding = {8, 5, 2, 0}, .childGap = 6, .childAlignment = AL_Y},
@@ -422,7 +431,7 @@ static void Timeline(void) {
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
                         if (clip->keyframes[i] < gPlayhead - .02f && (prev < 0.f || clip->keyframes[i] > prev)) prev = clip->keyframes[i];
-                    gPlayhead = prev >= 0.f ? prev : 0.f; gPreviewDirty = true;
+                    gPlayhead = prev >= 0.f ? prev : 0.f; gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
                 if (IconBtn(CLAY_ID("KfAdd"), I_KF_DIAMOND, 28, 14, C_DIM, false, 8) && gTimelineSelected >= 0)
                     PlutoTimelineAddKeyframe(gPlayhead);
@@ -432,7 +441,7 @@ static void Timeline(void) {
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
                         if (clip->keyframes[i] > gPlayhead + .02f && (next < 0.f || clip->keyframes[i] < next)) next = clip->keyframes[i];
-                    gPlayhead = next >= 0.f ? next : TimelineDuration(); gPreviewDirty = true;
+                    gPlayhead = next >= 0.f ? next : TimelineDuration(); gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
             }
             GAPX(14)
