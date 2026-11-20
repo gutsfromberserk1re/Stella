@@ -506,7 +506,7 @@ fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -
     }
     let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
     for (i, clip) in video_clips.iter().enumerate() {
-        let value = to_value(clip);
+        let value = serde_json::to_value(clip).unwrap_or_default();
         let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
         let label = format!("vbody{i}");
         graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
