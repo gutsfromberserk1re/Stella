@@ -264,7 +264,10 @@ static Font FontPx(int slot, int px) {
     if (gFCN >= 160) return GetFontDefault();
     Font f = LoadFontEx(gFontPath[slot], px, gFcps, gFcpN);
     if (f.texture.id == 0) { gFontOK[slot] = false; return GetFontDefault(); }
-    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    /* UI glyphs are rasterized at their exact output pixel size. Point sampling
+       preserves the font rasterizer's own antialiased coverage without blurring
+       it again through bilinear filtering. TxtAt aligns glyph origins to pixels. */
+    SetTextureFilter(f.texture, TEXTURE_FILTER_POINT);
     gFC[gFCN].slot = slot; gFC[gFCN].px = px; gFC[gFCN].f = f;
     return gFC[gFCN++].f;
 }

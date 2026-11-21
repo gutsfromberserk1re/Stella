@@ -287,7 +287,7 @@ int main(void) {
     /* Prevent Windows bitmap-scaling the UI on scaled displays. */
     SetProcessDPIAware();
 #endif
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
     Vector2 dpiScale = GetWindowScaleDPI();
     gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));
@@ -347,9 +347,16 @@ int main(void) {
     int observedPreviewRes = gPreviewRes;
     int observedPreviewFps = gPreviewFps;
     float observedPlayhead = gPlayhead;
-    float playbackRemainder = 0.f;
+    double playbackLastTime = GetTime();
+    double playbackRequestRemainder = 0.0;
+    bool playbackWasPlaying = false;
+    bool observedPlaybackState = gTimelinePlaying;
     float navigationRepeat = 0.f;
     while (!WindowShouldClose() && !gWantQuit) {
+        const double frameNow = GetTime();
+        double playbackElapsed = frameNow - playbackLastTime;
+        if (playbackElapsed < 0.0) playbackElapsed = 0.0;
+        playbackLastTime = frameNow;
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (gPreviewRes != observedPreviewRes) {
             observedPreviewRes = gPreviewRes;
@@ -358,7 +365,7 @@ int main(void) {
         }
         if (gPreviewFps != observedPreviewFps) {
             observedPreviewFps = gPreviewFps;
-            playbackRemainder = 0.f;
+            playbackRequestRemainder = 0.0;
         }
         if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
             observedPlayhead = gPlayhead;
@@ -368,6 +375,11 @@ int main(void) {
             }
         }
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (gTimelinePlaying != observedPlaybackState) {
+            observedPlaybackState = gTimelinePlaying;
+            gPreviewDirty = true;
+            gPreviewDebounce = 1.f;
+        }
         if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
             (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
             int splitCount = 0;
@@ -412,19 +424,31 @@ int main(void) {
             gPreviewDebounce = 1.f;
         }
         if (gTimelinePlaying) {
-            float end = TimelineDuration();
-            playbackRemainder += gDt;
-            const float frameDuration = 1.f / (float)fmaxf(1, gPreviewFps);
-            if (playbackRemainder >= frameDuration) {
-                float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
-                playbackRemainder -= advance;
-                gPlayhead += advance;
-                if (gPlayhead >= end) {
-                    gPlayhead = end; gTimelinePlaying = false; playbackRemainder = 0.f;
-                }
+            // The playhead follows a monotonic wall clock, not the UI frame
+            // delta. A slow UI frame must not silently slow the video itself.
+            if (!playbackWasPlaying) playbackElapsed = 0.0;
+            const float end = TimelineDuration();
+            gPlayhead += (float)playbackElapsed;
+
+            // Request at the selected preview cadence. When decoding falls
+            // behind, the next request targets the current time instead of
+            // trying to render a backlog of obsolete frames.
+            playbackRequestRemainder += playbackElapsed;
+            const double frameDuration = 1.0 / (double)fmaxf(1, gPreviewFps);
+            if (playbackRequestRemainder >= frameDuration) {
+                playbackRequestRemainder = fmod(playbackRequestRemainder, frameDuration);
                 gPreviewDirty = true;
             }
-        } else playbackRemainder = 0.f;
+            if (gPlayhead >= end) {
+                gPlayhead = end;
+                gTimelinePlaying = false;
+                playbackRequestRemainder = 0.0;
+                gPreviewDirty = true;
+            }
+        } else {
+            playbackRequestRemainder = 0.0;
+        }
+        playbackWasPlaying = gTimelinePlaying;
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         Vector2 currentDpi = GetWindowScaleDPI();
@@ -433,7 +457,11 @@ int main(void) {
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
         Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, gCtrlDown ? 0.f : gWheelDelta * 28.f}, gDt);
+        /* Stella owns panel scrolling (gScroll / gAudS) and supplies the
+           resulting childOffset directly to Clay. Do not feed the same wheel
+           delta into Clay's independent scroll state as well: that double-
+           scrolls manually managed panes, especially long Effects inspectors. */
+        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, 0}, gDt);
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
         PlutoPollBackend();

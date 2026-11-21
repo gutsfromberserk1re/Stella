@@ -3,13 +3,21 @@ use serde_json::Value;
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
 fn n(value: &Value, key: &str, fallback: f64) -> f64 { number(value, key, fallback) }
-pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
+pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, fps: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
     let props = &clip["props"];
     let transform = &props["transform"];
     let effects = &props["effects"];
     let colors = &props["colors"];
     let source_start = n(clip, "sourceOffset", 0.0).max(0.0);
-    let mut filters = vec![format!("trim=start={source_start:.5}:duration={length:.5}"), format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
+    /* Downsample to the chosen timeline frame rate before scaling and the
+       expensive effects chain. Previously `-r` ran at the very end of the
+       graph, so selecting 24/30fps still evaluated blur, grain, color and
+       other filters on every decoded source frame. Export and preview share
+       this exact filter order, keeping their frame sampling consistent. */
+    let mut filters = vec![
+        format!("trim=start={source_start:.5}:duration={length:.5}"),
+        format!("fps={fps}"),
+        format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
         format!("scale={width}:{height}:force_original_aspect_ratio=decrease"),
         format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"), "setsar=1".into(), "format=rgba".into()];
 
@@ -311,3 +319,39 @@ pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     filters.join(",")
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::video_filters;
+    use serde_json::json;
+
+    #[test]
+    fn transform_controls_reach_the_shared_preview_and_export_filter_graph() {
+        let clip = json!({
+            "sourceOffset": 0.0,
+            "props": {"transform": {
+                "position": {"x": 120.0, "y": -45.0},
+                "scale": {"w": 125.0, "h": 80.0},
+                "rotation": 12.0,
+                "opacity": 65.0
+            }}
+        });
+        let (filters, x, y) = video_filters(&clip, 1280, 720, 30, 0.0, 3.0, None, None);
+        assert!(filters.contains("scale=iw*1.25000:ih*0.80000"));
+        assert!(filters.contains("rotate=0.209440"));
+        assert!(filters.contains("colorchannelmixer=aa=0.6500"));
+        assert!(x.contains("+80.000"));
+        assert!(y.contains("-30.000"));
+    }
+
+    #[test]
+    fn color_wheel_grading_changes_the_shared_filter_graph() {
+        let neutral = json!({"sourceOffset":0.0,"props":{}});
+        let graded = json!({"sourceOffset":0.0,"props":{"colors":{"grading":{"shadows":{"hue":35.0,"amount":42.0}}}}});
+        let (neutral_filters, _, _) = video_filters(&neutral, 1280, 720, 30, 0.0, 3.0, None, None);
+        let (graded_filters, _, _) = video_filters(&graded, 1280, 720, 30, 0.0, 3.0, None, None);
+        assert!(!neutral_filters.contains("colorbalance="));
+        assert!(graded_filters.contains("colorbalance="));
+    }
+}

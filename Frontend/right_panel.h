@@ -377,30 +377,34 @@ static void NumField(int n, float *v, const char *unit) {
 
 /* small field used by crop / distort panels (T, L, R, B, TL, TR, BL, BR).
    Deliberately fixed-width: these stay compact and the spacers around them absorb extra width. */
+static void CommitMiniField(int n) {
+    static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
+                                   "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
+    if (n < 0 || n >= 8) return;
+    if (n < 4 && gLink[2]) {
+        int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
+        gMini[other] = gMini[n];
+        char updates[384];
+        snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]", paths[n], gMini[n], paths[other], gMini[other]);
+        PlutoTimelineSetPropertiesJson(updates);
+    } else if (n >= 4 && gLink[3]) {
+        char updates[768] = "["; size_t used = 1;
+        for (int i = 4; i < 8; i++) {
+            gMini[i] = gMini[n];
+            int written = snprintf(updates + used, sizeof(updates) - used, "%s{\"path\":\"%s\",\"value\":%.4f}", i == 4 ? "" : ",", paths[i], gMini[i]);
+            if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
+        }
+        if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
+    } else PlutoTimelineSetProperty(paths[n], gMini[n]);
+    gPreviewDirty = true;
+}
+
 static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Clay_ElementId scrubId = CLAY_IDI("MiniScrub", n);
     Bs b = Interact(id);
     bool changed = ValueFieldLogic(scrubId, &gMini[n], .2f);
-    static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
-                                   "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
-    if (changed && n >= 0 && n < 8) {
-        if (n < 4 && gLink[2]) {
-            int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
-            gMini[other] = gMini[n];
-            char updates[384];
-            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]", paths[n], gMini[n], paths[other], gMini[other]);
-            PlutoTimelineSetPropertiesJson(updates);
-        } else if (n >= 4 && gLink[3]) {
-            char updates[768] = "["; size_t used = 1;
-            for (int i = 4; i < 8; i++) {
-                gMini[i] = gMini[n];
-                int written = snprintf(updates + used, sizeof(updates) - used, "%s{\"path\":\"%s\",\"value\":%.4f}", i == 4 ? "" : ",", paths[i], gMini[i]);
-                if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
-            }
-            if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
-        } else PlutoTimelineSetProperty(paths[n], gMini[n]);
-    }
+    if (changed) CommitMiniField(n);
     CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
@@ -410,9 +414,9 @@ static void MiniField(int n, const char *lab) {
             Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%.0f", gMini[n]), 18, C_TEXT, 0);
             Tx("px", 13, C_ICON, 0);
         }
-        CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}, .padding = {2, 0, 0, 0}}}) {
-            Icon(I_CHEV_UP, 10, C_ICON);
-            Icon(I_CHEV_DN, 10, C_ICON);
+        CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}, .padding = {2, 0, 0, 0}, .childGap = 1}}) {
+            if (Arrow(CLAY_IDI("MiniU", n), I_CHEV_UP)) { gMini[n] += 1.f; CommitMiniField(n); }
+            if (Arrow(CLAY_IDI("MiniD", n), I_CHEV_DN)) { gMini[n] -= 1.f; CommitMiniField(n); }
         }
     }
 }
@@ -831,7 +835,7 @@ static void Accordion(int idx, const char *title, int icon) {
 
 static void ColorsView(void) {
     CLAY(CLAY_ID("AccList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-        Accordion(0, "Color Grading", I_PALETTE);
+        Accordion(0, "Color Grading", I_GRADING);
         Accordion(1, "HSL", I_SLIDERS);
         Accordion(2, "Light", I_SUN);
         Accordion(3, "Color", I_DROP);
@@ -1028,8 +1032,6 @@ static bool FxHeader(int i, float open) {
     return b.clicked;
 }
 
-#define TRANS_DESC_H 252.f
-#define TRANS_EMPTY_H 46.f
 #define FILT_BODY_H  214.f   /* 10 gap | 18 presets row | 10 gap | 2 x 84 thumbs + 8 gap */
 static int TransitionNextClip(int from) {
     if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track > 3) return -1;
@@ -1053,8 +1055,11 @@ static void EffectsView(void) {
     /* ---- Transitions ---- */
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
-    float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
+    /* The inspector body is the single vertical scroll viewport. Keep the
+       transition details in normal flow rather than creating another nested
+       clipped viewport here. Nested clipping + the inspector's translated
+       content made the following effect cards escape the right panel when
+       scrolling with Transitions expanded. */
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
@@ -1065,8 +1070,8 @@ static void EffectsView(void) {
             HSPACE
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
+        if (gTransOpen) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {

@@ -305,7 +305,10 @@ static void TimelineClipLane(int track) {
             int i = order[n];
             float x = gTimelinePan + gTimelineClips[i].start * pps;
             float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
-            if (x + width <= 0.f) continue;
+            /* The lane is clipped by Clay, but creating and measuring every
+               off-screen clip still costs layout and hit-test work each frame.
+               Skip clips beyond either visible edge before creating their nodes. */
+            if (x + width <= 0.f || x >= lane.width) continue;
             float left = fmaxf(0.f, x);
             if (left > cursor) {
                 CLAY_AUTO_ID({.layout = {.sizing = {CLAY_SIZING_FIXED(left - cursor), FIX(1)}}}) {}
@@ -315,6 +318,14 @@ static void TimelineClipLane(int track) {
             Clay_ElementId clipId = CLAY_IDI("TimelineClip", i);
             Bs b = Interact(clipId);
             Clay_BoundingBox bb = Clay_GetElementData(clipId).boundingBox;
+            Vector2 clipMouse = GetMousePosition();
+            bool clipEdgeLeft = fabsf(clipMouse.x - bb.x) <= 8.f;
+            bool clipEdgeRight = fabsf(clipMouse.x - (bb.x + bb.width)) <= 8.f;
+            bool trimEligible = gTimelineTool == 0 && bb.width > 18.f &&
+                                gTimelineClips[i].sourceDuration > 0.f;
+            if (Clay_PointerOver(clipId) && trimEligible && (clipEdgeLeft || clipEdgeRight)) {
+                gScrubCursor = true;
+            }
             if (!transitionPressed && !gTimelineScrubbing && !gTimelineContextConsumedClick &&
                 Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 gTransitionFocusClip = -1;
@@ -327,7 +338,17 @@ static void TimelineClipLane(int track) {
                     gTimelineSelectionAnchor = i;
                 }
                 PlutoTimelineSelect(i);
-                if (gTimelineTool == 0 || gTimelineTool == 1) {
+                if (trimEligible && (clipEdgeLeft || clipEdgeRight)) {
+                    /* Keep the complete source range in the backend. During
+                       the gesture only the UI copy is previewed; commit once
+                       on mouse-up so repeated inward/outward trims are lossless. */
+                    gClipTrimIndex = i;
+                    gClipTrimEdge = clipEdgeLeft ? 0 : 1;
+                    gClipTrimOrigStart = gTimelineClips[i].start;
+                    gClipTrimOrigEnd = gTimelineClips[i].start + gTimelineClips[i].duration;
+                    gClipTrimOrigOffset = gTimelineClips[i].sourceOffset;
+                    gClipTrimSourceDuration = gTimelineClips[i].sourceDuration;
+                } else if (gTimelineTool == 0 || gTimelineTool == 1) {
                     gClipDragIndex = i;
                     gClipDragTrack = track;
                     gClipDragOrigStart = gTimelineClips[i].start;
@@ -335,6 +356,40 @@ static void TimelineClipLane(int track) {
                     for (int j = 0; j < gTimelineClipCount; j++) {
                         gClipDragSnapshotStart[j] = gTimelineClips[j].start;
                         gClipDragSnapshotTrack[j] = gTimelineClips[j].track;
+                    }
+                }
+            }
+            if (gClipTrimIndex == i) {
+                TimelineClipUi *trimClip = &gTimelineClips[i];
+                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    float pointerTime = fmaxf(0.f, (clipMouse.x - lane.x - gTimelinePan) / pps);
+                    if (gClipTrimEdge == 0) {
+                        float earliest = fmaxf(0.f, gClipTrimOrigStart - gClipTrimOrigOffset);
+                        float nextStart = fminf(gClipTrimOrigEnd - .05f,
+                                                fmaxf(earliest, pointerTime));
+                        trimClip->start = nextStart;
+                        trimClip->duration = gClipTrimOrigEnd - nextStart;
+                        trimClip->sourceOffset = fmaxf(0.f, gClipTrimOrigOffset +
+                                                               nextStart - gClipTrimOrigStart);
+                    } else {
+                        float latest = gClipTrimOrigStart +
+                                       fmaxf(.05f, gClipTrimSourceDuration - gClipTrimOrigOffset);
+                        float nextEnd = fmaxf(gClipTrimOrigStart + .05f,
+                                              fminf(latest, pointerTime));
+                        trimClip->start = gClipTrimOrigStart;
+                        trimClip->duration = nextEnd - gClipTrimOrigStart;
+                        trimClip->sourceOffset = gClipTrimOrigOffset;
+                    }
+                } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                    float committedStart = trimClip->start;
+                    float committedEnd = trimClip->start + trimClip->duration;
+                    trimClip->start = gClipTrimOrigStart;
+                    trimClip->duration = gClipTrimOrigEnd - gClipTrimOrigStart;
+                    trimClip->sourceOffset = gClipTrimOrigOffset;
+                    gClipTrimIndex = -1;
+                    if (fabsf(committedStart - gClipTrimOrigStart) > .0001f ||
+                        fabsf(committedEnd - gClipTrimOrigEnd) > .0001f) {
+                        PlutoTimelineTrim(i, committedStart, committedEnd);
                     }
                 }
             }
@@ -349,7 +404,7 @@ static void TimelineClipLane(int track) {
                 gTimelineContextPos = GetMousePosition();
                 gTimelineContextOpen = true;
             }
-            if (gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
+            if (gClipTrimIndex != i && gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
                 if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && lane.width > 0.f) {
                     TimelineRestoreDragSnapshot();
                     int hoveredTrack = TimelineTrackUnderPointer();
