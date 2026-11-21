@@ -14,6 +14,8 @@ typedef char *(__cdecl *PlutoBackendRequestFn)(const char *json);
 typedef uint64_t(__cdecl *PlutoBackendSubmitFn)(const char *json);
 typedef char *(__cdecl *PlutoBackendPollFn)(void);
 typedef void(__cdecl *PlutoBackendFreeFn)(char *value);
+typedef int32_t(__cdecl *PlutoBackendCopyPreviewFn)(uint64_t requestId, uint8_t *destination, size_t capacity,
+                                                    uint32_t *width, uint32_t *height, size_t *byteLength, double *at);
 
 typedef struct {
     HMODULE module;
@@ -21,6 +23,7 @@ typedef struct {
     PlutoBackendSubmitFn submit;
     PlutoBackendPollFn poll;
     PlutoBackendFreeFn release;
+    PlutoBackendCopyPreviewFn copyPreview;
 } PlutoBackend;
 
 static PlutoBackend gBackend;
@@ -39,7 +42,8 @@ static bool PlutoBackendLoad(void) {
     gBackend.submit = (PlutoBackendSubmitFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_submit");
     gBackend.poll = (PlutoBackendPollFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_poll");
     gBackend.release = (PlutoBackendFreeFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_free");
-    if (!gBackend.request || !gBackend.submit || !gBackend.poll || !gBackend.release) {
+    gBackend.copyPreview = (PlutoBackendCopyPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_copy_preview_frame");
+    if (!gBackend.request || !gBackend.submit || !gBackend.poll || !gBackend.release || !gBackend.copyPreview) {
         FreeLibrary(gBackend.module);
         gBackend = (PlutoBackend){0};
         return false;
@@ -80,6 +84,36 @@ static bool PlutoJsonNumber(const char *json, const char *key, double *out) {
     double value = strtod(p, &end);
     if (end == p) return false;
     *out = value;
+    return true;
+}
+
+static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
+    if (!gBackend.copyPreview || !requestId) return false;
+    uint32_t width = 0, height = 0;
+    size_t required = 0;
+    double at = 0.0;
+    int32_t copied = gBackend.copyPreview(requestId, gPreviewPixels, gPreviewPixelCapacity,
+                                          &width, &height, &required, &at);
+    if (copied == -1 && required > 0) {
+        uint8_t *next = (uint8_t *)realloc(gPreviewPixels, required);
+        if (!next) return false;
+        gPreviewPixels = next;
+        gPreviewPixelCapacity = required;
+        copied = gBackend.copyPreview(requestId, gPreviewPixels, gPreviewPixelCapacity,
+                                      &width, &height, &required, &at);
+    }
+    if (copied != 1 || !width || !height || required != (size_t)width * height * 4u) return false;
+    if (gPreviewFrame.id && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
+        UpdateTexture(gPreviewFrame, gPreviewPixels);
+    } else {
+        Image image = {gPreviewPixels, (int)width, (int)height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        Texture2D next = LoadTextureFromImage(image);
+        if (!next.id) return false;
+        if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+        gPreviewFrame = next;
+        SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
+    }
+    if (displayedAt) *displayedAt = at;
     return true;
 }
 
@@ -285,6 +319,8 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonStringPath(begin, end, "props.transitionOut.type", clip->transitionType, sizeof(clip->transitionType));
             PlutoJsonNumberRange(begin, end, "start", &start);
             PlutoJsonNumberRange(begin, end, "dur", &duration);
+            clip->sourceOffset = PlutoReadNumber(begin, end, "sourceOffset", 0.f);
+            clip->sourceDuration = PlutoReadNumber(begin, end, "sourceDuration", 0.f);
             clip->transitionDuration = PlutoReadNumber(begin, end, "props.transitionOut.duration", 1.f);
             clip->track = PlutoTrackIndex(track);
             const char *hasAudio = strstr(begin, "\"hasAudio\":true");
@@ -371,9 +407,9 @@ static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) {
     snprintf(id, sizeof(id), "clip-%llu", (unsigned long long)gClipSerial++);
     if ((strcmp(media->kind, "audio") == 0) != (track >= 4)) track = strcmp(media->kind, "audio") == 0 ? 4 : 0;
     snprintf(request, sizeof(request),
-             "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"%s\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"%s\",\"hasAudio\":%s,\"sourceOffset\":0,\"props\":{}}}",
+             "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"%s\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"%s\",\"hasAudio\":%s,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{}}}",
              id, PlutoTrackName(track), fmaxf(0.f, start), fmaxf(.05f, media->duration), label, path,
-             media->kind, media->hasAudio ? "true" : "false");
+             media->kind, media->hasAudio ? "true" : "false", media->duration);
     if (!PlutoTimelineCall(request)) return false;
     for (int i = 0; i < gTimelineClipCount; i++) if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
     gPreviewDirty = true;
@@ -385,6 +421,17 @@ static bool PlutoTimelineMove(int index, float start, int track) {
     char id[128], request[512]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
     snprintf(request, sizeof(request), "{\"command\":\"timeline_move_clip\",\"id\":\"%s\",\"start\":%.4f,\"track\":\"%s\",\"playhead\":%.4f,\"snapThreshold\":0.25}",
              id, fmaxf(0.f, start), PlutoTrackName(track), gPlayhead);
+    bool okay = PlutoTimelineCall(request);
+    if (okay) gPreviewDirty = true;
+    return okay;
+}
+
+static bool PlutoTimelineTrim(int index, float start, float end) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    char id[128], request[512]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(request, sizeof(request),
+             "{\"command\":\"timeline_trim_clip\",\"id\":\"%s\",\"start\":%.6f,\"end\":%.6f,\"sourceDuration\":%.6f}",
+             id, fmaxf(0.f, start), end, gTimelineClips[index].sourceDuration);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
@@ -479,7 +526,7 @@ static void PlutoPollBackend(void) {
         char *event = gBackend.poll();
         if (!event) break;
         if (strstr(event, "\"command\":\"preview_frame\"")) {
-            double requestId = 0.0; char previewPath[1024] = {0};
+            double requestId = 0.0;
             bool matchingRequest = PlutoJsonNumber(event, "requestId", &requestId) &&
                                    gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
             if (matchingRequest) {
@@ -492,29 +539,39 @@ static void PlutoPollBackend(void) {
                              : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
                 bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
                 bool currentRequest = gPreviewRequestRes == gPreviewRes &&
-                    (previewMoving ? movingFrameFresh : (!gPreviewDirty &&
+                    (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
-                if (strstr(event, "\"ok\":true") && PlutoJsonString(event, "previewPath", previewPath, sizeof(previewPath))) {
-                    double renderedAt = -1.0, renderedHeight = 0.0;
+                if (strstr(event, "\"ok\":true")) {
+                    double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
                     bool frameMatchesRequest =
                         PlutoJsonNumber(event, "at", &renderedAt) &&
                         PlutoJsonNumber(event, "height", &renderedHeight) &&
-                        fabs(renderedAt - gPreviewRequestAt) <= (0.5 / 30.0) &&
+                        PlutoJsonNumber(event, "frameId", &frameIdNumber) &&
+                        fabs(renderedAt - gPreviewRequestAt) <= (0.5 / (double)fmaxf(1, gPreviewFps)) &&
                         (int)renderedHeight == gPreviewRes;
                     if (currentRequest && frameMatchesRequest) {
-                        if (strcmp(gPreviewTexturePath, previewPath) != 0) {
-                            Texture2D nextFrame = LoadTexture(previewPath);
-                            if (nextFrame.id) {
-                                SetTextureFilter(nextFrame, TEXTURE_FILTER_BILINEAR);
-                                if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
-                                gPreviewFrame = nextFrame;
-                                strncpy(gPreviewTexturePath, previewPath, sizeof(gPreviewTexturePath) - 1);
-                                gPreviewTexturePath[sizeof(gPreviewTexturePath) - 1] = 0;
-                            } else {
-                                snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not load rendered preview frame");
+                        double uploadedAt = renderedAt;
+                        double uploadStartedAt = GetTime();
+                        if (!PlutoUploadPreviewFrame((uint64_t)frameIdNumber, &uploadedAt)) {
+                            snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not upload preview frame");
+                        } else {
+                            gPreviewDisplayedAt = (float)uploadedAt;
+                            double now = GetTime();
+                            if (previewMoving && now - gPreviewTelemetryAt >= 1.0) {
+                                double queueMs = 0.0, setupMs = 0.0, decodeMs = 0.0, renderMs = 0.0;
+                                PlutoJsonNumber(event, "queueMs", &queueMs);
+                                PlutoJsonNumber(event, "streamSetupMs", &setupMs);
+                                PlutoJsonNumber(event, "decodeWaitMs", &decodeMs);
+                                PlutoJsonNumber(event, "totalMs", &renderMs);
+                                char timing[256];
+                                snprintf(timing, sizeof(timing),
+                                    "[Stella preview] end-to-end=%.1fms queue=%.1fms setup=%.1fms decode=%.1fms upload=%.1fms backend=%.1fms\n",
+                                    (now - gPreviewRequestStartedAt) * 1000.0, queueMs, setupMs, decodeMs,
+                                    (now - uploadStartedAt) * 1000.0, renderMs);
+                                OutputDebugStringA(timing);
+                                gPreviewTelemetryAt = now;
                             }
                         }
-                        gPreviewDisplayedAt = (float)renderedAt;
                         /* Keep showing completed frames during playback/scrubbing even if
                            the playhead advanced slightly while FFmpeg rendered this one.
                            Reject older frames so the picture cannot visibly run backward. */
@@ -574,18 +631,21 @@ static void PlutoUnloadMedia(void) {
         if (gImported[i].thumbnail.id) UnloadTexture(gImported[i].thumbnail);
     }
     if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
-    gPreviewTexturePath[0] = 0;
+    free(gPreviewPixels);
+    gPreviewPixels = NULL;
+    gPreviewPixelCapacity = 0;
 }
 
 static uint64_t PlutoRequestPreview(void) {
     if (!gBackend.submit || gPreviewTaskId) return 0;
     char request[128];
-    snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.4f,\"height\":%d}", gPlayhead, gPreviewRes);
+    snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d}", gPlayhead, gPreviewRes, gPreviewFps);
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
         gPreviewTaskId = taskId;
         gPreviewRequestAt = gPlayhead;
         gPreviewRequestRes = gPreviewRes;
+        gPreviewRequestStartedAt = GetTime();
     }
     return gPreviewTaskId;
 }

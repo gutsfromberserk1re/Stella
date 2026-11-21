@@ -222,29 +222,47 @@ static void TimelineClipLane(int track) {
         order[at] = i;
     }
 
+    /* Mirror Clay's horizontal flow when tiny clips hit the readable 46px
+       minimum. Transition badges use these displayed edges, not compressed
+       timeline time positions, so they stay centered at low zoom. */
+    float visualLeft[MAX_TIMELINE_CLIPS] = {0};
+    float visualWidth[MAX_TIMELINE_CLIPS] = {0};
+    float visualCursor = 0.f;
+    for (int n = 0; n < count; n++) {
+        int i = order[n];
+        float x = gTimelinePan + gTimelineClips[i].start * pps;
+        float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
+        if (x + width <= 0.f) continue;
+        float left = fmaxf(0.f, x);
+        float placed = fmaxf(visualCursor, left);
+        if (x < 0.f) width = fmaxf(1.f, width + x);
+        visualLeft[i] = lane.x + placed;
+        visualWidth[i] = width;
+        visualCursor = placed + width;
+    }
+
     if (track < 4) {
         for (int n = 0; n + 1 < count && gTransitionButtonCount < 64; n++) {
             int left = order[n], right = order[n + 1];
             float end = gTimelineClips[left].start + gTimelineClips[left].duration;
             if (fabsf(end - gTimelineClips[right].start) > .04f) continue;
-            float leftEdge = lane.x + gTimelinePan + gTimelineClips[left].start * TimelinePps();
-            float rightEdge = lane.x + gTimelinePan + gTimelineClips[right].start * TimelinePps();
-            float joinX = rightEdge;
-            float leftVisibleEnd = leftEdge + fmaxf(46.f, gTimelineClips[left].duration * TimelinePps());
-            float rightVisibleEnd = rightEdge + fmaxf(46.f, gTimelineClips[right].duration * TimelinePps());
+            if (visualWidth[left] <= 0.f || visualWidth[right] <= 0.f) continue;
+            float leftEdge = visualLeft[left];
+            float leftVisibleEnd = leftEdge + visualWidth[left];
+            float rightEdge = visualLeft[right];
+            float rightVisibleEnd = rightEdge + visualWidth[right];
+            float joinX = (leftVisibleEnd + rightEdge) * .5f;
             float spanSeconds = fminf(gTimelineClips[left].transitionDuration,
                                       fminf(gTimelineClips[left].duration, gTimelineClips[right].duration));
+            float spanPixels = fmaxf(2.f, spanSeconds * pps);
             bool applied = gTimelineClips[left].transitionType[0] &&
                            strcmp(gTimelineClips[left].transitionType, "none") != 0;
-            Rectangle durationRect = {fmaxf(leftEdge, joinX - spanSeconds * pps * .5f),
+            float spanStart = fmaxf(lane.x, fmaxf(leftEdge, joinX - spanPixels * .5f));
+            float spanEnd = fminf(lane.x + lane.width, fminf(rightVisibleEnd, joinX + spanPixels * .5f));
+            Rectangle durationRect = {spanStart,
                                       lane.y + 5.f,
-                                      fmaxf(0.f, fminf(rightVisibleEnd, joinX + spanSeconds * pps * .5f) -
-                                                   fmaxf(leftEdge, joinX - spanSeconds * pps * .5f)),
+                                      fmaxf(0.f, spanEnd - spanStart),
                                       5.f};
-            /* Honor the visible minimum card width at low zoom when clipping the duration bar. */
-            durationRect.x = fmaxf(leftEdge, durationRect.x);
-            if (durationRect.x + durationRect.width > fmaxf(leftVisibleEnd, rightVisibleEnd))
-                durationRect.width = fmaxf(0.f, fmaxf(leftVisibleEnd, rightVisibleEnd) - durationRect.x);
             Rectangle rect = {joinX - 12.f, lane.y + (lane.height - 24.f) * .5f, 24.f, 24.f};
             bool hovered = CheckCollisionPointRec(GetMousePosition(), rect);
             if (hovered) gHand = true;
