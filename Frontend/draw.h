@@ -450,13 +450,38 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured? */
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        for (int i = 0; i < 72; i++)
-            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
-        Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
+        /* Smooth conic hue disc, baked once into a texture: hue follows the angle,
+           saturation/brightness fall toward a deep, muted centre. Edge is anti-aliased. */
+        static Texture2D wheelTex;
+        enum { WHEEL_TEX = 256 };
+        if (wheelTex.id == 0) {
+            Image img = GenImageColor(WHEEL_TEX, WHEEL_TEX, BLANK);
+            Color *px = (Color *)img.data;
+            float half = WHEEL_TEX / 2.f;
+            for (int y = 0; y < WHEEL_TEX; y++) for (int x = 0; x < WHEEL_TEX; x++) {
+                float dx = x + .5f - half, dy = y + .5f - half;
+                float d = sqrtf(dx * dx + dy * dy), t = d / half;
+                float a = fminf(1.f, fmaxf(0.f, (half - d)));      /* 1px AA at the rim */
+                if (a <= 0.f) continue;
+                float ang = atan2f(dy, dx) * RAD2DEG; if (ang < 0.f) ang += 360.f;
+                float tt = fminf(1.f, t);
+                float e = tt * tt * (3.f - 2.f * tt);
+                Color col = ColorFromHSV(fmodf(ang + 90.f, 360.f), .52f + .40f * e, .30f + .46f * e);
+                col.a = (unsigned char)(a * 255.f);
+                px[y * WHEEL_TEX + x] = col;
+            }
+            wheelTex = LoadTextureFromImage(img);
+            UnloadImage(img);
+            SetTextureFilter(wheelTex, TEXTURE_FILTER_BILINEAR);
+        }
+        DrawTexturePro(wheelTex, (Rectangle){0, 0, WHEEL_TEX, WHEEL_TEX},
+                       (Rectangle){c.x - rad, c.y - rad, rad * 2, rad * 2}, (Vector2){0, 0}, 0.f, WHITE);
+        Ring(c, rad, 1.f, (Color){22, 23, 27, 120});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
-        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
+        float dot = 8.5f + 1.5f * cu->f;
+        DrawCircleV((Vector2){p.x, p.y + 1.5f}, dot + 1.5f, (Color){0, 0, 0, 90});          /* soft drop shadow */
+        DrawCircleV(p, dot, cu->v > .5f ? RC(cu->c) : (Color){214, 216, 222, 255});
+        Ring(p, dot, 1.f, (Color){255, 255, 255, 60});
     } break;
 
     case K_SWITCH: {
@@ -586,12 +611,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x, r.y + r.height - 19.f, r.width, 19.f};
-            if (!audioOnly) {
-                FillRR(band, 0.f, (Color){71, 129, 168, 210});
-                DrawLineEx((Vector2){r.x, band.y}, (Vector2){r.x + r.width, band.y},
-                           1.f, (Color){119, 166, 194, 225});
-            }
+                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
@@ -599,6 +619,11 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;
         StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){113, 116, 124, 255});
+        if (clip && !audioOnly && r.width >= 18.f) {
+            Color grip = (Color){210, 207, 222, 205};
+            DrawLineEx((Vector2){r.x + 3.5f, r.y + 8.f}, (Vector2){r.x + 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+            DrawLineEx((Vector2){r.x + r.width - 3.5f, r.y + 8.f}, (Vector2){r.x + r.width - 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
+        }
         if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
             TimelineClipUi *clip = &gTimelineClips[clipIndex];
             for (int k = 0; k < clip->keyframeCount; k++) {

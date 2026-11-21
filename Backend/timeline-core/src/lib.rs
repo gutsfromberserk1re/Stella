@@ -236,24 +236,56 @@ impl Timeline {
         self.find(id).cloned()
     }
 
-    pub fn trim_clip(&mut self, id: &str, start: f64, end: f64) -> Result<Clip, TimelineError> {
+    pub fn trim_clip(&mut self, id: &str, start: f64, end: f64, source_duration: Option<f64>) -> Result<Clip, TimelineError> {
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end - start <= EPSILON {
             return Err(TimelineError::InvalidRange);
         }
         let mut clip = self.find(id)?.clone();
+        if let Some(duration) = source_duration.filter(|duration| duration.is_finite() && *duration > 0.0) {
+            clip.extra.insert("sourceDuration".into(), serde_json::json!(duration));
+        }
+        let source_offset = clip.extra.get("sourceOffset")
+            .and_then(serde_json::Value::as_f64).unwrap_or(0.0).max(0.0);
+        let source_duration = clip.extra.get("sourceDuration")
+            .and_then(serde_json::Value::as_f64).filter(|duration| duration.is_finite() && *duration > 0.0);
+        /* A left trim changes source offset. The source start and end stay
+           bounded so dragging a handle back restores already-trimmed media. */
+        let next_start = start.max((clip.start - source_offset).max(0.0));
+        let next_offset = (source_offset + next_start - clip.start).max(0.0);
+        let next_end = source_duration
+            .map(|duration| end.min(next_start + (duration - next_offset).max(0.0)))
+            .unwrap_or_else(|| end.min(clip.end()));
+        if next_end - next_start <= EPSILON { return Err(TimelineError::InvalidRange); }
+
+        let linked_id = clip.linked_clip_id.clone();
+        let linked_track = linked_id.as_deref()
+            .and_then(|linked| self.clips.iter().find(|candidate| candidate.id == linked))
+            .map(|linked| linked.track);
+        let mut changing_ids = vec![id];
+        if let Some(linked) = linked_id.as_deref() { changing_ids.push(linked); }
         if self.clips.iter().any(|other| {
-            other.id != id
-                && other.track == clip.track
-                && start < other.end() - EPSILON
-                && end > other.start + EPSILON
+            !changing_ids.contains(&other.id.as_str())
+                && (other.track == clip.track || Some(other.track) == linked_track)
+                && next_start < other.end() - EPSILON
+                && next_end > other.start + EPSILON
         }) {
             return Err(TimelineError::InvalidRange);
         }
-        clip.start = start;
-        clip.duration = end - start;
+        clip.start = next_start;
+        clip.duration = next_end - next_start;
+        clip.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
         self.replace(clip.clone());
+        if let Some(linked_id) = linked_id {
+            if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
+                linked.start = next_start;
+                linked.duration = next_end - next_start;
+                linked.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
+                if let Some(duration) = source_duration { linked.extra.insert("sourceDuration".into(), serde_json::json!(duration)); }
+                self.replace(linked);
+            }
+        }
         self.refresh_duration();
-        Ok(clip)
+        self.find(id).cloned()
     }
 
     pub fn split_clip(

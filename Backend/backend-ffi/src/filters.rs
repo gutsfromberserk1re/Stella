@@ -47,7 +47,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         filters.push(format!("huesaturation=colors={hsl_range}:hue={hsl_hue:.3}:saturation={hsl_saturation:.4}:intensity={hsl_intensity:.4}:strength=100:lightness=1"));
     }
 
-    /* Keep all color-balance controls in one shared operation for preview/export. */
+    /* Export-side color balance; preview evaluates the matching controls in WGSL below. */
     let preset = effects["preset"]["id"].as_str().unwrap_or("none");
     let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
     let mut balance = [0.0_f64; 9]; // shadows RGB, midtones RGB, highlights RGB
@@ -265,6 +265,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let overlay_y = format!("(main_h-overlay_h)/2+{y:.3}{shake_y}");
     (filters.join(","), overlay_x, overlay_y)
 }
+
 
 pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     let props = &clip["props"];

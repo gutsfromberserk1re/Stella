@@ -679,7 +679,11 @@ static void AccHeader(int idx, const char *title, int icon, float openAnim, bool
             }
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(16), FIX(16)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(9),
                           .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
+                /* open state shows a minus, like the reference */
+                if (openAnim <= 0.5f) IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
+                else
+                    CLAY_AUTO_ID({.layout = {.sizing = {FIX(8), FIX(2)}},
+                                  .backgroundColor = Mix(C_DIM, C_TEXT, b.hover), .cornerRadius = CLAY_CORNER_RADIUS(1)}) {}
             }
         }
     }
