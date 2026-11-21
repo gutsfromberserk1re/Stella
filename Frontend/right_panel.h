@@ -444,13 +444,11 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l1, 19, C_ICON, 0); }
             NumField(n * 2, a, unit);
         }
-        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
-            HSPACE
+        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER}}}) {
             if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) {
                 gLink[link] = !gLink[link];
                 PlutoTimelineSetBoolProperty(link == 0 ? "props.transform.position.linked" : "props.transform.scale.linked", gLink[link]);
             }
-            HSPACE
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l2, 19, C_ICON, 0); }
@@ -640,7 +638,7 @@ static void WheelItem(int i, const char *label) {
         float hue, len; WheelInfo(gWh[i], &hue, &len);
         bool col = len > 0.02f;
         Color dc = ColorFromHSV(hue, fminf(1.f, .3f + .7f * len), 1.f);
-        CLAY(wid, {.layout = {.sizing = {FIX(100), FIX(100)}},
+        CLAY(wid, {.layout = {.sizing = {FIX(94), FIX(94)}},
                    .custom = {.customData = NC(K_WHEEL, C_CARD, (Clay_Color){gWh[i].x, gWh[i].y, 0, 0}, (Clay_Color){dc.r, dc.g, dc.b, 255},
                                                col ? 1.f : 0.f, fmaxf(b.hover * .6f, gWhDrag[i] ? 1.f : 0.f), 0)}}) {}
         Tx(label, 16, C_TEXT, 1);
@@ -1172,9 +1170,9 @@ static void EffectsView(void) {
     for (int i = 0; i < 4; i++) {
         oi[i] = Spring(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 680.f, 32.f);
         if (oi[i] < 0.f) oi[i] = 0.f;
-        if (oi[i] > 1.04f) oi[i] = 1.04f;
-        hb[i] = roundf(oi[i] * (FX_BODY_H + 12.5f));
-        if (hb[i] >= 1.f) sum += hb[i] + 2.25f; /* wrapper's FIX padding */
+        if (oi[i] > 1.f) oi[i] = 1.f;
+        hb[i] = roundf(oi[i] * (FX_BODY_H + 42.f));
+        if (hb[i] >= 1.f) sum += hb[i] + 12.25f; /* wrapper padding + top spacer */
     }
     float lh = roundf(ov * (12.25f + (4.f + EXTRA_FX_COUNT) * (FX_ITEM_H + 2.25f) + 13.f * 8.f + sum));
     CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
