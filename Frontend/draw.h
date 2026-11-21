@@ -453,7 +453,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         for (int i = 0; i < 72; i++)
             DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .62f, .50f));
         /* soft grey-ish centre so the wheel fades toward neutral like the reference */
-        DrawCircleGradient((int)c.x, (int)c.y, rad, (Color){46, 46, 54, 150}, (Color){46, 46, 54, 0});
+        DrawCircleGradient((Vector2){c.x, c.y}, rad, (Color){46, 46, 54, 150}, (Color){46, 46, 54, 0});
         Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
         float dot = 9.5f + 1.5f * cu->f;
