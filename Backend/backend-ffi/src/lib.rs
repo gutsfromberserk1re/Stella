@@ -14,7 +14,6 @@ use std::{
     hash::{Hash, Hasher},
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
-    process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},

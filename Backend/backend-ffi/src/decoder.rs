@@ -66,7 +66,7 @@ impl VideoDecoder {
             return Err(format!("Media file is missing: {path}"));
         }
 
-        let mut input = format::input(path)
+        let input = format::input(path)
             .map_err(|error| format!("Could not open video source '{path}': {error}"))?;
         let (stream_index, time_base, frame_rate, decoder) = {
             let stream = input

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use wgpu::util::DeviceExt;
 
@@ -282,8 +282,8 @@ struct TargetResources {
 }
 
 struct RendererState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     layers: HashMap<String, LayerResources>,
@@ -336,7 +336,7 @@ fn state() -> Result<&'static Mutex<RendererState>, String> {
             mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest, ..Default::default()
         });
-        Ok::<_, String>(RendererState { device, queue, pipeline, sampler, layers: HashMap::new(), target: None })
+        Ok::<_, String>(RendererState { device: Arc::new(device), queue: Arc::new(queue), pipeline, sampler, layers: HashMap::new(), target: None })
     })?;
     let _ = GPU.set(Mutex::new(created));
     GPU.get().ok_or_else(|| "wgpu renderer initialization failed".to_string())
@@ -360,8 +360,10 @@ impl GpuPreviewRenderer {
             if layer.pixels.len() != expected { return Err(format!("Decoded layer is {} bytes; expected {expected}", layer.pixels.len())); }
         }
         let mut renderer = state()?.lock().map_err(|_| "wgpu renderer lock failed")?;
-        let device = &renderer.device;
-        let queue = &renderer.queue;
+        // Clone the Arc handles so resource creation does not keep an immutable
+        // borrow of `renderer` alive while the layer/target caches are mutated.
+        let device = Arc::clone(&renderer.device);
+        let queue = Arc::clone(&renderer.queue);
 
         if renderer.target.as_ref().is_none_or(|target| target.width != tw || target.height != th) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {

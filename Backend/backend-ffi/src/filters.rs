@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashMap;
 
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
@@ -271,7 +272,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
 /// Export continues to use `video_filters`; the formulas below intentionally mirror
 /// its color, crop, transform and preset values without invoking FFmpeg filters.
 pub(crate) fn preview_uniforms(
-    clip: &Value,
+    clip: &HashMap<String, Value>,
     source_width: u32,
     source_height: u32,
     target_width: u32,
@@ -280,7 +281,8 @@ pub(crate) fn preview_uniforms(
     clip_time_seconds: f64,
 ) -> super::renderer::PreviewUniforms {
     use super::renderer::PreviewUniforms;
-    let props = &clip["props"];
+    let empty = Value::Null;
+    let props = clip.get("props").unwrap_or(&empty);
     let transform = &props["transform"];
     let colors = &props["colors"];
     let effects = &props["effects"];
