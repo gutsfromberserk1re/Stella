@@ -6,6 +6,7 @@
 use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
 mod filters;
+mod gpu_preview;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     ffi::{CStr, CString},
@@ -51,9 +52,7 @@ impl Default for PreviewFrame {
     fn default() -> Self { Self { request_id: 0, width: 0, height: 0, at: 0.0, pixels: Vec::new() } }
 }
 
-// A little more read-ahead absorbs short decode/render scheduling spikes.
-// At 720p this is roughly 29 MiB of queued RGBA frames; the queue remains bounded.
-const PREVIEW_DECODE_QUEUE_DEPTH: usize = 8;
+const PREVIEW_DECODE_QUEUE_DEPTH: usize = 6;
 
 struct PreviewStream {
     signature: u64,
@@ -356,7 +355,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v3.png"));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
     } else { std::path::PathBuf::new() };
@@ -379,27 +378,18 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let thumbnail_path = if kind == "audio" {
         None
     } else {
-        // A previous version only checked the cached file size. A truncated or
-        // invalid image could therefore remain the permanent "thumbnail" for
-        // that asset. Validate cached images with FFmpeg and regenerate them
-        // into a new cache version when they cannot be decoded.
-        let cached_valid = thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
-            && media_command(&ffmpeg).args(["-v", "error", "-i"]).arg(&thumbnail)
-                .args(["-frames:v", "1", "-f", "null", "-"])
-                .status().is_ok_and(|status| status.success());
-        let generated = if cached_valid {
+        let generated = if thumbnail.metadata().is_ok_and(|meta| meta.len() > 128) {
             true
         } else {
             let _ = std::fs::remove_file(&thumbnail);
-            let scale = "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black";
             let mut command = media_command(&ffmpeg);
-            command.args(["-hide_banner", "-loglevel", "error"]);
+            command.args(["-v", "error"]);
             if kind == "video" {
-                let seek = format!("{:.3}", (duration * 0.1).clamp(0.25, 2.0));
+                let seek = format!("{:.3}", (duration * 0.1).min(2.0));
                 command.args(["-ss", seek.as_str()]);
             }
-            command.args(["-i"]).arg(path)
-                .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1", "-vf", scale, "-compression_level", "6", "-y"])
+            command.arg("-i").arg(path)
+                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
                 .arg(&thumbnail);
             let first_attempt = command.status().is_ok_and(|status| status.success())
                 && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
@@ -408,10 +398,11 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             } else {
                 let _ = std::fs::remove_file(&thumbnail);
                 let mut fallback = media_command(&ffmpeg);
-                fallback.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(path)
-                    .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1", "-vf", scale, "-compression_level", "6", "-y"])
+                fallback.args(["-v", "error", "-i"]).arg(path)
+                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
                     .arg(&thumbnail)
-                    .status().is_ok_and(|status| status.success())
+                    .status()
+                    .is_ok_and(|status| status.success())
                     && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
             }
         };
@@ -645,7 +636,7 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
     let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
     for (i, clip) in video_clips.iter().enumerate() {
         let value = serde_json::to_value(clip).unwrap_or_default();
-        let (filters, x, y) = filters::video_filters(&value, width, height, fps, clip.start, clip.duration, None, None);
+        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
         let label = format!("vbody{i}");
         graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
         body_layers[i] = Some((label, x, y));
@@ -663,8 +654,8 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let mut right_value = serde_json::to_value(right).map_err(|e| e.to_string())?;
         left_value["sourceOffset"] = json!(left_source);
         right_value["sourceOffset"] = json!(right_source);
-        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, fps, 0.0, *duration, None, None);
-        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, fps, 0.0, *duration, None, None);
+        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None);
+        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
         let left_raw = format!("tx{i}a_raw");
         let right_raw = format!("tx{i}b_raw");
         let left_full = format!("tx{i}a");
@@ -672,8 +663,8 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let output = format!("tx{i}_out");
         let left_bg = format!("tx{i}a_bg");
         let right_bg = format!("tx{i}b_bg");
-        graph.push(format!("[{}]{left_filters},settb=AVTB,format=rgba[{left_raw}]", video_branches[i].2.as_ref().unwrap()));
-        graph.push(format!("[{}]{right_filters},settb=AVTB,format=rgba[{right_raw}]", video_branches[i + 1].1.as_ref().unwrap()));
+        graph.push(format!("[{}]{left_filters},fps={fps},settb=AVTB,format=rgba[{left_raw}]", video_branches[i].2.as_ref().unwrap()));
+        graph.push(format!("[{}]{right_filters},fps={fps},settb=AVTB,format=rgba[{right_raw}]", video_branches[i + 1].1.as_ref().unwrap()));
         graph.push(format!("color=c=black@0:s={width}x{height}:r={fps}:d={duration:.5},format=rgba,settb=AVTB[{left_bg}]"));
         graph.push(format!("color=c=black@0:s={width}x{height}:r={fps}:d={duration:.5},format=rgba,settb=AVTB[{right_bg}]"));
         graph.push(format!("[{left_bg}][{left_raw}]overlay=x={left_x}:y={left_y}:shortest=1:repeatlast=0:format=auto,format=rgba,setpts=PTS-STARTPTS[{left_full}]"));

@@ -13,7 +13,7 @@ The FFI accepts and returns UTF-8 JSON strings. Strings returned by the backend 
 ## Implemented engine paths
 
 - Timeline get/add/move/split/delete, snapping, undo/redo, clip properties, and keyframe storage run synchronously in Rust.
-- Media inspection, FFprobe metadata, FFmpeg thumbnails, audio waveforms, and export run on the media worker. A dedicated preview worker owns one persistent FFmpeg raw-frame stream. FFmpeg decodes on a separate thread into a bounded eight-frame queue; decoded buffers are recycled, sequential playback consumes ready frames, and timeline changes/backward jumps reopen the stream with input seeking.
+- Media inspection, FFprobe metadata, FFmpeg thumbnails, audio waveforms, and export run on the media worker. A dedicated preview worker owns one persistent FFmpeg raw-frame stream. FFmpeg decodes on a separate thread into a bounded six-frame queue; decoded buffers are recycled, sequential playback consumes ready frames, and timeline changes/backward jumps reopen the stream with input seeking.
 - Preview RGBA frames cross the C ABI through `pluto_backend_copy_preview_frame` and update the existing raylib texture directly; preview frames no longer pass through per-frame PNG files or image decoding.
 - Preview and export both build video and audio filters through `backend-ffi/src/filters.rs`.
 - When available, the preview worker uses cached editing proxies at every preview size; export continues to read original sources. The shared filters keep effect and transition behavior aligned while proxy resolution controls preview fidelity.
@@ -25,3 +25,7 @@ FFmpeg and FFprobe resolve from `PLUTO_FFMPEG_DIR`, the app's adjacent `ffmpeg/`
 Video effects use the shared FFmpeg filter builder for preview and export. A transition is stored on the outgoing clip at `props.transitionOut` with a type and duration; it is used only when a neighboring video clip follows directly on the same track. The renderer overlaps the incoming clip by that duration and composites it over the outgoing clip.
 
 Timeline scrubbing and left/right frame stepping use the current 30 fps timebase. The preview decoder uses a bounded queue rather than decoding synchronously for each frame request. Runtime verification is still required from a Windows build on representative media and machines; the Rust toolchain and Windows C toolchain are not included in this source-only patch environment.
+
+## Native GPU preview migration
+
+The Rust backend now includes the first wgpu/WGSL frame-processing module (`backend-ffi/src/gpu_preview.rs` and `preview.wgsl`). It initializes a reusable GPU compute device and exposes an RGBA frame-processing boundary. This is migration groundwork only: the live preview still uses the existing FFmpeg filter/compositing graph, and the identity WGSL kernel is not yet connected to playback. See `GPU_PREVIEW_STAGE_1.md` for the staged replacement plan and current limitations.
