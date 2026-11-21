@@ -557,6 +557,28 @@ static void PlutoPollBackend(void) {
                         } else {
                             gPreviewDisplayedAt = (float)uploadedAt;
                             double now = GetTime();
+                            {   /* Phase 1 stats: feed the F3 overlay on every displayed frame. */
+                                double q = 0.0, su = 0.0, dc = 0.0, bk = 0.0;
+                                PlutoJsonNumber(event, "queueMs", &q);
+                                PlutoJsonNumber(event, "streamSetupMs", &su);
+                                PlutoJsonNumber(event, "decodeWaitMs", &dc);
+                                PlutoJsonNumber(event, "totalMs", &bk);
+                                const double a = gPerfShownFrames ? 0.1 : 1.0;
+                                gPerfQueueMs += (q - gPerfQueueMs) * a;
+                                gPerfSetupMs += (su - gPerfSetupMs) * a;
+                                gPerfDecodeMs += (dc - gPerfDecodeMs) * a;
+                                gPerfBackendMs += (bk - gPerfBackendMs) * a;
+                                gPerfUploadMs += ((now - uploadStartedAt) * 1000.0 - gPerfUploadMs) * a;
+                                gPerfEndToEndMs += ((now - gPreviewRequestStartedAt) * 1000.0 - gPerfEndToEndMs) * a;
+                                if (gPerfLastShownAt > 0.0)
+                                    gPerfFrameIntervalMs += ((now - gPerfLastShownAt) * 1000.0 - gPerfFrameIntervalMs) * a;
+                                gPerfLastShownAt = now;
+                                gPerfShownFrames++; gPerfShownInWindow++;
+                                if (now - gPerfFpsWindowAt >= 1.0) {
+                                    gPerfDisplayFps = gPerfShownInWindow / (now - gPerfFpsWindowAt);
+                                    gPerfShownInWindow = 0; gPerfFpsWindowAt = now;
+                                }
+                            }
                             if (previewMoving && now - gPreviewTelemetryAt >= 1.0) {
                                 double queueMs = 0.0, setupMs = 0.0, decodeMs = 0.0, renderMs = 0.0;
                                 PlutoJsonNumber(event, "queueMs", &queueMs);
@@ -578,6 +600,7 @@ static void PlutoPollBackend(void) {
                         gPreviewDirty = previewMoving &&
                             fabsf(gPreviewRequestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
                     } else {
+                        gPerfDiscardedFrames++;
                         gPreviewDirty = true;
                     }
                 } else if (strstr(event, "\"ok\":false")) {
@@ -675,15 +698,12 @@ static void PlutoRequestExport(void) {
     free(utf8);
 }
 
-/* Drag edits send "live":true so the backend records a single undo step per drag. */
-static bool gPropLive;
-
 static bool PlutoTimelineSetPropertyJson(const char *path, const char *valueJson) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     char id[128], escapedPath[128], request[768];
     PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
     PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
-    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s%s}", id, escapedPath, valueJson, gPropLive ? ",\"live\":true" : "");
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s}", id, escapedPath, valueJson);
     bool ok = PlutoTimelineCall(request);
     if (ok) gPreviewDirty = true;
     return ok;
@@ -693,7 +713,7 @@ static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) {
     if (!propertiesJson || propertiesJson[0] != '[' || gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     char id[128], request[8192];
     PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
-    int n = snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s%s}", id, propertiesJson, gPropLive ? ",\"live\":true" : "");
+    int n = snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s}", id, propertiesJson);
     if (n <= 0 || (size_t)n >= sizeof(request)) return false;
     bool ok = PlutoTimelineCall(request);
     if (ok) gPreviewDirty = true;
@@ -703,20 +723,6 @@ static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) {
 static bool PlutoTimelineSetProperty(const char *path, double value) {
     char number[48]; snprintf(number, sizeof(number), "%.6f", value);
     return PlutoTimelineSetPropertyJson(path, number);
-}
-
-static bool PlutoTimelineSetPropertyLive(const char *path, double value) {
-    gPropLive = true;
-    bool ok = PlutoTimelineSetProperty(path, value);
-    gPropLive = false;
-    return ok;
-}
-
-static bool PlutoTimelineSetPropertiesLive(const char *propertiesJson) {
-    gPropLive = true;
-    bool ok = PlutoTimelineSetPropertiesJson(propertiesJson);
-    gPropLive = false;
-    return ok;
 }
 
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) {
@@ -774,8 +780,6 @@ static bool PlutoTimelineSnap(bool enabled) { (void)enabled; return false; }
 static bool PlutoTimelineHistory(bool redo) { (void)redo; return false; }
 static bool PlutoTimelineSetProperty(const char *path, double value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) { (void)propertiesJson; return false; }
-static bool PlutoTimelineSetPropertyLive(const char *path, double value) { (void)path; (void)value; return false; }
-static bool PlutoTimelineSetPropertiesLive(const char *propertiesJson) { (void)propertiesJson; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetStringProperty(const char *path, const char *value) { (void)path; (void)value; return false; }

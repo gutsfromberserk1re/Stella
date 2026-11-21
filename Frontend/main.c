@@ -368,6 +368,7 @@ int main(void) {
             }
         }
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (IsKeyPressed(KEY_F3)) gPerfOverlay = !gPerfOverlay;
         if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
             (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
             int splitCount = 0;
@@ -463,6 +464,7 @@ int main(void) {
         DrawPreviewQualityDropdown();
         DrawPreviewFpsDropdown();
         DrawTimelineContextMenu();
+        DrawPerfOverlay();
         EndDrawing();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
                        gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :
