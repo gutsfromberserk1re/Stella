@@ -15,6 +15,40 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install static FFmpeg decoder libraries and libclang
+        shell: pwsh
+        run: |
+          $version = 'v9.0.2-3'
+          $archiveName = 'ffmpeg-decode-static-x86_64-pc-windows-msvc.tar.xz'
+          $archive = Join-Path $env:RUNNER_TEMP $archiveName
+          $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-decode-static'
+          $url = "https://github.com/martinfrancois/ffmpeg-decode-static/releases/download/$version/$archiveName"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $expectedSha256 = '7821646cb2183f20ef714acaa54575a25d2fe9e50d46bb497e156324d125d766'
+          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Static FFmpeg decoder archive checksum mismatch: $actualSha256"
+          }
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          tar.exe -xf $archive -C $extract
+          if (-not (Test-Path (Join-Path $extract 'include/libavcodec/avcodec.h')) -or
+              -not (Test-Path (Join-Path $extract 'lib/avcodec.lib'))) {
+            throw 'The static FFmpeg decoder archive did not contain the expected MSVC headers and libraries'
+          }
+          "FFMPEG_DIR=$($extract -replace '\\','/')" | Add-Content -Path $env:GITHUB_ENV
+
+          $llvmBin = Join-Path $env:ProgramFiles 'LLVM/bin'
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            choco install llvm --no-progress --yes
+          }
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            $clang = Get-ChildItem -Path $env:ProgramFiles -Filter libclang.dll -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $clang) { throw 'libclang.dll was not found; ffmpeg-sys-next needs LLVM/libclang for binding generation' }
+            $llvmBin = $clang.DirectoryName
+          }
+          "LIBCLANG_PATH=$llvmBin" | Add-Content -Path $env:GITHUB_ENV
+          $llvmBin | Add-Content -Path $env:GITHUB_PATH
+
       - name: Test timeline core
         run: cargo test --manifest-path Backend/Cargo.toml -p pluto-timeline-core
 
@@ -144,9 +178,23 @@ jobs:
 
           test -f ci-build/out/dist/Stella.exe
 
-      - name: Package Rust backend
+      - name: Package Rust backend and FFmpeg decoder build materials
         shell: pwsh
-        run: Copy-Item Backend\target\release\pluto_backend.dll ci-build\out\dist\pluto_backend.dll -Force
+        run: |
+          Copy-Item Backend\target\release\pluto_backend.dll ci-build\out\dist\pluto_backend.dll -Force
+          $decoderDir = Join-Path ci-build\out\dist 'ffmpeg-decode-static'
+          New-Item -ItemType Directory -Path $decoderDir -Force | Out-Null
+          Copy-Item (Join-Path $env:FFMPEG_DIR 'BUILD-INFO') $decoderDir -Force
+          Copy-Item (Join-Path $env:FFMPEG_DIR 'licenses') $decoderDir -Recurse -Force
+          Copy-Item (Join-Path $env:FFMPEG_DIR 'lib') $decoderDir -Recurse -Force
+          Copy-Item (Join-Path $env:FFMPEG_DIR 'include') $decoderDir -Recurse -Force
+          @'
+          Stella links the LGPL-2.1-or-later decode-only FFmpeg libraries from:
+          https://github.com/martinfrancois/ffmpeg-decode-static
+          The exact archive, upstream source versions, checksums and build configuration are recorded in BUILD-INFO.
+          See the licenses directory for FFmpeg, dav1d and zlib license texts.
+          The FFmpeg command-line tools bundled in the full package are distributed separately and have their own GPL notices.
+          '@ | Set-Content -LiteralPath (Join-Path $decoderDir 'THIRD_PARTY_NOTICES.txt') -Encoding UTF8
 
       - name: Package UI icons
         shell: pwsh

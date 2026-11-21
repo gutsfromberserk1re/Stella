@@ -3,4 +3,4 @@
 mod wgpu_renderer;
 
 
-pub use wgpu_renderer::{GpuLayerFrame, GpuPreviewRenderer};
+pub use wgpu_renderer::{GpuLayerFrame, GpuPreviewRenderer, PreviewUniforms};

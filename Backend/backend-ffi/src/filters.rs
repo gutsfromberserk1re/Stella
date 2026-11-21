@@ -47,7 +47,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         filters.push(format!("huesaturation=colors={hsl_range}:hue={hsl_hue:.3}:saturation={hsl_saturation:.4}:intensity={hsl_intensity:.4}:strength=100:lightness=1"));
     }
 
-    /* Keep all color-balance controls in one shared operation for preview/export. */
+    /* Export-side color balance; preview evaluates the matching controls in WGSL below. */
     let preset = effects["preset"]["id"].as_str().unwrap_or("none");
     let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
     let mut balance = [0.0_f64; 9]; // shadows RGB, midtones RGB, highlights RGB
@@ -264,6 +264,167 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let overlay_x = format!("(main_w-overlay_w)/2+{x:.3}{shake_x}");
     let overlay_y = format!("(main_h-overlay_h)/2+{y:.3}{shake_y}");
     (filters.join(","), overlay_x, overlay_y)
+}
+
+
+/// Build the per-clip uniform block consumed by the real-time WGSL preview shader.
+/// Export continues to use `video_filters`; the formulas below intentionally mirror
+/// its color, crop, transform and preset values without invoking FFmpeg filters.
+pub(crate) fn preview_uniforms(
+    clip: &Value,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    transition_in: Option<(&str, f32)>,
+    clip_time_seconds: f64,
+) -> super::renderer::PreviewUniforms {
+    use super::renderer::PreviewUniforms;
+    let props = &clip["props"];
+    let transform = &props["transform"];
+    let colors = &props["colors"];
+    let effects = &props["effects"];
+    let mut out = PreviewUniforms::default();
+    out.source_target = [source_width as f32, source_height as f32, target_width as f32, target_height as f32];
+
+    let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0) as f32;
+    let rotation = n(transform, "rotation", 0.0).to_radians() as f32;
+    let mut transition_kind = 0.0_f32;
+    let mut transition_progress = 1.0_f32;
+    let mut transition_axis = [1.0_f32, 0.0_f32];
+    if let Some((kind, progress)) = transition_in {
+        transition_kind = match kind {
+            "fade" | "crossfade" | "dissolve" | "fadeblack" | "fadewhite" => 1.0,
+            "wipe" | "wipeleft" | "wiperight" | "wipeup" | "wipedown" | "diagtl" | "diagtr" | "diagbl" | "diagbr" => 2.0,
+            "iris" | "circleopen" | "circleclose" | "radial" => 3.0,
+            "slide" | "slideleft" | "slideright" | "slideup" | "slidedown" => 4.0,
+            "dip" => 5.0,
+            _ => 1.0,
+        };
+        transition_axis = match kind {
+            "wipeup" | "slideup" => [0.0, 1.0],
+            "wipedown" | "slidedown" => [0.0, -1.0],
+            "wiperight" | "slideright" => [-1.0, 0.0],
+            "diagtl" => [1.0, 1.0],
+            "diagtr" => [-1.0, 1.0],
+            "diagbl" => [1.0, -1.0],
+            "diagbr" => [-1.0, -1.0],
+            _ => [1.0, 0.0],
+        };
+        transition_progress = progress.clamp(0.0, 1.0);
+    }
+    out.composite = [opacity, rotation, transition_progress, transition_kind];
+
+    let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0) as f32;
+    let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0) as f32;
+    let position_x = (n(&transform["position"], "x", 0.0) / 1920.0) as f32;
+    let position_y = (n(&transform["position"], "y", 0.0) / 1080.0) as f32;
+    out.transform = [scale_w, scale_h, position_x, position_y];
+
+    let crop = &transform["crop"];
+    out.crop = [
+        (n(crop, "left", 0.0) / 1920.0).clamp(0.0, 0.45) as f32,
+        (n(crop, "top", 0.0) / 1080.0).clamp(0.0, 0.45) as f32,
+        (n(crop, "right", 0.0) / 1920.0).clamp(0.0, 0.45) as f32,
+        (n(crop, "bottom", 0.0) / 1080.0).clamp(0.0, 0.45) as f32,
+    ];
+
+    let light = &colors["light"];
+    let color = &colors["color"];
+    let detail = &colors["detail"];
+    let preset = effects["preset"]["id"].as_str().unwrap_or("none");
+    let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
+    let mut brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
+    let mut contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
+    let mut saturation = (1.0 + n(color, "saturation", 0.0) / 100.0).clamp(0.0, 3.0);
+    let vibrance = (n(color, "vibrance", 0.0) / 100.0).clamp(-1.0, 1.0);
+    match preset {
+        "vivid" => { saturation *= 1.0 + 0.7 * intensity; contrast *= 1.08; }
+        "noir" => { saturation *= 1.0 - intensity; contrast *= 1.0 + 0.2 * intensity; brightness -= 0.02 * intensity; }
+        "fade" => { contrast *= 1.0 - 0.16 * intensity; brightness += 0.08 * intensity; saturation *= 1.0 - 0.2 * intensity; }
+        "cinema" => { contrast *= 1.0 + 0.15 * intensity; saturation *= 1.0 - 0.15 * intensity; }
+        _ => {}
+    }
+    out.color = [brightness as f32, contrast as f32, saturation as f32, vibrance as f32];
+
+    let shadow_lift = ((n(light, "shadows", 0.0) + n(light, "blacks", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
+    let highlight_gain = ((n(light, "highlights", 0.0) + n(light, "whites", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
+    let temperature = (n(color, "temperature", 0.0) / 100.0).clamp(-1.0, 1.0);
+    let mut shadows = [shadow_lift + temperature, shadow_lift, shadow_lift - temperature];
+    let mut midtones = [temperature, 0.0, -temperature];
+    let mut highlights = [highlight_gain + temperature, highlight_gain, highlight_gain - temperature];
+    for (key, band) in [("shadows", 0usize), ("tint", 1usize), ("highlights", 2usize)] {
+        if let Some(wheel) = colors["grading"][key].as_object() {
+            let amount = wheel.get("amount").and_then(Value::as_f64).unwrap_or(0.0) / 100.0 * 0.3;
+            let angle = wheel.get("hue").and_then(Value::as_f64).unwrap_or(0.0).to_radians();
+            let add = [amount * angle.cos(), amount * (angle - std::f64::consts::TAU / 3.0).cos(), amount * (angle + std::f64::consts::TAU / 3.0).cos()];
+            let target = match band { 0 => &mut shadows, 1 => &mut midtones, _ => &mut highlights };
+            for i in 0..3 { target[i] += add[i]; }
+        }
+    }
+    match preset {
+        "warm" => for values in [&mut shadows, &mut midtones, &mut highlights] { values[0] += 0.12 * intensity; values[2] -= 0.10 * intensity; },
+        "cool" => for values in [&mut shadows, &mut midtones, &mut highlights] { values[0] -= 0.08 * intensity; values[2] += 0.12 * intensity; },
+        "retro" => for values in [&mut shadows, &mut midtones, &mut highlights] { values[0] += 0.15 * intensity; values[2] -= 0.12 * intensity; },
+        _ => {}
+    }
+    out.shadows = [shadows[0].clamp(-1.0, 1.0) as f32, shadows[1].clamp(-1.0, 1.0) as f32, shadows[2].clamp(-1.0, 1.0) as f32, 0.0];
+    out.midtones = [midtones[0].clamp(-1.0, 1.0) as f32, midtones[1].clamp(-1.0, 1.0) as f32, midtones[2].clamp(-1.0, 1.0) as f32, 0.0];
+    out.highlights = [highlights[0].clamp(-1.0, 1.0) as f32, highlights[1].clamp(-1.0, 1.0) as f32, highlights[2].clamp(-1.0, 1.0) as f32, 0.0];
+
+    let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0) as usize;
+    let hsl_key = hsl_index.to_string();
+    let hsl = &colors["hsl"][hsl_key.as_str()];
+    let hue_centers = [0.0_f64, 0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
+    out.hsl = [
+        (n(hsl, "hue", 0.0) / 360.0) as f32,
+        (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+        (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5) as f32,
+        if hsl_index == 0 { -1.0 } else { (hue_centers[hsl_index] / 360.0) as f32 },
+    ];
+
+    let color_vignette = n(detail, "vignette", 0.0);
+    let effect_vignette = if enabled(effects, "vignette") { n(&effects["vignette"], "amount", 0.0).abs() / 100.0 } else { 0.0 };
+    let vignette = (color_vignette.abs() / 100.0 * 0.75 + effect_vignette * 0.85).clamp(0.0, 1.0);
+    let sharpen = if enabled(effects, "sharpen") { n(&effects["sharpen"], "amount", 45.0) / 100.0 } else { n(detail, "sharpness", 0.0) / 100.0 };
+    let scanline_amount = if enabled(effects, "scanlines") { n(&effects["scanlines"], "amount", 32.0) / 100.0 } else { 0.0 };
+    let posterize = if enabled(effects, "posterize") { n(&effects["posterize"], "levels", 6.0).clamp(2.0, 16.0) } else { 0.0 };
+    out.effects = [vignette as f32, sharpen.clamp(0.0, 1.0) as f32, scanline_amount.clamp(0.0, 1.0) as f32, posterize as f32];
+
+    let pixelate = if enabled(effects, "pixelate") { (n(&effects["pixelate"], "size", 12.0) * n(&effects["pixelate"], "blend", 100.0) / 100.0).clamp(1.0, 80.0) } else { 0.0 };
+    let chromatic = if enabled(effects, "chromatic") { n(&effects["chromatic"], "amount", 0.0).abs() * 0.06 } else { 0.0 };
+    let mirror = if enabled(effects, "mirror") { 1.0 } else { 0.0 };
+    let glow = if enabled(effects, "glow") { n(&effects["glow"], "amount", 0.0).clamp(0.0, 100.0) / 100.0 } else { 0.0 };
+    out.effects2 = [pixelate as f32, chromatic as f32, mirror, glow as f32];
+
+    let blur = if enabled(effects, "blur") { n(&effects["blur"], "amount", 0.0).clamp(0.0, 100.0) * 0.04 } else { 0.0 };
+    let grain = if enabled(effects, "grain") { n(&effects["grain"], "amount", 0.0).clamp(0.0, 100.0) / 100.0 } else if preset == "retro" { intensity * 0.12 } else { 0.0 };
+    let film_burn = if enabled(effects, "filmBurn") { n(&effects["filmBurn"], "amount", 42.0).clamp(0.0, 100.0) / 100.0 } else { 0.0 };
+    let shake = if enabled(effects, "shake") { n(&effects["shake"], "amount", 18.0).clamp(0.0, 100.0) * 0.03 } else { 0.0 };
+    out.effects3 = [blur as f32, grain as f32, film_burn as f32, shake as f32];
+
+    let halftone = if enabled(effects, "halftone") { n(&effects["halftone"], "amount", 50.0).clamp(0.0, 100.0) / 100.0 } else { 0.0 };
+    let lens = if enabled(effects, "lens") { n(&effects["lens"], "amount", 55.0) / 100.0 * 0.22 } else if enabled(effects, "fisheye") { n(&effects["fisheye"], "amount", 40.0) / 100.0 * 0.22 } else { 0.0 };
+    let glitch = if enabled(effects, "glitch") { n(&effects["glitch"], "amount", 0.0) / 100.0 } else { 0.0 };
+    let scanline_spacing = if enabled(effects, "scanlines") { n(&effects["scanlines"], "spacing", 4.0).max(1.0) } else { 4.0 };
+    out.effects4 = [halftone as f32, lens as f32, glitch as f32, scanline_spacing as f32];
+
+    let distort = &transform["distort"];
+    out.distort = [n(distort, "tl", 0.0) as f32, n(distort, "tr", 0.0) as f32,
+                   n(distort, "br", 0.0) as f32, n(distort, "bl", 0.0) as f32];
+    out.transition = [transition_axis[0], transition_axis[1], 0.02, clip_time_seconds as f32];
+    let light_leak = &effects["lightLeak"];
+    out.effects5 = if enabled(effects, "lightLeak") {
+        [
+            (n(light_leak, "amount", 40.0) / 100.0 * 0.5).clamp(0.0, 0.5) as f32,
+            (n(light_leak, "warmth", 70.0) / 100.0).clamp(0.0, 1.0) as f32,
+            (n(light_leak, "position", 35.0) / 100.0).clamp(0.0, 1.0) as f32,
+            (n(&effects["filmBurn"], "flicker", 12.0) / 100.0 * 0.45).clamp(0.0, 0.45) as f32,
+        ]
+    } else {
+        [0.0, 0.0, 0.0, (n(&effects["filmBurn"], "flicker", 12.0) / 100.0 * 0.45).clamp(0.0, 0.45) as f32]
+    };
+    out
 }
 
 pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {

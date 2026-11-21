@@ -5,6 +5,7 @@
 
 use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
+mod decoder;
 mod filters;
 mod renderer;
 use std::{
@@ -29,8 +30,9 @@ struct Backend {
     redo: Mutex<Vec<Timeline>>,
     next_task: AtomicU64,
     task_tx: Sender<(u64, Value)>,
-    preview_task_tx: Sender<(u64, Value)>,
+    preview_task_tx: Sender<(u64, Value, Arc<Timeline>)>,
     proxy_task_tx: Sender<(u64, Value)>,
+    preview_timeline: std::sync::RwLock<Arc<Timeline>>,
     event_rx: Mutex<Receiver<String>>,
     preview_inflight: Arc<AtomicBool>,
 }
@@ -52,7 +54,9 @@ impl Default for PreviewFrame {
 }
 
 #[derive(Default)]
-struct PreviewEngine;
+struct PreviewEngine {
+    decoders: decoder::DecoderPool,
+}
 
 fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
     let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
@@ -97,7 +101,7 @@ fn preview_source_path(clip: &Clip) -> String {
 fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
-        let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value)>();
+        let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value, Arc<Timeline>)>();
         let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
         let (event_tx, event_rx) = mpsc::channel::<String>();
         let preview_inflight = Arc::new(AtomicBool::new(false));
@@ -117,14 +121,16 @@ fn backend() -> &'static Backend {
             .name("stella-proxy-worker".into())
             .spawn(move || proxy_worker(proxy_task_rx, proxy_events))
             .expect("failed to start Stella proxy worker");
+        let initial_timeline = Arc::new(Timeline::default());
         Backend {
-            timeline: Mutex::new(Timeline::default()),
+            timeline: Mutex::new((*initial_timeline).clone()),
             undo: Mutex::new(Vec::new()),
             redo: Mutex::new(Vec::new()),
             next_task: AtomicU64::new(1),
             task_tx,
             preview_task_tx,
             proxy_task_tx,
+            preview_timeline: std::sync::RwLock::new(initial_timeline),
             event_rx: Mutex::new(event_rx),
             preview_inflight,
         }
@@ -166,24 +172,24 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, proxy_tas
     }
 }
 
-fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
-    /* The preview worker owns decode and GPU rendering requests so FFmpeg and
-       wgpu waits never stall the UI thread or media-import worker. */
+fn preview_worker(tasks: Receiver<(u64, Value, Arc<Timeline>)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
+    /* This thread owns persistent libav decoder contexts, frame caches, and the
+       wgpu preview renderer. The UI sends only a playhead and display settings. */
     let mut engine = PreviewEngine::default();
-    while let Ok((id, request)) = tasks.recv() {
+    while let Ok((id, request, timeline)) = tasks.recv() {
         let queued_ms = request["submittedAtMs"].as_u64().unwrap_or(0);
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let queue_ms = now_ms.saturating_sub(queued_ms);
         let total_started = Instant::now();
-        let (result, setup_ms, decode_ms, gpu_ms) = engine.render(&request, id);
+        let (result, decode_ms, gpu_ms) = engine.render(&request, &timeline, id);
         preview_inflight.store(false, Ordering::Release);
         let response = match result {
             Ok((width, height, at)) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
                 "width":width,"height":height,"at":at,"queueMs":queue_ms,
-                "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"gpuRenderMs":gpu_ms,
+                "decodeMs":decode_ms,"gpuRenderMs":gpu_ms,
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
-                "queueMs":queue_ms,"streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"gpuRenderMs":gpu_ms,
+                "queueMs":queue_ms,"decodeMs":decode_ms,"gpuRenderMs":gpu_ms,
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
         };
         if events.send(response.to_string()).is_err() { break; }
@@ -714,99 +720,102 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     Ok(json!({"outputPath": output_path, "duration": duration, "width": width, "height": height, "fps": fps}))
 }
 
-fn decode_video_frame(path: &str, seek: f64) -> Result<(u32, u32, Vec<u8>), String> {
-    let ffmpeg = multimedia_binary("ffmpeg");
-    let mut command = media_command(&ffmpeg);
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if seek > 0.0001 { command.args(["-ss", &format!("{seek:.6}")]); }
-    command.args(["-i", path, "-frames:v", "1", "-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
-    // FFmpeg is used only to decode a single source frame. Dimensions are read
-    // separately from the media metadata, never set by a preview filter graph.
-    let (width, height) = probe_video_dimensions(path)?;
-    let output = command.output().map_err(|error| format!("Could not start FFmpeg decoder: {error}"))?;
-    if !output.status.success() { return Err(ffmpeg_error(output)); }
-    let expected = width as usize * height as usize * 4;
-    if output.stdout.len() != expected {
-        return Err(format!("Decoder returned {} bytes; expected {expected} for {width}x{height} RGBA", output.stdout.len()));
-    }
-    Ok((width, height, output.stdout))
-}
-
-
-fn probe_video_dimensions(path: &str) -> Result<(u32, u32), String> {
-    let ffprobe = multimedia_binary("ffprobe");
-    let output = media_command(&ffprobe)
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
-        .arg(path).output().map_err(|error| format!("Could not start FFprobe: {error}"))?;
-    if !output.status.success() { return Err(ffmpeg_error(output)); }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text.trim().split(',');
-    let width = parts.next().and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0).ok_or("Invalid decoded video width")?;
-    let height = parts.next().and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0).ok_or("Invalid decoded video height")?;
-    Ok((width, height))
-}
-
-
 impl PreviewEngine {
-    fn render(&mut self, request: &Value, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64, f64) {
-        let started = Instant::now();
+    fn render(&mut self, request: &Value, timeline: &Timeline, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64) {
         let mut decode_ms = 0.0;
         let mut gpu_ms = 0.0;
         let result = (|| -> Result<(u32, u32, f64), String> {
-            let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
             let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
             let height = request["height"].as_u64().unwrap_or(720).clamp(240, 1080) as u32;
             let width = ((height as f64 * 16.0 / 9.0).round() as u32) & !1;
             let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
             let frame_at = (at * fps as f64).round() / fps as f64;
-            let mut active: Vec<&Clip> = timeline.clips.iter()
-                .filter(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio") && frame_at >= clip.start && frame_at < clip.end())
-                .collect();
-            active.sort_by(|a, b| {
+
+            // Collect clips that are active now plus incoming clips during their
+            // outgoing-neighbour's transition window. Decoder state is retained
+            // by source path in DecoderPool between preview requests.
+            let mut active: Vec<(&Clip, Option<(String, f64, f64)>)> = Vec::new();
+            for clip in timeline.clips.iter().filter(|clip| {
+                clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+            }) {
+                if frame_at >= clip.start && frame_at < clip.end() {
+                    active.push((clip, None));
+                    continue;
+                }
+                if frame_at >= clip.start { continue; }
+                let mut incoming = None;
+                for left in timeline.clips.iter().filter(|left| left.track == clip.track && left.end() <= clip.start + 0.04) {
+                    if let Some((kind, duration)) = transition_between(left, clip) {
+                        let start = (clip.start - duration).max(0.0);
+                        if frame_at >= start && frame_at < clip.start {
+                            incoming = Some((kind, duration, frame_at - start));
+                            break;
+                        }
+                    }
+                }
+                if incoming.is_some() { active.push((clip, incoming)); }
+            }
+
+            active.sort_by(|(a, _), (b, _)| {
                 let rank = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, _ => 4 };
                 rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
             });
+
             if active.is_empty() {
                 publish_black_frame(id, width, height, frame_at)?;
                 return Ok((width, height, frame_at));
             }
-            let mut decoded_layers: Vec<(Vec<u8>, u32, u32, f32)> = Vec::with_capacity(active.len());
-            for clip in active {
-                let opacity = clip.extra.get("props").and_then(|p| p.get("transform")).and_then(|t| t.get("opacity"))
-                    .and_then(Value::as_f64).unwrap_or(100.0).clamp(0.0, 100.0) as f32 / 100.0;
-                if opacity <= 0.0 { continue; }
+
+            let mut decoded_layers: Vec<(String, decoder::DecodedFrame, renderer::PreviewUniforms)> = Vec::with_capacity(active.len());
+            for (clip, transition) in active {
+                let transition_progress = transition.as_ref().map(|(_, duration, elapsed)| {
+                    (elapsed / duration.max(0.001)).clamp(0.0, 1.0) as f32
+                });
+                let transition_info = transition.as_ref().map(|(kind, _, _)| (kind.as_str(), transition_progress.unwrap_or(1.0)));
+
                 let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
                 if original.is_empty() { return Err(format!("Video clip '{}' has no source path", clip.label)); }
                 let path = preview_source_path(clip);
                 if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
+
                 let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-                let source_at = source_offset + (frame_at - clip.start).max(0.0);
+                let clip_elapsed = transition.as_ref().map(|(_, _, elapsed)| *elapsed).unwrap_or_else(|| (frame_at - clip.start).max(0.0));
+                let source_at = source_offset + clip_elapsed;
                 let decode_started = Instant::now();
-                let (source_width, source_height, decoded) = decode_video_frame(&path, source_at)?;
+                let frame = self.decoders.frame_at(&path, source_at)?;
                 decode_ms += decode_started.elapsed().as_secs_f64() * 1000.0;
-                decoded_layers.push((decoded, source_width, source_height, opacity));
+                let uniforms = filters::preview_uniforms(
+                    &clip.extra,
+                    frame.width,
+                    frame.height,
+                    width,
+                    height,
+                    transition_info,
+                    source_at,
+                );
+                decoded_layers.push((clip.id.clone(), frame, uniforms));
             }
+
             if decoded_layers.is_empty() {
                 publish_black_frame(id, width, height, frame_at)?;
                 return Ok((width, height, frame_at));
             }
+
             let gpu_started = Instant::now();
-            let layers: Vec<renderer::GpuLayerFrame<'_>> = decoded_layers.iter().map(|(pixels, w, h, opacity)| renderer::GpuLayerFrame {
-                pixels, width: *w, height: *h, opacity: *opacity,
+            let layers: Vec<renderer::GpuLayerFrame<'_>> = decoded_layers.iter().map(|(key, frame, uniforms)| renderer::GpuLayerFrame {
+                key,
+                pixels: frame.rgba.as_slice(),
+                width: frame.width,
+                height: frame.height,
+                uniforms: *uniforms,
             }).collect();
             let composited = renderer::GpuPreviewRenderer::composite_rgba(&layers, width, height)?;
             gpu_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
-            let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
-            let mut slot = slot.lock().map_err(|_| "Preview frame lock failed")?;
-            slot.pixels = composited;
-            slot.request_id = id;
-            slot.width = width;
-            slot.height = height;
-            slot.at = frame_at;
+            let mut pixels = composited;
+            publish_preview_buffer(id, width, height, frame_at, &mut pixels, false)?;
             Ok((width, height, frame_at))
         })();
-        let _total_render_ms = started.elapsed().as_secs_f64() * 1000.0;
-        (result, 0.0, decode_ms, gpu_ms)
+        (result, decode_ms, gpu_ms)
     }
 }
 
@@ -817,7 +826,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
         .lock()
         .map_err(|_| "Timeline lock failed".to_owned())?;
     let command = request["command"].as_str().ok_or("Command is required")?;
-    match command {
+    let result = match command {
         "timeline_get" => serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()),
         "timeline_undo" => {
             let previous = backend.undo.lock().map_err(|_| "Undo history lock failed")?.pop()
@@ -990,7 +999,16 @@ fn dispatch(request: Value) -> Result<Value, String> {
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         _ => Err(format!("Unsupported command: {command}")),
+    };
+    // Maintain a cheap immutable snapshot for preview requests. This moves the
+    // timeline clone to edit time rather than serializing/deserializing the
+    // entire project on every playback frame.
+    if result.is_ok() && command != "timeline_get" {
+        if let Ok(mut snapshot) = backend.preview_timeline.write() {
+            *snapshot = Arc::new(timeline.clone());
+        }
     }
+    result
 }
 
 fn save_history(backend: &Backend, before: Timeline) -> Result<(), String> {
@@ -1090,25 +1108,27 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             request["submittedAtMs"] = json!(now_ms);
         }
-        if matches!(command.as_str(), "preview_frame" | "export_project") && request["timeline"].is_null() {
-            let timeline = match backend.timeline.lock() {
-                Ok(timeline) => timeline.clone(),
-                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
+        if command == "export_project" && request["timeline"].is_null() {
+            let timeline = match backend.preview_timeline.read() {
+                Ok(timeline) => (**timeline).clone(),
+                Err(_) => return 0,
             };
             request["timeline"] = match serde_json::to_value(timeline) {
                 Ok(value) => value,
-                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
+                Err(_) => return 0,
             };
         }
         let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
-        let sender = if is_preview { &backend.preview_task_tx }
-            else if command == "generate_proxy" { &backend.proxy_task_tx }
-            else { &backend.task_tx };
-        if sender.send((id, request)).is_ok() {
-            id
+        if is_preview {
+            let snapshot = match backend.preview_timeline.read() {
+                Ok(value) => Arc::clone(&value),
+                Err(_) => { backend.preview_inflight.store(false, Ordering::Release); return 0; }
+            };
+            if backend.preview_task_tx.send((id, request, snapshot)).is_ok() { id }
+            else { backend.preview_inflight.store(false, Ordering::Release); 0 }
         } else {
-            if is_preview { backend.preview_inflight.store(false, Ordering::Release); }
-            0
+            let sender = if command == "generate_proxy" { &backend.proxy_task_tx } else { &backend.task_tx };
+            if sender.send((id, request)).is_ok() { id } else { 0 }
         }
     }))
     .unwrap_or(0)

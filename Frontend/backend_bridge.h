@@ -532,15 +532,17 @@ static void PlutoPollBackend(void) {
             if (matchingRequest) {
                 gPreviewTaskId = 0;
                 bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
-                float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
                 bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
                 bool newerInDirection = gPreviewDisplayedAt < 0.f ||
-                    (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
-                             : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
-                bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
+                    (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / fmaxf(1.f, (float)gPreviewFps)
+                             : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / fmaxf(1.f, (float)gPreviewFps));
+                /* Show the newest completed frame in the current travel direction.
+                   Do not reject it just because decoding took longer than an arbitrary
+                   200ms window; while the worker finishes, keep the UI responsive and
+                   request the next playhead frame immediately after this upload. */
                 bool currentRequest = gPreviewRequestRes == gPreviewRes &&
-                    (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
-                     fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
+                    (previewMoving ? newerInDirection : (!gPreviewDirty &&
+                     fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / fmaxf(1.f, (float)gPreviewFps))));
                 if (strstr(event, "\"ok\":true")) {
                     double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
                     bool frameMatchesRequest =
@@ -560,12 +562,12 @@ static void PlutoPollBackend(void) {
                             if (previewMoving && now - gPreviewTelemetryAt >= 1.0) {
                                 double queueMs = 0.0, decodeMs = 0.0, gpuMs = 0.0, renderMs = 0.0;
                                 PlutoJsonNumber(event, "queueMs", &queueMs);
-                                PlutoJsonNumber(event, "decodeWaitMs", &decodeMs);
+                                PlutoJsonNumber(event, "decodeMs", &decodeMs);
                                 PlutoJsonNumber(event, "gpuRenderMs", &gpuMs);
                                 PlutoJsonNumber(event, "totalMs", &renderMs);
                                 char timing[256];
                                 snprintf(timing, sizeof(timing),
-                                    "[Stella preview] end-to-end=%.1fms queue=%.1fms decode=%.1fms gpu-upload/render/readback=%.1fms surface-upload=%.1fms backend=%.1fms\n",
+                                    "[Stella preview] end-to-end=%.1fms queue=%.1fms decode=%.1fms GPU-composite/readback=%.1fms surface-upload=%.1fms backend=%.1fms\n",
                                     (now - gPreviewRequestStartedAt) * 1000.0, queueMs, decodeMs, gpuMs,
                                     (now - uploadStartedAt) * 1000.0, renderMs);
                                 OutputDebugStringA(timing);
