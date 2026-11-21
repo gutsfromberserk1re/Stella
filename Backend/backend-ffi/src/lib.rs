@@ -319,7 +319,9 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v3.jpg"));
+    // v4 uses in-process libav decoding and a small BMP cache. Bumping the
+    // version makes older missing/failed JPEG thumbnails regenerate automatically.
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v4.bmp"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
     } else { std::path::PathBuf::new() };
@@ -342,32 +344,17 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let thumbnail_path = if kind == "audio" {
         None
     } else {
-        let generated = if thumbnail.metadata().is_ok_and(|meta| meta.len() > 128) {
+        let cached = thumbnail.metadata().is_ok_and(|meta| meta.len() >= 54 + 320 * 180 * 3);
+        let generated = if cached {
             true
         } else {
             let _ = std::fs::remove_file(&thumbnail);
-            let mut command = media_command(&ffmpeg);
-            command.args(["-v", "error"]);
-            if kind == "video" {
-                let seek = format!("{:.3}", (duration * 0.1).min(2.0));
-                command.args(["-ss", seek.as_str()]);
-            }
-            command.arg("-i").arg(path)
-                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
-                .arg(&thumbnail);
-            let first_attempt = command.status().is_ok_and(|status| status.success())
-                && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
-            if first_attempt {
-                true
-            } else {
-                let _ = std::fs::remove_file(&thumbnail);
-                let mut fallback = media_command(&ffmpeg);
-                fallback.args(["-v", "error", "-i"]).arg(path)
-                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
-                    .arg(&thumbnail)
-                    .status()
-                    .is_ok_and(|status| status.success())
-                    && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
+            match decoder::write_thumbnail(&path.to_string_lossy(), &thumbnail, 320, 180) {
+                Ok(()) => thumbnail.metadata().is_ok_and(|meta| meta.len() >= 54 + 320 * 180 * 3),
+                Err(error) => {
+                    eprintln!("[Stella media] thumbnail generation failed for '{}': {error}", path.display());
+                    false
+                }
             }
         };
         generated.then(|| thumbnail.to_string_lossy().into_owned())
@@ -765,7 +752,8 @@ impl PreviewEngine {
                 return Ok((width, height, frame_at));
             }
 
-            let mut decoded_layers: Vec<(String, decoder::DecodedFrame, renderer::PreviewUniforms)> = Vec::with_capacity(active.len());
+            let no_props = Value::Null;
+            let mut decoded_layers: Vec<(String, decoder::DecodedFrame, renderer::LayerUniforms)> = Vec::with_capacity(active.len());
             for (clip, transition) in active {
                 let transition_progress = transition.as_ref().map(|(_, duration, elapsed)| {
                     (elapsed / duration.max(0.001)).clamp(0.0, 1.0) as f32
@@ -783,15 +771,9 @@ impl PreviewEngine {
                 let decode_started = Instant::now();
                 let frame = self.decoders.frame_at(&path, source_at)?;
                 decode_ms += decode_started.elapsed().as_secs_f64() * 1000.0;
-                let uniforms = filters::preview_uniforms(
-                    &clip.extra,
-                    frame.width,
-                    frame.height,
-                    width,
-                    height,
-                    transition_info,
-                    source_at,
-                );
+                let props = clip.extra.get("props").unwrap_or(&no_props);
+                let uniforms = renderer::LayerUniforms::from_props_with_transition(props, source_at, transition_info);
+                if uniforms.opacity() <= 0.0 { continue; }
                 decoded_layers.push((clip.id.clone(), frame, uniforms));
             }
 

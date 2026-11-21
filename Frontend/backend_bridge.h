@@ -616,6 +616,9 @@ static void PlutoPollBackend(void) {
                 if (PlutoJsonString(event, "thumbnailPath", asset->thumbnailPath, sizeof(asset->thumbnailPath))) {
                     asset->thumbnail = LoadTexture(asset->thumbnailPath);
                     if (asset->thumbnail.id) SetTextureFilter(asset->thumbnail, TEXTURE_FILTER_BILINEAR);
+                    else TraceLog(LOG_WARNING, "Stella: could not load media thumbnail: %s", asset->thumbnailPath);
+                } else if (strcmp(kind, "audio") != 0) {
+                    TraceLog(LOG_WARNING, "Stella: backend returned no thumbnail for media: %s", name);
                 }
                 gBackendMessage[0] = 0;
             }

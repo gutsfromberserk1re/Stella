@@ -52,6 +52,9 @@ jobs:
       - name: Test timeline core
         run: cargo test --manifest-path Backend/Cargo.toml -p pluto-timeline-core
 
+      - name: Test preview parameter mapping and media thumbnails
+        run: cargo test --manifest-path Backend/Cargo.toml -p pluto-backend-ffi
+
       - name: Build Rust C ABI backend
         run: cargo build --release --manifest-path Backend/Cargo.toml -p pluto-backend-ffi
 

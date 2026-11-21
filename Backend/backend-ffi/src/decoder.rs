@@ -104,6 +104,37 @@ impl VideoDecoder {
         Ok(())
     }
 
+    fn decode_first_frame(&mut self) -> Result<DecodedFrame, String> {
+        let mut decoded = frame::Video::empty();
+        let mut packet = ffmpeg::Packet::empty();
+        loop {
+            match packet.read(&mut self.input) {
+                Ok(()) => {
+                    if packet.stream() == self.stream_index {
+                        self.decoder.send_packet(&packet)
+                            .map_err(|error| format!("Thumbnail decode packet failed: {error}"))?;
+                        while self.decoder.receive_frame(&mut decoded).is_ok() {
+                            let timestamp = decoded.timestamp().or_else(|| decoded.pts())
+                                .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
+                            return convert_frame_to_rgba(&decoded, timestamp);
+                        }
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => {
+                    self.decoder.send_eof()
+                        .map_err(|error| format!("Thumbnail decoder flush failed: {error}"))?;
+                    while self.decoder.receive_frame(&mut decoded).is_ok() {
+                        let timestamp = decoded.timestamp().or_else(|| decoded.pts())
+                            .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
+                        return convert_frame_to_rgba(&decoded, timestamp);
+                    }
+                    return Err("No video frame was available for this media thumbnail".into());
+                }
+                Err(error) => return Err(format!("Could not read media for thumbnail: {error}")),
+            }
+        }
+    }
+
     fn decode_at(&mut self, target_seconds: f64) -> Result<DecodedFrame, String> {
         let target = target_seconds.max(0.0);
         let tolerance = (0.5 / self.frame_rate).max(0.002);
@@ -154,6 +185,114 @@ impl VideoDecoder {
         }
     }
 
+}
+
+/// Decode a single source frame in-process, downscale it to a small 16:9 bitmap,
+/// and write a BMP that Raylib can load in both the lite and full distributions.
+/// This deliberately avoids the FFmpeg CLI so media-library thumbnails work in
+/// the lite package (which ships decoder libraries but not ffmpeg.exe).
+pub fn write_thumbnail(path: &str, destination: &Path, target_width: u32, target_height: u32) -> Result<(), String> {
+    if target_width == 0 || target_height == 0 {
+        return Err("Thumbnail dimensions must be nonzero".into());
+    }
+    let mut decoder = VideoDecoder::open(path)?;
+    let decoded = decoder.decode_first_frame()?;
+    let thumbnail = resize_rgba_fit(&decoded, target_width, target_height)?;
+    write_bmp24(destination, target_width, target_height, &thumbnail)
+}
+
+fn resize_rgba_fit(source: &DecodedFrame, target_width: u32, target_height: u32) -> Result<Vec<u8>, String> {
+    let source_width = source.width as usize;
+    let source_height = source.height as usize;
+    let expected = source_width.checked_mul(source_height).and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "Thumbnail source dimensions overflowed".to_owned())?;
+    if source.rgba.len() != expected || source_width == 0 || source_height == 0 {
+        return Err("Thumbnail source frame has invalid RGBA data".into());
+    }
+    let target_w = target_width as usize;
+    let target_h = target_height as usize;
+    let scale = (target_w as f64 / source_width as f64).min(target_h as f64 / source_height as f64);
+    let draw_w = ((source_width as f64 * scale).round() as usize).clamp(1, target_w);
+    let draw_h = ((source_height as f64 * scale).round() as usize).clamp(1, target_h);
+    let offset_x = (target_w - draw_w) / 2;
+    let offset_y = (target_h - draw_h) / 2;
+    let mut output = vec![0u8; target_w * target_h * 4];
+    // Opaque dark backing makes transparent PNGs and letterboxed media thumbnails clean.
+    for pixel in output.chunks_exact_mut(4) { pixel.copy_from_slice(&[12, 13, 17, 255]); }
+
+    let sample = |x: usize, y: usize, channel: usize| -> f64 {
+        source.rgba[(y * source_width + x) * 4 + channel] as f64
+    };
+    for dy in 0..draw_h {
+        let sy = (((dy as f64 + 0.5) * source_height as f64 / draw_h as f64) - 0.5)
+            .clamp(0.0, source_height.saturating_sub(1) as f64);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(source_height - 1);
+        let fy = sy - y0 as f64;
+        for dx in 0..draw_w {
+            let sx = (((dx as f64 + 0.5) * source_width as f64 / draw_w as f64) - 0.5)
+                .clamp(0.0, source_width.saturating_sub(1) as f64);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(source_width - 1);
+            let fx = sx - x0 as f64;
+            let destination_index = ((offset_y + dy) * target_w + offset_x + dx) * 4;
+            let alpha = (sample(x0, y0, 3) * (1.0 - fx) * (1.0 - fy)
+                + sample(x1, y0, 3) * fx * (1.0 - fy)
+                + sample(x0, y1, 3) * (1.0 - fx) * fy
+                + sample(x1, y1, 3) * fx * fy) / 255.0;
+            for channel in 0..3 {
+                let value = sample(x0, y0, channel) * (1.0 - fx) * (1.0 - fy)
+                    + sample(x1, y0, channel) * fx * (1.0 - fy)
+                    + sample(x0, y1, channel) * (1.0 - fx) * fy
+                    + sample(x1, y1, channel) * fx * fy;
+                // Composite alpha over the dark library-tile background.
+                output[destination_index + channel] = (value * alpha / 255.0
+                    + [12.0, 13.0, 17.0][channel] * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
+            }
+            output[destination_index + 3] = 255;
+        }
+    }
+    Ok(output)
+}
+
+fn write_bmp24(destination: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let row_bytes = width.checked_mul(3).ok_or_else(|| "Thumbnail bitmap row size overflowed".to_owned())?;
+    let padded_row = (row_bytes + 3) & !3;
+    let image_bytes = padded_row.checked_mul(height).ok_or_else(|| "Thumbnail bitmap size overflowed".to_owned())?;
+    let file_bytes = 54u32.checked_add(image_bytes).ok_or_else(|| "Thumbnail bitmap file size overflowed".to_owned())?;
+    if rgba.len() != width as usize * height as usize * 4 {
+        return Err("Thumbnail bitmap received invalid RGBA data".into());
+    }
+
+    let mut header = [0u8; 54];
+    header[0..2].copy_from_slice(b"BM");
+    header[2..6].copy_from_slice(&file_bytes.to_le_bytes());
+    header[10..14].copy_from_slice(&54u32.to_le_bytes());
+    header[14..18].copy_from_slice(&40u32.to_le_bytes());
+    header[18..22].copy_from_slice(&(width as i32).to_le_bytes());
+    header[22..26].copy_from_slice(&(height as i32).to_le_bytes());
+    header[26..28].copy_from_slice(&1u16.to_le_bytes());
+    header[28..30].copy_from_slice(&24u16.to_le_bytes());
+    header[34..38].copy_from_slice(&image_bytes.to_le_bytes());
+    header[38..42].copy_from_slice(&2835i32.to_le_bytes());
+    header[42..46].copy_from_slice(&2835i32.to_le_bytes());
+
+    let mut file = std::fs::File::create(destination)
+        .map_err(|error| format!("Could not create media thumbnail '{}': {error}", destination.display()))?;
+    use std::io::Write;
+    file.write_all(&header).map_err(|error| format!("Could not write thumbnail header: {error}"))?;
+    let mut row = vec![0u8; padded_row as usize];
+    for y in (0..height as usize).rev() {
+        let row_start = y * width as usize * 4;
+        for x in 0..width as usize {
+            let source_index = row_start + x * 4;
+            let target_index = x * 3;
+            row[target_index..target_index + 3]
+                .copy_from_slice(&[rgba[source_index + 2], rgba[source_index + 1], rgba[source_index]]);
+        }
+        file.write_all(&row).map_err(|error| format!("Could not write thumbnail row: {error}"))?;
+    }
+    file.flush().map_err(|error| format!("Could not finish media thumbnail: {error}"))
 }
 
 fn clamp_byte(value: f32) -> u8 { value.round().clamp(0.0, 255.0) as u8 }
@@ -407,3 +546,31 @@ impl DecoderPool {
 #[cfg(windows)]
 #[link(name = "bcrypt")]
 extern "C" {}
+
+
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_writer_outputs_small_loadable_bmp() {
+        let source = DecodedFrame {
+            width: 2,
+            height: 1,
+            pts_seconds: 0.0,
+            rgba: Arc::new(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+        };
+        let resized = resize_rgba_fit(&source, 4, 4).expect("thumbnail resize");
+        assert_eq!(resized.len(), 4 * 4 * 4);
+        assert_eq!(&resized[0..4], &[12, 13, 17, 255]); // letterbox is opaque
+
+        let path = std::env::temp_dir().join(format!("stella-thumbnail-test-{}.bmp", std::process::id()));
+        write_bmp24(&path, 4, 4, &resized).expect("write BMP thumbnail");
+        let bytes = std::fs::read(&path).expect("read BMP thumbnail");
+        assert_eq!(&bytes[0..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bytes[18..22].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(bytes[22..26].try_into().unwrap()), 4);
+        assert_eq!(bytes.len(), 54 + 4 * 4 * 3);
+        let _ = std::fs::remove_file(path);
+    }
+}
