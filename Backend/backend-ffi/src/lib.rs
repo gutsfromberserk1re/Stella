@@ -314,7 +314,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v3.jpg"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
     } else { std::path::PathBuf::new() };

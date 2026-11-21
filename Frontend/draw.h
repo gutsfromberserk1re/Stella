@@ -338,8 +338,14 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
                     CubicStroke(P(.15, .62), P(.10, .79), P(.24, .90), P(.39, .80), t, c);
                     CubicStroke(P(.39, .80), P(.47, .73), P(.54, .64), P(.57, .56), t, c);
                 } break;
-    case I_DISTORT: StrokeRR((Rectangle){x + .1f * w, y + .15f * h, .8f * w, .7f * h}, .14f * w, t, c);
-                    LN(.1, .5, .9, .5); LN(.5, .15, .5, .5); break;
+    case I_DISTORT: {
+                    /* Perspective mesh: four corner handles connected to a clean inner frame. */
+                    LN(.18, .22, .82, .22); LN(.82, .22, .78, .78); LN(.78, .78, .22, .78); LN(.22, .78, .18, .22);
+                    LN(.18, .22, .34, .38); LN(.82, .22, .66, .38); LN(.22, .78, .34, .62); LN(.78, .78, .66, .62);
+                    LN(.34, .38, .66, .38); LN(.66, .38, .66, .62); LN(.66, .62, .34, .62); LN(.34, .62, .34, .38);
+                    DrawCircleV(P(.18, .22), .055f * w, c); DrawCircleV(P(.82, .22), .055f * w, c);
+                    DrawCircleV(P(.22, .78), .055f * w, c); DrawCircleV(P(.78, .78), .055f * w, c);
+                } break;
     case I_SKIP_B:  LN(.28, .2, .28, .8); LN(.76, .2, .4, .5); LN(.4, .5, .76, .8); break;
     case I_SKIP_F:  LN(.72, .2, .72, .8); LN(.24, .2, .6, .5); LN(.6, .5, .24, .8); break;
     case I_PLAY:    Tri(P(.3, .16), P(.3, .84), P(.84, .5), c); break;
@@ -451,10 +457,10 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
         for (int i = 0; i < 72; i++)
-            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
+            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .58f, .76f));
         Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 9.5f + 1.5f * cu->f;
+        float dot = 7.2f + 0.8f * cu->f;
         DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
         DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
     } break;
@@ -586,7 +592,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
+                : (Rectangle){r.x + 2.f, r.y + r.height - 17.f, fmaxf(0.f, r.width - 4.f), 14.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
                            (Vector2){0, 0}, 0.f, WHITE);
