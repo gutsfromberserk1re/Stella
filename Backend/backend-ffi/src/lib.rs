@@ -636,7 +636,7 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
     let mut body_layers: Vec<Option<(String, String, String)>> = vec![None; video_clips.len()];
     for (i, clip) in video_clips.iter().enumerate() {
         let value = serde_json::to_value(clip).unwrap_or_default();
-        let (filters, x, y) = filters::video_filters(&value, width, height, clip.start, clip.duration, None, None);
+        let (filters, x, y) = filters::video_filters(&value, width, height, fps, clip.start, clip.duration, None, None);
         let label = format!("vbody{i}");
         graph.push(format!("[{}]{filters}[{label}]", video_branches[i].0));
         body_layers[i] = Some((label, x, y));
@@ -654,8 +654,8 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let mut right_value = serde_json::to_value(right).map_err(|e| e.to_string())?;
         left_value["sourceOffset"] = json!(left_source);
         right_value["sourceOffset"] = json!(right_source);
-        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None);
-        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
+        let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, fps, 0.0, *duration, None, None);
+        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, fps, 0.0, *duration, None, None);
         let left_raw = format!("tx{i}a_raw");
         let right_raw = format!("tx{i}b_raw");
         let left_full = format!("tx{i}a");

@@ -835,7 +835,7 @@ static void Accordion(int idx, const char *title, int icon) {
 
 static void ColorsView(void) {
     CLAY(CLAY_ID("AccList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-        Accordion(0, "Color Grading", I_PALETTE);
+        Accordion(0, "Color Grading", I_GRADING);
         Accordion(1, "HSL", I_SLIDERS);
         Accordion(2, "Light", I_SUN);
         Accordion(3, "Color", I_DROP);
