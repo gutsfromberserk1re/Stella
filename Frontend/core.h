@@ -82,7 +82,7 @@ static float gWheelDelta;
 static bool gCtrlDown;
 static bool  gHand, gCross;
 static int   gLeftTab = 0, gRightTab = 0;
-static int   gPreviewRes = 720;
+static int   gPreviewRes = 1080;
 static bool  gPreviewMenuOpen;
 static float gPreviewMenuT;
 static bool  gPreviewDirty;

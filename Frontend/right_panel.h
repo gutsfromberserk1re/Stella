@@ -357,6 +357,26 @@ static void NumField(int n, float *v, const char *unit) {
             gNum[other] = fmaxf(0.f, gLinkedNumOtherStart * ratio);
         }
     }
+    if (gValueDragId == scrubId.id && gValueDragging) {
+        /* live preview while scrubbing; the release below sends the final committed value */
+        static float lastLive[4] = {1e9f, 1e9f, 1e9f, 1e9f};
+        if (fabsf(*v - lastLive[n]) > 0.49f) {
+            lastLive[n] = *v;
+            if (linkedDrag) {
+                int other = n ^ 1;
+                char updates[384];
+                snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                         kNumPropertyPaths[n], *v, kNumPropertyPaths[other], gNum[other]);
+                float keep = *v, keepOther = gNum[other];
+                PlutoTimelineSetPropertiesLive(updates);
+                *v = keep; gNum[other] = keepOther;   /* the backend echo must not fight the drag */
+            } else {
+                float keep = *v;
+                PlutoTimelineSetPropertyLive(kNumPropertyPaths[n], *v);
+                *v = keep;
+            }
+        }
+    }
     if (changed) CommitNumField(n, before);
     else if (gLinkedNumDragField == n && gValueDragId != scrubId.id) gLinkedNumDragField = -1;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
@@ -584,10 +604,19 @@ static void TransformView(void) {
                 } else gDragId = 0;
             }
             CLAY(rid, {.layout = {.sizing = {GROW, FIX(93)}}, .custom = {.customData = NC(K_ROTRULER, C_CARD, C_CARD, C_CARD, (gRot + 180.f) / 360.f, b.hover, 0)}}) {}
-            if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
-                PlutoTimelineSetProperty("props.transform.rotation", gRotT);
+            static bool rotWasDragging;
+            if (gRotDrag) {
+                if (fabsf(gRotT - sentRotation) > 0.05f) {
+                    float keep = gRot, keepT = gRotT;
+                    PlutoTimelineSetPropertyLive("props.transform.rotation", gRotT);
+                    gRot = keep; gRotT = keepT;
+                    sentRotation = gRotT;
+                }
+            } else if (rotWasDragging || fabsf(gRotT - sentRotation) > 0.01f) {
+                PlutoTimelineSetProperty("props.transform.rotation", gRotT);   /* closes the drag */
                 sentRotation = gRotT;
             }
+            rotWasDragging = gRotDrag;
         }
         GAPY(10)
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}}}) {
@@ -604,10 +633,19 @@ static void TransformView(void) {
             Clay_ElementId sid = CLAY_ID("OpacitySlider");
             Bs b = Interact(sid);
             SliderLogic(sid, 0, 8.5f);
-            if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
-                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
+            static bool opacityWasDragging;
+            if (gSlDrag[0]) {
+                if (fabsf(gSlT[0] - sentOpacity) > 0.004f) {
+                    float keep = gSl[0], keepT = gSlT[0];
+                    PlutoTimelineSetPropertyLive("props.transform.opacity", gSlT[0] * 100.f);
+                    gSl[0] = keep; gSlT[0] = keepT;
+                    sentOpacity = gSlT[0];
+                }
+            } else if (opacityWasDragging || fabsf(gSlT[0] - sentOpacity) > 0.002f) {
+                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);   /* closes the drag */
                 sentOpacity = gSlT[0];
             }
+            opacityWasDragging = gSlDrag[0];
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},
                        .custom = {.customData = NC(K_SLIDER, RGB(38, 39, 43), RGB(150, 152, 160), C_CARD, gSl[0], (b.hover + (gSlDrag[0] ? 1.f : 0.f)) * 1.5f, 1)}}) {}
         }
@@ -1056,7 +1094,12 @@ static void EffectsView(void) {
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
     float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
+    /* Measure the real body (wrapped text changes its height) instead of trusting a constant,
+       and drop the clip entirely once fully open so nothing is cut off or mis-scissored
+       while the inspector scrolls. The clip is only used during the open/close animation. */
+    bool transFull = gTransOpen && o >= 0.999f;
+    float transMeasured = Clay_GetElementData(CLAY_ID("TransInner")).boundingBox.height;
+    float dh = roundf(o * (transMeasured > 1.f ? transMeasured : (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H)));
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
@@ -1067,8 +1110,9 @@ static void EffectsView(void) {
             HSPACE
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
+        if (transFull || dh >= 1.f) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, transFull ? FIT : FIX(dh)}}, .clip = {.vertical = !transFull}}) {
+              CLAY(CLAY_ID("TransInner"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
@@ -1116,6 +1160,7 @@ static void EffectsView(void) {
                     CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
                                .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, (gTransitionDuration - .1f) / 1.9f, durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
                 }
+              }
             }
         }
     }

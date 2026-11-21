@@ -37,6 +37,9 @@ struct Backend {
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
+/* True while a drag ("live") property edit session is open: the first live edit records one
+   undo step, later live edits and the closing commit do not, so a drag is a single undo. */
+static LIVE_EDIT: AtomicBool = AtomicBool::new(false);
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
 
@@ -208,9 +211,9 @@ fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
             let temporary = destination.with_file_name(format!("proxy-render-{id}.mp4"));
             let mut command = media_command(&ffmpeg);
             command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
-                .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                       "-an", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-                       "-g", "6", "-keyint_min", "6", "-sc_threshold", "0", "-bf", "0",
+                .args(["-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
+                       "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "17",
+                       "-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-bf", "0",
                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
                 .arg(&temporary);
             let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
@@ -277,13 +280,14 @@ fn inspect_media(path: &str) -> Result<Value, String> {
 
     let mut duration = 5.0;
     let mut has_audio = false;
+    let mut source_height = 0u64;
     if kind != "image" {
         let output = media_command(multimedia_binary("ffprobe"))
             .args([
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration:stream=codec_type,duration",
+                "format=duration:stream=codec_type,duration,height",
                 "-of",
                 "json",
             ])
@@ -303,6 +307,8 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         has_audio = data["streams"]
             .as_array()
             .is_some_and(|streams| streams.iter().any(|s| s["codec_type"] == "audio"));
+        source_height = data["streams"].as_array().map(|streams| streams.iter()
+            .filter(|s| s["codec_type"] == "video").filter_map(|s| s["height"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
         duration = seconds(&data["format"]["duration"])
             .or_else(|| {
                 data["streams"]
@@ -322,10 +328,14 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     // v4 uses in-process libav decoding and a small BMP cache. Bumping the
     // version makes older missing/failed JPEG thumbnails regenerate automatically.
     let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v4.bmp"));
-    let proxy = if kind == "video" {
-        cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
+    /* The preview decodes the original file whenever that is cheap (<= 1440p). A proxy is only
+       built for very large sources, where it is a 1080p, high-quality, short-GOP intermediate
+       rather than the old 720p CRF-30 file that made the preview look soft and blocky. */
+    let needs_proxy = kind == "video" && source_height > 1440;
+    let proxy = if needs_proxy {
+        cache_dir.join(format!("{media_hash:016x}-proxy-1080p-g12-q17-v4.mp4"))
     } else { std::path::PathBuf::new() };
-    if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
+    if needs_proxy { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
     let waveform_path = if has_audio {
         let generated = if waveform.is_file() {
@@ -951,7 +961,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let path = request["path"].as_str().ok_or("Property path is required")?;
             set_timeline_clip_property(&mut timeline, id, path, request["value"].clone())?;
-            save_history(backend, before)?;
+            save_property_history(backend, before, request["live"].as_bool().unwrap_or(false))?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_set_clip_properties" => {
@@ -976,7 +986,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
                 }
             }
             for (index, clip) in working { timeline.clips[index] = clip; }
-            save_history(backend, before)?;
+            save_property_history(backend, before, request["live"].as_bool().unwrap_or(false))?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         _ => Err(format!("Unsupported command: {command}")),
@@ -990,6 +1000,19 @@ fn dispatch(request: Value) -> Result<Value, String> {
         }
     }
     result
+}
+
+fn save_property_history(backend: &Backend, before: Timeline, live: bool) -> Result<(), String> {
+    let in_session = LIVE_EDIT.load(Ordering::Acquire);
+    if live {
+        if !in_session { LIVE_EDIT.store(true, Ordering::Release); save_history(backend, before)?; }
+        Ok(())
+    } else if in_session {
+        LIVE_EDIT.store(false, Ordering::Release); // closing commit of a drag: already recorded
+        Ok(())
+    } else {
+        save_history(backend, before)
+    }
 }
 
 fn save_history(backend: &Backend, before: Timeline) -> Result<(), String> {

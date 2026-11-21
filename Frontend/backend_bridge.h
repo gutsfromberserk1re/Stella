@@ -675,12 +675,15 @@ static void PlutoRequestExport(void) {
     free(utf8);
 }
 
+/* Drag edits send "live":true so the backend records a single undo step per drag. */
+static bool gPropLive;
+
 static bool PlutoTimelineSetPropertyJson(const char *path, const char *valueJson) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     char id[128], escapedPath[128], request[768];
     PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
     PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
-    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s}", id, escapedPath, valueJson);
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s%s}", id, escapedPath, valueJson, gPropLive ? ",\"live\":true" : "");
     bool ok = PlutoTimelineCall(request);
     if (ok) gPreviewDirty = true;
     return ok;
@@ -690,7 +693,7 @@ static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) {
     if (!propertiesJson || propertiesJson[0] != '[' || gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     char id[128], request[8192];
     PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
-    int n = snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s}", id, propertiesJson);
+    int n = snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s%s}", id, propertiesJson, gPropLive ? ",\"live\":true" : "");
     if (n <= 0 || (size_t)n >= sizeof(request)) return false;
     bool ok = PlutoTimelineCall(request);
     if (ok) gPreviewDirty = true;
@@ -700,6 +703,20 @@ static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) {
 static bool PlutoTimelineSetProperty(const char *path, double value) {
     char number[48]; snprintf(number, sizeof(number), "%.6f", value);
     return PlutoTimelineSetPropertyJson(path, number);
+}
+
+static bool PlutoTimelineSetPropertyLive(const char *path, double value) {
+    gPropLive = true;
+    bool ok = PlutoTimelineSetProperty(path, value);
+    gPropLive = false;
+    return ok;
+}
+
+static bool PlutoTimelineSetPropertiesLive(const char *propertiesJson) {
+    gPropLive = true;
+    bool ok = PlutoTimelineSetPropertiesJson(propertiesJson);
+    gPropLive = false;
+    return ok;
 }
 
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) {
@@ -757,6 +774,8 @@ static bool PlutoTimelineSnap(bool enabled) { (void)enabled; return false; }
 static bool PlutoTimelineHistory(bool redo) { (void)redo; return false; }
 static bool PlutoTimelineSetProperty(const char *path, double value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) { (void)propertiesJson; return false; }
+static bool PlutoTimelineSetPropertyLive(const char *path, double value) { (void)path; (void)value; return false; }
+static bool PlutoTimelineSetPropertiesLive(const char *propertiesJson) { (void)propertiesJson; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetStringProperty(const char *path, const char *value) { (void)path; (void)value; return false; }

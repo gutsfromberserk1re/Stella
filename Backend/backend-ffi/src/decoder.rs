@@ -295,178 +295,194 @@ fn write_bmp24(destination: &Path, width: u32, height: u32, rgba: &[u8]) -> Resu
     file.flush().map_err(|error| format!("Could not finish media thumbnail: {error}"))
 }
 
-fn clamp_byte(value: f32) -> u8 { value.round().clamp(0.0, 255.0) as u8 }
-
-fn yuv_to_rgb(y: u8, u: u8, v: u8, full_range: bool) -> [u8; 3] {
-    let yy = y as f32;
-    let uu = u as f32 - 128.0;
-    let vv = v as f32 - 128.0;
-    if full_range {
-        [
-            clamp_byte(yy + 1.402 * vv),
-            clamp_byte(yy - 0.344_136 * uu - 0.714_136 * vv),
-            clamp_byte(yy + 1.772 * uu),
-        ]
-    } else {
-        let c = (yy - 16.0).max(0.0);
-        [
-            clamp_byte((1.164_383 * c) + 1.596_027 * vv),
-            clamp_byte((1.164_383 * c) - 0.391_762 * uu - 0.812_968 * vv),
-            clamp_byte((1.164_383 * c) + 2.017_232 * uu),
-        ]
-    }
-}
-
+#[inline]
+fn clamp8(value: i64) -> u8 { value.clamp(0, 255) as u8 }
 
 #[inline]
 fn read_u16_le(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
-#[inline]
-fn yuv_to_rgb_depth(y: u16, u: u16, v: u16, depth: u8) -> [u8; 3] {
-    let scale = (1u32 << (depth - 8)) as f32;
-    let yy = ((y as f32) - 16.0 * scale) / (219.0 * scale);
-    let uu = ((u as f32) - 128.0 * scale) / (224.0 * scale);
-    let vv = ((v as f32) - 128.0 * scale) / (224.0 * scale);
-    [
-        clamp_byte((yy + 1.402 * vv) * 255.0),
-        clamp_byte((yy - 0.344_136 * uu - 0.714_136 * vv) * 255.0),
-        clamp_byte((yy + 1.772 * uu) * 255.0),
-    ]
-}
+/// Fixed-point (20 bit) YCbCr -> RGB coefficients for one bit depth, range and matrix.
+#[derive(Clone, Copy)]
+struct Coef { yoff: i64, ys: i64, coff: i64, rv: i64, gu: i64, gv: i64, bu: i64 }
 
-fn convert_planar_yuv16(
-    source: &frame::Video,
-    width: u32,
-    height: u32,
-    rgba: &mut [u8],
-    depth: u8,
-    chroma_x_shift: usize,
-    chroma_y_shift: usize,
-) {
-    let y_plane = source.data(0);
-    let u_plane = source.data(1);
-    let v_plane = source.data(2);
-    let y_stride = source.stride(0);
-    let u_stride = source.stride(1);
-    let v_stride = source.stride(2);
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let yy = read_u16_le(y_plane, y * y_stride + x * 2);
-            let uu = read_u16_le(u_plane, (y >> chroma_y_shift) * u_stride + (x >> chroma_x_shift) * 2);
-            let vv = read_u16_le(v_plane, (y >> chroma_y_shift) * v_stride + (x >> chroma_x_shift) * 2);
-            let rgb = yuv_to_rgb_depth(yy, uu, vv, depth);
-            let d = (y * width as usize + x) * 4;
-            rgba[d..d + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+impl Coef {
+    fn new(depth: u32, full: bool, kr: f64, kb: f64) -> Self {
+        let kg = 1.0 - kr - kb;
+        let sh = (1u32 << (depth - 8)) as f64;
+        let (yoff, ysc, csc) = if full { (0.0, 1.0, 1.0) } else { (16.0 * sh, 255.0 / 219.0, 255.0 / 224.0) };
+        let q = (1u64 << 20) as f64;
+        Coef {
+            yoff: yoff.round() as i64,
+            ys: (ysc / sh * q).round() as i64,
+            coff: (128.0 * sh).round() as i64,
+            rv: (2.0 * (1.0 - kr) * csc / sh * q).round() as i64,
+            gu: (2.0 * kb * (1.0 - kb) / kg * csc / sh * q).round() as i64,
+            gv: (2.0 * kr * (1.0 - kr) / kg * csc / sh * q).round() as i64,
+            bu: (2.0 * (1.0 - kb) * csc / sh * q).round() as i64,
         }
     }
+
+    #[inline(always)]
+    fn rgb(&self, y: i64, u: i64, v: i64) -> [u8; 3] {
+        let yy = (y - self.yoff) * self.ys + (1 << 19);
+        let (u, v) = (u - self.coff, v - self.coff);
+        [clamp8((yy + self.rv * v) >> 20), clamp8((yy - self.gu * u - self.gv * v) >> 20), clamp8((yy + self.bu * u) >> 20)]
+    }
+}
+
+/// Pick the YCbCr matrix the file was mastered with. Untagged HD material is BT.709,
+/// untagged SD is BT.601; the old converter always used BT.601, which shifted HD colours.
+fn matrix_and_range(source: &frame::Video, height: u32) -> (f64, f64, bool) {
+    use ffmpeg::util::color::{Range, Space};
+    let (kr, kb) = match source.color_space() {
+        Space::BT709 => (0.2126, 0.0722),
+        Space::BT470BG | Space::SMPTE170M => (0.299, 0.114),
+        Space::BT2020NCL | Space::BT2020CL => (0.2627, 0.0593),
+        _ => if height >= 720 { (0.2126, 0.0722) } else { (0.299, 0.114) },
+    };
+    (kr, kb, source.color_range() == Range::JPEG)
+}
+
+/// Split an RGBA image into row bands and fill them on all cores. Frames are converted
+/// on the preview worker, so this is what keeps 1080p decode-to-texture latency low.
+fn par_rows(rgba: &mut [u8], width: usize, height: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    let row_bytes = width * 4;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(height.max(1));
+    if threads <= 1 || height < 96 {
+        for (y, row) in rgba.chunks_exact_mut(row_bytes).enumerate() { f(y, row); }
+        return;
+    }
+    let rows_per = (height + threads - 1) / threads;
+    std::thread::scope(|scope| {
+        for (band, chunk) in rgba.chunks_mut(rows_per * row_bytes).enumerate() {
+            let f = &f;
+            scope.spawn(move || {
+                for (i, row) in chunk.chunks_exact_mut(row_bytes).enumerate() { f(band * rows_per + i, row); }
+            });
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_planar(source: &frame::Video, width: usize, height: usize, rgba: &mut [u8],
+                  depth: u32, sx: usize, sy: usize, coef: Coef) {
+    let (yp, up, vp) = (source.data(0), source.data(1), source.data(2));
+    let (ys, us, vs) = (source.stride(0), source.stride(1), source.stride(2));
+    if depth == 8 {
+        par_rows(rgba, width, height, |y, row| {
+            let (yr, ur, vr) = (&yp[y * ys..], &up[(y >> sy) * us..], &vp[(y >> sy) * vs..]);
+            for x in 0..width {
+                let rgb = coef.rgb(yr[x] as i64, ur[x >> sx] as i64, vr[x >> sx] as i64);
+                row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        });
+    } else {
+        par_rows(rgba, width, height, |y, row| {
+            let (yo, uo, vo) = (y * ys, (y >> sy) * us, (y >> sy) * vs);
+            for x in 0..width {
+                let rgb = coef.rgb(read_u16_le(yp, yo + x * 2) as i64,
+                                   read_u16_le(up, uo + (x >> sx) * 2) as i64,
+                                   read_u16_le(vp, vo + (x >> sx) * 2) as i64);
+                row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        });
+    }
+}
+
+/// NV12 / NV21 (8-bit) and P010LE (10-bit, stored in the high bits of 16).
+fn convert_semi_planar(source: &frame::Video, width: usize, height: usize, rgba: &mut [u8],
+                       swap_uv: bool, high_bit_depth: bool, coef: Coef) {
+    let (yp, uvp) = (source.data(0), source.data(1));
+    let (ys, uvs) = (source.stride(0), source.stride(1));
+    par_rows(rgba, width, height, |y, row| {
+        for x in 0..width {
+            let (yy, u, v);
+            if high_bit_depth {
+                yy = (read_u16_le(yp, y * ys + x * 2) >> 6) as i64;
+                let o = (y >> 1) * uvs + (x >> 1) * 4;
+                u = (read_u16_le(uvp, o) >> 6) as i64;
+                v = (read_u16_le(uvp, o + 2) >> 6) as i64;
+            } else {
+                yy = yp[y * ys + x] as i64;
+                let o = (y >> 1) * uvs + (x & !1);
+                let (a, b) = (uvp[o] as i64, uvp[o + 1] as i64);
+                if swap_uv { u = b; v = a; } else { u = a; v = b; }
+            }
+            let rgb = coef.rgb(yy, u, v);
+            row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+    });
 }
 
 fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64) -> Result<DecodedFrame, String> {
     let width = source.width();
     let height = source.height();
     if width == 0 || height == 0 { return Err("Decoder returned an empty video frame".into()); }
-    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    let (w, h) = (width as usize, height as usize);
+    let mut rgba = vec![0u8; w * h * 4];
     let pixel_format = source.format();
+    let (kr, kb, tagged_full) = matrix_and_range(source, height);
 
     match pixel_format {
         Pixel::RGBA | Pixel::BGRA | Pixel::ARGB | Pixel::ABGR => {
-            let src = source.data(0);
-            let stride = source.stride(0);
-            let bpp = 4usize;
-            for y in 0..height as usize {
-                let row = &src[y * stride..y * stride + width as usize * bpp];
-                for x in 0..width as usize {
+            let (src, stride) = (source.data(0), source.stride(0));
+            par_rows(&mut rgba, w, h, |y, row| {
+                let line = &src[y * stride..y * stride + w * 4];
+                for x in 0..w {
                     let s = x * 4;
-                    let d = (y * width as usize + x) * 4;
                     let (r, g, b, a) = match pixel_format {
-                        Pixel::RGBA => (row[s], row[s + 1], row[s + 2], row[s + 3]),
-                        Pixel::BGRA => (row[s + 2], row[s + 1], row[s], row[s + 3]),
-                        Pixel::ARGB => (row[s + 1], row[s + 2], row[s + 3], row[s]),
-                        Pixel::ABGR => (row[s + 3], row[s + 2], row[s + 1], row[s]),
-                        _ => unreachable!(),
+                        Pixel::RGBA => (line[s], line[s + 1], line[s + 2], line[s + 3]),
+                        Pixel::BGRA => (line[s + 2], line[s + 1], line[s], line[s + 3]),
+                        Pixel::ARGB => (line[s + 1], line[s + 2], line[s + 3], line[s]),
+                        _ => (line[s + 3], line[s + 2], line[s + 1], line[s]),
                     };
-                    rgba[d..d + 4].copy_from_slice(&[r, g, b, a]);
+                    row[s..s + 4].copy_from_slice(&[r, g, b, a]);
                 }
-            }
+            });
         }
         Pixel::RGB24 | Pixel::BGR24 => {
-            let src = source.data(0);
-            let stride = source.stride(0);
-            for y in 0..height as usize {
-                let row = &src[y * stride..y * stride + width as usize * 3];
-                for x in 0..width as usize {
+            let (src, stride) = (source.data(0), source.stride(0));
+            let rgb_order = pixel_format == Pixel::RGB24;
+            par_rows(&mut rgba, w, h, |y, row| {
+                let line = &src[y * stride..y * stride + w * 3];
+                for x in 0..w {
                     let s = x * 3;
-                    let d = (y * width as usize + x) * 4;
-                    let (r, g, b) = if pixel_format == Pixel::RGB24 {
-                        (row[s], row[s + 1], row[s + 2])
-                    } else { (row[s + 2], row[s + 1], row[s]) };
-                    rgba[d..d + 4].copy_from_slice(&[r, g, b, 255]);
+                    let (r, g, b) = if rgb_order { (line[s], line[s + 1], line[s + 2]) } else { (line[s + 2], line[s + 1], line[s]) };
+                    row[x * 4..x * 4 + 4].copy_from_slice(&[r, g, b, 255]);
                 }
-            }
+            });
         }
         Pixel::YUV420P | Pixel::YUVJ420P | Pixel::YUV422P | Pixel::YUVJ422P | Pixel::YUV444P | Pixel::YUVJ444P => {
-            let y_plane = source.data(0); let u_plane = source.data(1); let v_plane = source.data(2);
-            let ys = source.stride(0); let us = source.stride(1); let vs = source.stride(2);
-            let (sx, sy, full) = match pixel_format {
-                Pixel::YUV420P => (1usize, 1usize, false), Pixel::YUVJ420P => (1, 1, true),
+            let (sx, sy, jpeg) = match pixel_format {
+                Pixel::YUV420P => (1, 1, false), Pixel::YUVJ420P => (1, 1, true),
                 Pixel::YUV422P => (1, 0, false), Pixel::YUVJ422P => (1, 0, true),
-                Pixel::YUV444P => (0, 0, false), Pixel::YUVJ444P => (0, 0, true),
-                _ => unreachable!(),
+                Pixel::YUV444P => (0, 0, false), _ => (0, 0, true),
             };
-            for y in 0..height as usize {
-                for x in 0..width as usize {
-                    let yy = y_plane[y * ys + x];
-                    let uu = u_plane[(y >> sy) * us + (x >> sx)];
-                    let vv = v_plane[(y >> sy) * vs + (x >> sx)];
-                    let rgb = yuv_to_rgb(yy, uu, vv, full);
-                    let d = (y * width as usize + x) * 4;
-                    rgba[d..d + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                }
-            }
+            convert_planar(source, w, h, &mut rgba, 8, sx, sy, Coef::new(8, jpeg || tagged_full, kr, kb));
         }
         Pixel::NV12 | Pixel::NV21 => {
-            let y_plane = source.data(0); let uv_plane = source.data(1);
-            let ys = source.stride(0); let uvs = source.stride(1);
-            for y in 0..height as usize {
-                for x in 0..width as usize {
-                    let uv = (y >> 1) * uvs + (x & !1);
-                    let (u, v) = if pixel_format == Pixel::NV12 {
-                        (uv_plane[uv], uv_plane[uv + 1])
-                    } else { (uv_plane[uv + 1], uv_plane[uv]) };
-                    let rgb = yuv_to_rgb(y_plane[y * ys + x], u, v, false);
-                    let d = (y * width as usize + x) * 4;
-                    rgba[d..d + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                }
-            }
+            convert_semi_planar(source, w, h, &mut rgba, pixel_format == Pixel::NV21, false, Coef::new(8, tagged_full, kr, kb));
         }
-        Pixel::YUV420P9LE | Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P16LE => {
-            let depth = match pixel_format { Pixel::YUV420P9LE => 9, Pixel::YUV420P10LE => 10, Pixel::YUV420P12LE => 12, _ => 16 };
-            convert_planar_yuv16(source, width, height, &mut rgba, depth, 1, 1);
-        }
-        Pixel::YUV422P9LE | Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P16LE => {
-            let depth = match pixel_format { Pixel::YUV422P9LE => 9, Pixel::YUV422P10LE => 10, Pixel::YUV422P12LE => 12, _ => 16 };
-            convert_planar_yuv16(source, width, height, &mut rgba, depth, 1, 0);
-        }
-        Pixel::YUV444P9LE | Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P16LE => {
-            let depth = match pixel_format { Pixel::YUV444P9LE => 9, Pixel::YUV444P10LE => 10, Pixel::YUV444P12LE => 12, _ => 16 };
-            convert_planar_yuv16(source, width, height, &mut rgba, depth, 0, 0);
+        Pixel::YUV420P9LE | Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P16LE
+        | Pixel::YUV422P9LE | Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P16LE
+        | Pixel::YUV444P9LE | Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P16LE => {
+            let depth: u32 = match pixel_format {
+                Pixel::YUV420P9LE | Pixel::YUV422P9LE | Pixel::YUV444P9LE => 9,
+                Pixel::YUV420P10LE | Pixel::YUV422P10LE | Pixel::YUV444P10LE => 10,
+                Pixel::YUV420P12LE | Pixel::YUV422P12LE | Pixel::YUV444P12LE => 12,
+                _ => 16,
+            };
+            let (sx, sy) = match pixel_format {
+                Pixel::YUV420P9LE | Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P16LE => (1, 1),
+                Pixel::YUV422P9LE | Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P16LE => (1, 0),
+                _ => (0, 0),
+            };
+            convert_planar(source, w, h, &mut rgba, depth, sx, sy, Coef::new(depth, tagged_full, kr, kb));
         }
         Pixel::P010LE => {
-            let y_plane = source.data(0); let uv_plane = source.data(1);
-            let ys = source.stride(0); let uvs = source.stride(1);
-            for y in 0..height as usize {
-                for x in 0..width as usize {
-                    let yy = read_u16_le(y_plane, y * ys + x * 2) >> 6;
-                    let uv = (y >> 1) * uvs + (x >> 1) * 4;
-                    let uu = read_u16_le(uv_plane, uv) >> 6;
-                    let vv = read_u16_le(uv_plane, uv + 2) >> 6;
-                    let rgb = yuv_to_rgb_depth(yy, uu, vv, 10);
-                    let d = (y * width as usize + x) * 4;
-                    rgba[d..d + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                }
-            }
+            convert_semi_planar(source, w, h, &mut rgba, false, true, Coef::new(10, tagged_full, kr, kb));
         }
         other => return Err(format!("Preview decoder does not yet convert pixel format {other:?}. Try generating a compatible proxy (8-bit RGB/YUV or supported 9/10/12/16-bit planar YUV and P010).")),
     }
