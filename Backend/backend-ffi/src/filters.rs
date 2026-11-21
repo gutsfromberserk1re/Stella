@@ -319,3 +319,39 @@ pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     filters.join(",")
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::video_filters;
+    use serde_json::json;
+
+    #[test]
+    fn transform_controls_reach_the_shared_preview_and_export_filter_graph() {
+        let clip = json!({
+            "sourceOffset": 0.0,
+            "props": {"transform": {
+                "position": {"x": 120.0, "y": -45.0},
+                "scale": {"w": 125.0, "h": 80.0},
+                "rotation": 12.0,
+                "opacity": 65.0
+            }}
+        });
+        let (filters, x, y) = video_filters(&clip, 1280, 720, 30, 0.0, 3.0, None, None);
+        assert!(filters.contains("scale=iw*1.25000:ih*0.80000"));
+        assert!(filters.contains("rotate=0.209440"));
+        assert!(filters.contains("colorchannelmixer=aa=0.6500"));
+        assert!(x.contains("+80.000"));
+        assert!(y.contains("-30.000"));
+    }
+
+    #[test]
+    fn color_wheel_grading_changes_the_shared_filter_graph() {
+        let neutral = json!({"sourceOffset":0.0,"props":{}});
+        let graded = json!({"sourceOffset":0.0,"props":{"colors":{"grading":{"shadows":{"hue":35.0,"amount":42.0}}}}});
+        let (neutral_filters, _, _) = video_filters(&neutral, 1280, 720, 30, 0.0, 3.0, None, None);
+        let (graded_filters, _, _) = video_filters(&graded, 1280, 720, 30, 0.0, 3.0, None, None);
+        assert!(!neutral_filters.contains("colorbalance="));
+        assert!(graded_filters.contains("colorbalance="));
+    }
+}
