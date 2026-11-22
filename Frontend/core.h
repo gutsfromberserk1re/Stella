@@ -101,11 +101,40 @@ static double gPreviewTelemetryAt;
 /* Phase 1: on-screen preview timing (F3). Values are exponential moving averages in ms. */
 static bool   gPerfOverlay;
 static double gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs, gPerfBackendMs, gPerfUploadMs, gPerfEndToEndMs;
-static double gPerfFrameIntervalMs, gPerfLastShownAt, gPerfDisplayFps, gPerfFpsWindowAt;
+static double gPerfLastShownAt, gPerfDisplayFps, gPerfFpsWindowAt;
+/* Frame interval stats: ring of the last PERF_INTERVAL_RING shown-frame gaps (ms). Gaps longer than
+   PERF_GAP_S are pauses/seeks, not frame pacing, so they are dropped instead of averaged in. */
+#define PERF_INTERVAL_RING 120
+#define PERF_GAP_S 0.5
+static float  gPerfIntervals[PERF_INTERVAL_RING];
+static int    gPerfIntervalCount, gPerfIntervalHead;
+static double gPerfIntervalMedMs, gPerfIntervalP95Ms;
 static int    gPerfShownInWindow;
 static double gPerfRingDepth;
 static double gPerfHwDecode; /* 1 when the last shown frame came from a hardware decoder */
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;
+
+static int PerfCmpFloat(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+/* Call once per displayed frame, before updating gPerfLastShownAt. */
+static void PerfNoteInterval(double now) {
+    if (gPerfLastShownAt > 0.0) {
+        double gap = now - gPerfLastShownAt;
+        if (gap > PERF_GAP_S) { gPerfIntervalCount = 0; gPerfIntervalHead = 0; } /* pause/seek: start fresh */
+        else {
+            gPerfIntervals[gPerfIntervalHead] = (float)(gap * 1000.0);
+            gPerfIntervalHead = (gPerfIntervalHead + 1) % PERF_INTERVAL_RING;
+            if (gPerfIntervalCount < PERF_INTERVAL_RING) gPerfIntervalCount++;
+        }
+    }
+    if (gPerfIntervalCount > 0) {
+        float tmp[PERF_INTERVAL_RING];
+        const int n = gPerfIntervalCount; /* valid samples are always indices 0..n-1 */
+        memcpy(tmp, gPerfIntervals, (size_t)n * sizeof(float));
+        qsort(tmp, (size_t)n, sizeof(float), PerfCmpFloat);
+        gPerfIntervalMedMs = tmp[n / 2];
+        gPerfIntervalP95Ms = tmp[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1];
+    }
+}
 static Texture2D gPreviewFrame;
 static uint8_t *gPreviewPixels;
 static size_t gPreviewPixelCapacity;

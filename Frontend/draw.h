@@ -887,9 +887,9 @@ static void OnClayError(Clay_ErrorData e) { printf("Clay error: %.*s\n", e.error
 /* Phase 1: preview timing overlay, toggled with F3. Budget at 30 fps is 33.3 ms per frame. */
 static void DrawPerfOverlay(void) {
     if (!gPerfOverlay) return;
-    char line[7][96];
+    char line[7][112];
     const double budget = 1000.0 / (double)(gPreviewFps > 0 ? gPreviewFps : 30);
-    snprintf(line[0], sizeof(line[0]), "Preview %dp @ %dfps   shown %.1f fps   interval %.1f ms", gPreviewRes, gPreviewFps, gPerfDisplayFps, gPerfFrameIntervalMs);
+    snprintf(line[0], sizeof(line[0]), "Preview %dp @ %dfps   shown %.1f fps   interval med %.1f / p95 %.1f ms", gPreviewRes, gPreviewFps, gPerfDisplayFps, gPerfIntervalMedMs, gPerfIntervalP95Ms);
     snprintf(line[1], sizeof(line[1]), "end-to-end %.1f ms (budget %.1f)", gPerfEndToEndMs, budget);
     snprintf(line[2], sizeof(line[2]), "queue %.1f   setup %.1f   decode wait %.1f", gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs);
     snprintf(line[3], sizeof(line[3]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);

@@ -574,8 +574,7 @@ static void PlutoPollBackend(void) {
                                 gPerfRingDepth += (rd - gPerfRingDepth) * a;
                                 gPerfUploadMs += ((now - uploadStartedAt) * 1000.0 - gPerfUploadMs) * a;
                                 gPerfEndToEndMs += ((now - gPreviewRequestStartedAt) * 1000.0 - gPerfEndToEndMs) * a;
-                                if (gPerfLastShownAt > 0.0)
-                                    gPerfFrameIntervalMs += ((now - gPerfLastShownAt) * 1000.0 - gPerfFrameIntervalMs) * a;
+                                PerfNoteInterval(now);
                                 gPerfLastShownAt = now;
                                 gPerfShownFrames++; gPerfShownInWindow++;
                                 if (now - gPerfFpsWindowAt >= 1.0) {
