@@ -36,6 +36,9 @@ struct Backend {
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
+static PREVIEW_RESTARTS: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_PROXY_CLIPS: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_ORIGINAL_CLIPS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
 
@@ -249,6 +252,7 @@ fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview
             Ok((width, height, at)) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
                 "width":width,"height":height,"at":at,"queueMs":queue_ms,
                 "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
+                "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),"proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),"originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
                 "queueMs":queue_ms,"streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,
@@ -799,11 +803,7 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
     append_filter_graph_arg(&mut command, &ffmpeg, &script);
     for input in inputs {
         if input.image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
-        else {
-            // Hardware decode; FFmpeg copies frames back to system memory for the CPU filter graph.
-            command.args(["-hwaccel", "d3d11va"]);
-            if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
-        }
+        else if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
         command.args(["-threads", "0", "-i"]).arg(input.path);
     }
     command.args(["-map", "[vout]", "-an", "-t", &format!("{duration:.5}"),
@@ -852,14 +852,18 @@ impl PreviewEngine {
 
             let mut preview_timeline = timeline;
             preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));
+            let (mut proxied, mut originals) = (0u64, 0u64);
             for clip in &mut preview_timeline.clips {
                 let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
                 let source = preview_source_path(clip);
+                if source != original { proxied += 1; } else { originals += 1; }
                 if !std::path::Path::new(&source).is_file() { return Err(format!("Media file is missing: {source}")); }
                 clip.extra.insert("path".into(), Value::String(source));
                 clip.extra.insert("hasAudio".into(), Value::Bool(false));
                 if original.is_empty() { return Err("Video clip has no source path".into()); }
             }
+            PREVIEW_PROXY_CLIPS.store(proxied, Ordering::Relaxed);
+            PREVIEW_ORIGINAL_CLIPS.store(originals, Ordering::Relaxed);
             if preview_timeline.clips.is_empty() {
                 self.stream = None;
                 publish_black_frame(id, width, height, frame_at)?;
@@ -901,6 +905,7 @@ impl PreviewEngine {
                     if origin_time > 0.0 { clip.extra.insert("previewSeekAdjusted".into(), json!(true)); }
                     else { clip.extra.remove("previewSeekAdjusted"); }
                 }
+                PREVIEW_RESTARTS.fetch_add(1, Ordering::Relaxed);
                 self.stream = Some(start_preview_stream(&shifted, width, height, fps, id, signature, origin_index)?);
                 setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
             }
