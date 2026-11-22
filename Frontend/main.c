@@ -362,6 +362,9 @@ int main(void) {
         }
         if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
             observedPlayhead = gPlayhead;
+            if (!gTimelinePropertyEditOpen && gKeyframeDragClip < 0 && !gValueDragging && !gRotDrag && !gSlDrag[0]) {
+                PlutoApplyKeyframeValues();
+            }
             if (!gTimelinePlaying && !gTimelineScrubbing) {
                 gPreviewDirty = true;
                 gPreviewDebounce = 1.f;
@@ -442,9 +445,14 @@ int main(void) {
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
+        if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            PlutoTimelineEndPropertyEdit();
+        }
         if (gPreviewDirty && !gPreviewTaskId) {
             gPreviewDebounce += gDt;
-            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying || gPreviewNavigating ? 0.f : .075f)) {
+            bool responsiveEdit = gTimelinePropertyEditOpen || gKeyframeDragClip >= 0 ||
+                gValueDragging || gRotDrag || gSlDrag[0];
+            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying || gPreviewNavigating || responsiveEdit ? 0.f : .075f)) {
                 if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
                 else { gPreviewDebounce = .045f; }
             }

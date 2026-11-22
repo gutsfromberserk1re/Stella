@@ -346,7 +346,21 @@ static bool PlutoSyncTimeline(const char *json) {
                     }
                     if (!ke) break;
                     double kt = 0.0;
-                    if (PlutoJsonNumberRange(kb, ke, "time", &kt)) clip->keyframes[clip->keyframeCount++] = (float)kt;
+                    if (PlutoJsonNumberRange(kb, ke, "time", &kt)) {
+                        TimelineKeyframeUi *keyframe = &clip->keyframes[clip->keyframeCount++];
+                        keyframe->time = (float)kt;
+                        static const char *valuePaths[6] = {
+                            "values.x", "values.y", "values.scaleW", "values.scaleH", "values.rotation", "values.opacity"
+                        };
+                        for (int field = 0; field < 6; field++) {
+                            double value = 0.0;
+                            if (PlutoJsonNumberPath(kb, ke, valuePaths[field], &value) && isfinite(value)) {
+                                if (field == 5 && value > 0.0 && value <= 1.0) value *= 100.0;
+                                keyframe->value[field] = (float)value;
+                                keyframe->valueMask |= 1u << field;
+                            }
+                        }
+                    }
                 }
             }
             if (selectedId[0] && strcmp(selectedId, clip->id) == 0) { selectedBegin = begin; selectedEnd = end; }
@@ -372,6 +386,18 @@ static bool PlutoTimelineCall(const char *request) {
     } else if (response) {
         PlutoJsonString(response, "error", gBackendMessage, sizeof(gBackendMessage));
     }
+    if (response) gBackend.release(response);
+    return okay;
+}
+
+/* Live drag updates intentionally skip full timeline JSON serialization/parsing.
+   The authoritative state changes synchronously in Rust; one full sync occurs on release. */
+static bool PlutoTimelineCallFast(const char *request) {
+    if (!gBackend.request) { strcpy(gBackendMessage, "Rust backend DLL is unavailable"); return false; }
+    char *response = gBackend.request(request);
+    bool okay = response && strstr(response, "\"ok\":true") != NULL;
+    if (okay) gBackendMessage[0] = 0;
+    else if (response) PlutoJsonString(response, "error", gBackendMessage, sizeof(gBackendMessage));
     if (response) gBackend.release(response);
     return okay;
 }
@@ -510,7 +536,7 @@ static bool PlutoTimelineAddKeyframe(float at) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     char id[128], request[768]; PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
     snprintf(request, sizeof(request), "{\"command\":\"timeline_add_keyframe\",\"id\":\"%s\",\"at\":%.4f,\"values\":{\"x\":%.4f,\"y\":%.4f,\"scaleW\":%.4f,\"scaleH\":%.4f,\"rotation\":%.4f,\"opacity\":%.4f}}",
-             id, at, gNum[0], gNum[1], gNum[2], gNum[3], gRotT, gSlT[0]);
+             id, at, gNum[0], gNum[1], gNum[2], gNum[3], gRotT, gSlT[0] * 100.f);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
@@ -718,26 +744,94 @@ static void PlutoRequestExport(void) {
     free(utf8);
 }
 
-static bool PlutoTimelineSetPropertyJson(const char *path, const char *valueJson) {
+static bool gTimelinePropertyEditOpen;
+
+static bool PlutoTimelineSetPropertyJsonMode(const char *path, const char *valueJson, bool live) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
-    char id[128], escapedPath[128], request[768];
+    live = live || gTimelinePropertyEditOpen;
+    if (live) gTimelinePropertyEditOpen = true;
+    char id[128], escapedPath[128], request[896];
     PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
     PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
-    snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s}", id, escapedPath, valueJson);
-    bool ok = PlutoTimelineCall(request);
+    snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_set_clip_property\",\"id\":\"%s\",\"path\":\"%s\",\"value\":%s,\"at\":%.6f,\"live\":%s}",
+        id, escapedPath, valueJson, gPlayhead, live ? "true" : "false");
+    bool ok = live ? PlutoTimelineCallFast(request) : PlutoTimelineCall(request);
+    if (ok) gPreviewDirty = true;
+    return ok;
+}
+
+static bool PlutoTimelineSetPropertyJson(const char *path, const char *valueJson) {
+    return PlutoTimelineSetPropertyJsonMode(path, valueJson, false);
+}
+
+static bool PlutoTimelineSetPropertyLive(const char *path, double value) {
+    char number[48]; snprintf(number, sizeof(number), "%.6f", value);
+    return PlutoTimelineSetPropertyJsonMode(path, number, true);
+}
+
+static bool PlutoTimelineSetPropertiesJsonMode(const char *propertiesJson, bool live) {
+    if (!propertiesJson || propertiesJson[0] != '[' || gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
+    live = live || gTimelinePropertyEditOpen;
+    if (live) gTimelinePropertyEditOpen = true;
+    char id[128], request[8448];
+    PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
+    int n = snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s,\"at\":%.6f,\"live\":%s}",
+        id, propertiesJson, gPlayhead, live ? "true" : "false");
+    if (n <= 0 || (size_t)n >= sizeof(request)) return false;
+    bool ok = live ? PlutoTimelineCallFast(request) : PlutoTimelineCall(request);
     if (ok) gPreviewDirty = true;
     return ok;
 }
 
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) {
-    if (!propertiesJson || propertiesJson[0] != '[' || gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
-    char id[128], request[8192];
-    PlutoJsonEscape(gTimelineClips[gTimelineSelected].id, id, sizeof(id));
-    int n = snprintf(request, sizeof(request), "{\"command\":\"timeline_set_clip_properties\",\"id\":\"%s\",\"properties\":%s}", id, propertiesJson);
-    if (n <= 0 || (size_t)n >= sizeof(request)) return false;
-    bool ok = PlutoTimelineCall(request);
-    if (ok) gPreviewDirty = true;
-    return ok;
+    return PlutoTimelineSetPropertiesJsonMode(propertiesJson, false);
+}
+
+static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) {
+    return PlutoTimelineSetPropertiesJsonMode(propertiesJson, true);
+}
+
+static void PlutoTimelineEndPropertyEdit(void) {
+    if (!gTimelinePropertyEditOpen) return;
+    gTimelinePropertyEditOpen = false;
+    /* Commit one undo snapshot and refresh the local keyframe/inspector cache once. */
+    gPreviewDirty = true;
+    gPreviewDebounce = 1.f;
+    PlutoTimelineCall("{\"command\":\"timeline_end_property_edit\"}");
+}
+
+static bool PlutoTimelineMoveKeyframe(int index, float from, float to, bool live) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    if (live) gTimelinePropertyEditOpen = true;
+    char id[128], request[512];
+    PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_move_keyframe\",\"id\":\"%s\",\"from\":%.6f,\"to\":%.6f,\"live\":%s}",
+        id, from, to, live ? "true" : "false");
+    bool okay = live ? PlutoTimelineCallFast(request) : PlutoTimelineCall(request);
+    if (okay) {
+        /* Keep the local timeline diamonds in sync without reparsing the full timeline. */
+        if (live && fabsf(to - from) > 0.0005f) {
+            TimelineClipUi *clip = &gTimelineClips[index];
+            for (int k = 0; k < clip->keyframeCount; k++) {
+                if (fabsf(clip->keyframes[k].time - from) <= 0.001f) {
+                    clip->keyframes[k].time = to;
+                    break;
+                }
+            }
+            for (int a = 1; a < clip->keyframeCount; a++) {
+                TimelineKeyframeUi value = clip->keyframes[a]; int b = a;
+                while (b > 0 && clip->keyframes[b - 1].time > value.time) {
+                    clip->keyframes[b] = clip->keyframes[b - 1]; b--;
+                }
+                clip->keyframes[b] = value;
+            }
+        }
+        gPreviewDirty = true;
+    }
+    return okay;
 }
 
 static bool PlutoTimelineSetProperty(const char *path, double value) {
@@ -799,7 +893,11 @@ static bool PlutoTimelineSplit(int index, float at) { (void)index; (void)at; ret
 static bool PlutoTimelineSnap(bool enabled) { (void)enabled; return false; }
 static bool PlutoTimelineHistory(bool redo) { (void)redo; return false; }
 static bool PlutoTimelineSetProperty(const char *path, double value) { (void)path; (void)value; return false; }
+static bool PlutoTimelineSetPropertyLive(const char *path, double value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) { (void)propertiesJson; return false; }
+static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) { (void)propertiesJson; return false; }
+static void PlutoTimelineEndPropertyEdit(void) {}
+static bool PlutoTimelineMoveKeyframe(int index, float from, float to, bool live) { (void)index; (void)from; (void)to; (void)live; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetStringProperty(const char *path, const char *value) { (void)path; (void)value; return false; }

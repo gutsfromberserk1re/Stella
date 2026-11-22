@@ -135,9 +135,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let k = tgt.y / 1080.0; // target px per 1080p reference px
 
     // ---------------------------------------------------------------- geometry
-    let cw = max(1.0 - u.crop.x - u.crop.y, 0.05);
-    let ch = max(1.0 - u.crop.z - u.crop.w, 0.05);
-    let src_aspect = (u.size.x * cw) / (u.size.y * ch);
+    // Crop removes source-edge pixels; it must not shrink the source aspect
+    // and then scale the remaining image back up (the old behaviour zoomed in).
+    let src_aspect = u.size.x / u.size.y;
     let tgt_aspect = tgt.x / tgt.y;
     var fit = vec2<f32>(1.0, 1.0);
     if (src_aspect > tgt_aspect) {
@@ -188,8 +188,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         l = (floor(l * ref_px / u.fx4.x) + vec2<f32>(0.5, 0.5)) * u.fx4.x / ref_px;
     }
 
-    let suv = vec2<f32>(u.crop.x + l.x * cw, u.crop.z + l.y * ch);
-    let ruv = vec2<f32>(cw, ch) * k / base_px; // source-uv per reference pixel
+    // The crop is a transparent cut-out over the original, unchanged source
+    // geometry. This keeps subject scale/position stable while crop values move.
+    let crop_right = 1.0 - u.crop.y;
+    let crop_bottom = 1.0 - u.crop.w;
+    let crop_edge_px = min(min((l.x - u.crop.x) * u.size.x, (crop_right - l.x) * u.size.x),
+                           min((l.y - u.crop.z) * u.size.y, (crop_bottom - l.y) * u.size.y));
+    let crop_coverage = clamp(crop_edge_px + 0.5, 0.0, 1.0);
+    if (crop_coverage <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+    let suv = l;
+    let ruv = k / base_px; // source-uv per reference pixel
 
     // ------------------------------------------------------- sampling / blurs
     var col = fetch(suv);
@@ -365,6 +373,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             transition_progress > 0.0
         );
     }
-    let alpha = coverage * clamp(u.geo0.w, 0.0, 1.0) * transition_alpha;
+    let alpha = coverage * crop_coverage * clamp(u.geo0.w, 0.0, 1.0) * transition_alpha;
     return vec4<f32>(col, alpha);
 }

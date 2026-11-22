@@ -18,6 +18,42 @@ static const char *gExtraFxKeys[] = {"sharpen", "lens", "scanlines", "shake", "f
 static bool gExtraFxOn[EXTRA_FX_COUNT];
 static int gFilter;
 
+/* Resolve inspector transform fields from the selected clip's current keyframe
+   segment. The preview uses the same linear interpolation in Rust/WGPU. */
+static float PlutoKeyframedInspectorValue(const TimelineClipUi *clip, int field, float fallback, float at) {
+    if (!clip || field < 0 || field >= 6) return fallback;
+    unsigned bit = 1u << field;
+    float firstTime = 0.f, firstValue = fallback, lastTime = 0.f, lastValue = fallback;
+    bool haveFirst = false, haveLast = false;
+    for (int i = 0; i < clip->keyframeCount; i++) {
+        const TimelineKeyframeUi *key = &clip->keyframes[i];
+        if (!(key->valueMask & bit)) continue;
+        if (!haveFirst) { firstTime = lastTime = key->time; firstValue = lastValue = key->value[field]; haveFirst = haveLast = true; continue; }
+        if (at <= key->time) {
+            float span = key->time - lastTime;
+            float t = span > 0.000001f ? fmaxf(0.f, fminf(1.f, (at - lastTime) / span)) : 1.f;
+            return lastValue + (key->value[field] - lastValue) * t;
+        }
+        lastTime = key->time;
+        lastValue = key->value[field];
+        haveLast = true;
+    }
+    if (!haveFirst) return fallback;
+    return at < firstTime ? firstValue : lastValue;
+}
+
+static void PlutoApplyKeyframeValues(void) {
+    if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return;
+    const TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
+    gNum[0] = PlutoKeyframedInspectorValue(clip, 0, gNum[0], gPlayhead);
+    gNum[1] = PlutoKeyframedInspectorValue(clip, 1, gNum[1], gPlayhead);
+    gNum[2] = PlutoKeyframedInspectorValue(clip, 2, gNum[2], gPlayhead);
+    gNum[3] = PlutoKeyframedInspectorValue(clip, 3, gNum[3], gPlayhead);
+    gRot = gRotT = PlutoKeyframedInspectorValue(clip, 4, gRotT, gPlayhead);
+    float opacity = PlutoKeyframedInspectorValue(clip, 5, gSlT[0] * 100.f, gPlayhead);
+    gSl[0] = gSlT[0] = fmaxf(0.f, fminf(1.f, opacity / 100.f));
+}
+
 static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
 #ifdef _WIN32
     static const char *sliderPaths[5][8] = {
@@ -38,6 +74,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     gNum[3] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.scale.h", 100.f);
     gRot = gRotT = PlutoReadNumber(clipBegin, clipEnd, "props.transform.rotation", 0.f);
     gSl[0] = gSlT[0] = fmaxf(0.f, fminf(1.f, PlutoReadNumber(clipBegin, clipEnd, "props.transform.opacity", 100.f) / 100.f));
+    PlutoApplyKeyframeValues();
     gLink[0] = false; gLink[1] = true; gLink[2] = false; gLink[3] = false;
     PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.position.linked", &gLink[0]);
     PlutoJsonBoolPath(clipBegin, clipEnd, "props.transform.scale.linked", &gLink[1]);
@@ -357,6 +394,16 @@ static void NumField(int n, float *v, const char *unit) {
             gNum[other] = fmaxf(0.f, gLinkedNumOtherStart * ratio);
         }
     }
+    if (gValueDragging && gValueDragId == scrubId.id) {
+        if (gLink[linkedGroup]) {
+            char updates[384];
+            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                     kNumPropertyPaths[n], gNum[n], kNumPropertyPaths[n ^ 1], gNum[n ^ 1]);
+            PlutoTimelineSetPropertiesLiveJson(updates);
+        } else {
+            PlutoTimelineSetPropertyLive(kNumPropertyPaths[n], *v);
+        }
+    }
     if (changed) CommitNumField(n, before);
     else if (gLinkedNumDragField == n && gValueDragId != scrubId.id) gLinkedNumDragField = -1;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
@@ -384,6 +431,24 @@ static void MiniField(int n, const char *lab) {
     bool changed = ValueFieldLogic(scrubId, &gMini[n], .2f);
     static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
                                    "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
+    if (gValueDragging && gValueDragId == scrubId.id && n >= 0 && n < 8) {
+        if (n < 4 && gLink[2]) {
+            int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
+            gMini[other] = gMini[n];
+            char updates[384];
+            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
+                     paths[n], gMini[n], paths[other], gMini[other]);
+            PlutoTimelineSetPropertiesLiveJson(updates);
+        } else if (n >= 4 && gLink[3]) {
+            char updates[768] = "["; size_t used = 1;
+            for (int i = 4; i < 8; i++) {
+                gMini[i] = gMini[n];
+                int written = snprintf(updates + used, sizeof(updates) - used, "%s{\"path\":\"%s\",\"value\":%.4f}", i == 4 ? "" : ",", paths[i], gMini[i]);
+                if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
+            }
+            if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesLiveJson(updates); }
+        } else PlutoTimelineSetPropertyLive(paths[n], gMini[n]);
+    }
     if (changed && n >= 0 && n < 8) {
         if (n < 4 && gLink[2]) {
             int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
@@ -562,11 +627,17 @@ static void TransformView(void) {
                 Tx("Rotation", 19, C_TEXT, 0);
                 HSPACE
                 float rotationValue = gRot;
-                if (ValBoxEditable(CLAY_ID("RotationValue"), &rotationValue, "\xC2\xB0", 128, 35, 22, 18, 11, -180.f, 180.f, 1)) {
+                Clay_ElementId rotationValueId = CLAY_ID("RotationValue");
+                if (ValBoxEditable(rotationValueId, &rotationValue, "\xC2\xB0", 128, 35, 22, 18, 11, -180.f, 180.f, 1)) {
                     gRot = gRotT = rotationValue;
                     sentRotation = rotationValue;
                     PlutoTimelineSetProperty("props.transform.rotation", rotationValue);
                     gPreviewDirty = true;
+                }
+                if (gValueDragging && gValueDragId == rotationValueId.id) {
+                    gRot = gRotT = rotationValue;
+                    PlutoTimelineSetPropertyLive("props.transform.rotation", rotationValue);
+                    sentRotation = rotationValue;
                 }
             }
             Clay_ElementId rid = CLAY_ID("RotRuler");
@@ -586,7 +657,10 @@ static void TransformView(void) {
                 } else gDragId = 0;
             }
             CLAY(rid, {.layout = {.sizing = {GROW, FIX(93)}}, .custom = {.customData = NC(K_ROTRULER, C_CARD, C_CARD, C_CARD, (gRot + 180.f) / 360.f, b.hover, 0)}}) {}
-            if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
+            if (gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
+                PlutoTimelineSetPropertyLive("props.transform.rotation", gRotT);
+                sentRotation = gRotT;
+            } else if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
                 PlutoTimelineSetProperty("props.transform.rotation", gRotT);
                 sentRotation = gRotT;
             }
@@ -597,17 +671,24 @@ static void TransformView(void) {
                 Tx("Opacity", 18, C_TEXT, 0);
                 HSPACE
                 float opacityValue = gSl[0] * 100.f;
-                if (ValBoxEditable(CLAY_ID("OpacityValue"), &opacityValue, "%", 72, 27, 16, 13, 8, 0.f, 100.f, 0)) {
+                Clay_ElementId opacityValueId = CLAY_ID("OpacityValue");
+                if (ValBoxEditable(opacityValueId, &opacityValue, "%", 72, 27, 16, 13, 8, 0.f, 100.f, 0)) {
                     gSl[0] = gSlT[0] = opacityValue / 100.f;
                     PlutoTimelineSetProperty("props.transform.opacity", opacityValue);
+                    sentOpacity = gSlT[0];
+                }
+                if (gValueDragging && gValueDragId == opacityValueId.id) {
+                    gSl[0] = gSlT[0] = opacityValue / 100.f;
+                    PlutoTimelineSetPropertyLive("props.transform.opacity", opacityValue);
                     sentOpacity = gSlT[0];
                 }
             }
             Clay_ElementId sid = CLAY_ID("OpacitySlider");
             Bs b = Interact(sid);
             SliderLogic(sid, 0, 8.5f);
-            if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
-                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
+            if (fabsf(gSlT[0] - sentOpacity) > 0.002f) {
+                if (gSlDrag[0]) PlutoTimelineSetPropertyLive("props.transform.opacity", gSlT[0] * 100.f);
+                else PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
                 sentOpacity = gSlT[0];
             }
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},

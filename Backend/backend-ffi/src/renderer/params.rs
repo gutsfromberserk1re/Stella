@@ -44,6 +44,49 @@ fn flag(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
 }
 
+fn resolve_keyframed_props(props: &Value, keyframes: &Value, time: f64) -> Value {
+    const FIELDS: [(&str, &[&str]); 6] = [
+        ("x", &["transform", "position", "x"]),
+        ("y", &["transform", "position", "y"]),
+        ("scaleW", &["transform", "scale", "w"]),
+        ("scaleH", &["transform", "scale", "h"]),
+        ("rotation", &["transform", "rotation"]),
+        ("opacity", &["transform", "opacity"]),
+    ];
+    let Some(frames) = keyframes.as_array().filter(|items| !items.is_empty()) else { return props.clone(); };
+    let mut resolved = if props.is_object() { props.clone() } else { serde_json::json!({}) };
+    for (field, path) in FIELDS {
+        let mut points: Vec<(f64, f64)> = frames.iter().filter_map(|frame| {
+            let at = frame["time"].as_f64().filter(|v| v.is_finite())?;
+            let value = frame["values"][field].as_f64().filter(|v| v.is_finite())?;
+            // Older Stella builds stored opacity as a 0..1 fraction; current
+            // keyframes store the inspector's 0..100 percentage value.
+            let value = if field == "opacity" && value > 0.0 && value <= 1.0 { value * 100.0 } else { value };
+            Some((at, value))
+        }).collect();
+        if points.is_empty() { continue; }
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let value = if time <= points[0].0 {
+            points[0].1
+        } else if time >= points[points.len() - 1].0 {
+            points[points.len() - 1].1
+        } else {
+            let right = points.partition_point(|point| point.0 < time).min(points.len() - 1);
+            let (t0, v0) = points[right - 1];
+            let (t1, v1) = points[right];
+            let amount = ((time - t0) / (t1 - t0).max(1e-9)).clamp(0.0, 1.0);
+            v0 + (v1 - v0) * amount
+        };
+        let mut cursor = &mut resolved;
+        for key in &path[..path.len() - 1] {
+            if !cursor[*key].is_object() { cursor[*key] = serde_json::json!({}); }
+            cursor = &mut cursor[*key];
+        }
+        cursor[path[path.len() - 1]] = serde_json::json!(value);
+    }
+    resolved
+}
+
 impl LayerUniforms {
     /// A layer that renders exactly like the old fit-and-blend shader.
     pub fn identity() -> Self {
@@ -83,6 +126,14 @@ impl LayerUniforms {
     /// `props` is `clip.extra["props"]` (or `Value::Null`); `time` is timeline seconds.
     pub fn from_props(props: &Value, time: f64) -> Self {
         Self::from_props_with_transition(props, time, None)
+    }
+
+    /// Resolves transform keyframes before mapping the normal property tree to
+    /// uniforms. Keyframe times are absolute timeline seconds and values use
+    /// x, y, scaleW, scaleH, rotation (degrees), and opacity (percent).
+    pub fn from_props_with_keyframes(props: &Value, time: f64, keyframes: &Value) -> Self {
+        let resolved = resolve_keyframed_props(props, keyframes, time);
+        Self::from_props(&resolved, time)
     }
 
     /// Maps the active incoming transition along with the clip's visual properties.
@@ -389,6 +440,34 @@ mod tests {
         assert!((u.geo1[1] + 0.1).abs() < 1e-6);
         assert!((u.crop[0] - 0.1).abs() < 1e-6);
         assert!((u.crop[3] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn keyframes_interpolate_transform_uniforms_on_the_native_preview_path() {
+        let props = json!({"transform": {"position": {"x": 0.0, "y": 0.0},
+            "scale": {"w": 100.0, "h": 100.0}, "rotation": 0.0, "opacity": 100.0}});
+        let keyframes = json!([
+            {"time": 1.0, "values": {"x": 0.0, "y": 100.0, "scaleW": 100.0, "scaleH": 100.0, "rotation": 0.0, "opacity": 100.0}},
+            {"time": 3.0, "values": {"x": 960.0, "y": -100.0, "scaleW": 200.0, "scaleH": 50.0, "rotation": 90.0, "opacity": 40.0}}
+        ]);
+        let u = LayerUniforms::from_props_with_keyframes(&props, 2.0, &keyframes);
+        assert!((u.geo1[0] - 0.25).abs() < 1e-5, "position X halfway");
+        assert!((u.geo1[1] - 0.0).abs() < 1e-5, "position Y halfway");
+        assert!((u.geo0[0] - 1.5).abs() < 1e-5, "scale X halfway");
+        assert!((u.geo0[1] - 0.75).abs() < 1e-5, "scale Y halfway");
+        assert!((u.geo0[2] - std::f32::consts::FRAC_PI_4).abs() < 1e-5, "rotation halfway");
+        assert!((u.opacity() - 0.70).abs() < 1e-5, "opacity halfway");
+        let before = LayerUniforms::from_props_with_keyframes(&props, 0.0, &keyframes);
+        let after = LayerUniforms::from_props_with_keyframes(&props, 4.0, &keyframes);
+        assert_eq!(before.geo0[0], 1.0);
+        assert!((after.geo0[0] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn legacy_fractional_keyframe_opacity_is_read_as_a_fraction() {
+        let frames = json!([{"time": 0.0, "values": {"opacity": 0.25}}]);
+        let u = LayerUniforms::from_props_with_keyframes(&Value::Null, 0.0, &frames);
+        assert!((u.opacity() - 0.25).abs() < 1e-5);
     }
 
     #[test]

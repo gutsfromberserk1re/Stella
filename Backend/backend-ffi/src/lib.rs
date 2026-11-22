@@ -29,6 +29,8 @@ use std::{
 
 struct Backend {
     timeline: Mutex<Timeline>,
+    /// One undo snapshot for an entire inspector/keyframe drag, not one per UI frame.
+    property_edit: Mutex<Option<Timeline>>,
     undo: Mutex<Vec<Timeline>>,
     redo: Mutex<Vec<Timeline>>,
     next_task: AtomicU64,
@@ -46,7 +48,7 @@ static PREVIEW_ORIGINAL_CLIPS: AtomicU64 = AtomicU64::new(0);
 /// Phase 0 telemetry. PATH: 0 = none yet, 1 = native GPU compositor, 2 = FFmpeg graph fallback.
 /// A fallback frame is far slower, so F3 must say when it is happening and why.
 static PREVIEW_PATH: AtomicU64 = AtomicU64::new(0);
-/// Why the last frame left the native path: 0 none, 1 transition, 2 still image, 3 keyframes,
+/// Why the last frame left the native path: 0 none, 1 transition, 2 still image,
 /// 4 missing/empty source, 5 decoder error, 6 GPU composite error.
 static PREVIEW_FALLBACK_REASON: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_COMPOSITE_US: AtomicU64 = AtomicU64::new(0);
@@ -334,6 +336,7 @@ fn backend() -> &'static Backend {
             .expect("failed to start Stella proxy worker");
         Backend {
             timeline: Mutex::new(Timeline::default()),
+            property_edit: Mutex::new(None),
             undo: Mutex::new(Vec::new()),
             redo: Mutex::new(Vec::new()),
             next_task: AtomicU64::new(1),
@@ -988,10 +991,9 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
 }
 
 impl PreviewEngine {
-    /// Fast path for ordinary video playback: reuse in-process FFmpeg decoders,
-    /// then let Stella's existing wgpu layer renderer composite the active clips.
-    /// Timelines containing still images, keyframes or an active transition keep
-    /// using the established FFmpeg graph until those cases have native parity.
+    /// Fast path for video playback and transform keyframes: reuse in-process
+    /// FFmpeg decoders, then evaluate keyframes into Stella's WGPU layer uniforms.
+    /// Still images and active transitions retain the FFmpeg graph fallback.
     fn render_native(
         &mut self,
         timeline: &Timeline,
@@ -1033,15 +1035,11 @@ impl PreviewEngine {
             TrackId::A2 => 5,
         });
 
-        // The native parameter mapper currently handles static properties. Keep
-        // animated clips on the reference filter graph rather than silently
-        // displaying incorrect keyframe values.
+        // Video keyframes are evaluated into the same WGPU uniforms as static
+        // transforms, so animated clips stay on the low-latency native path.
         for clip in &active {
             if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
                 return note_fallback(2);
-            }
-            if clip.extra.get("keyframes").and_then(Value::as_array).is_some_and(|items| !items.is_empty()) {
-                return note_fallback(3);
             }
             let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             if source.is_empty() {
@@ -1096,12 +1094,13 @@ impl PreviewEngine {
         let null_props = Value::Null;
         let layers: Vec<GpuLayerFrame<'_>> = active.iter().zip(decoded.iter()).map(|(clip, frame)| {
             let props = clip.extra.get("props").unwrap_or(&null_props);
+            let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
             GpuLayerFrame {
                 key: clip.id.as_str(),
                 pixels: frame.rgba.as_slice(),
                 width: frame.width,
                 height: frame.height,
-                uniforms: LayerUniforms::from_props(props, frame_at),
+                uniforms: LayerUniforms::from_props_with_keyframes(props, frame_at, keyframes),
             }
         }).collect();
 
@@ -1391,52 +1390,131 @@ fn dispatch(request: Value) -> Result<Value, String> {
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_add_keyframe" => {
-            let before = timeline.clone();
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).ok_or("Keyframe time is invalid")?;
+            {
+                let clip = timeline.clips.iter().find(|clip| clip.id == id)
+                    .ok_or_else(|| format!("Clip {id} was not found"))?;
+                if at < clip.start - 1e-4 || at > clip.end() + 1e-4 {
+                    return Err("Keyframe must be inside the selected clip".into());
+                }
+                if let Some(keyframes) = clip.extra.get("keyframes") {
+                    if !keyframes.is_array() { return Err("Clip keyframes are invalid".into()); }
+                }
+            }
+            let before = begin_history_change(backend, &timeline, false)?;
             let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
                 .ok_or_else(|| format!("Clip {id} was not found"))?;
             let keyframes = clip.extra.entry("keyframes".into()).or_insert_with(|| json!([]));
             let list = keyframes.as_array_mut().ok_or("Clip keyframes are invalid")?;
-            if !list.iter().any(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - at).abs() < 0.0001) {
+            let mut changed = false;
+            if let Some(existing) = list.iter_mut().find(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - at).abs() < 0.0001) {
+                existing["values"] = request["values"].clone();
+                changed = true;
+            } else {
                 list.push(json!({"time": at, "values": request["values"].clone()}));
+                changed = true;
+            }
+            if changed {
                 list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
-                save_history(backend, before)?;
+                commit_history_change(backend, before)?;
             }
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
-        "timeline_set_clip_property" => {
-            let before = timeline.clone();
+        "timeline_move_keyframe" => {
             let id = request["id"].as_str().ok_or("Clip id is required")?;
-            let path = request["path"].as_str().ok_or("Property path is required")?;
-            set_timeline_clip_property(&mut timeline, id, path, request["value"].clone())?;
-            save_history(backend, before)?;
+            let from = request["from"].as_f64().filter(|value| value.is_finite()).ok_or("Original keyframe time is invalid")?;
+            let to = request["to"].as_f64().filter(|value| value.is_finite()).ok_or("New keyframe time is invalid")?;
+            let live = request["live"].as_bool().unwrap_or(false);
+            // Validate the move before opening an undo transaction. A blocked
+            // drag (for example, dropping onto another keyframe) must not leave
+            // an empty history snapshot behind.
+            {
+                let clip = timeline.clips.iter().find(|clip| clip.id == id)
+                    .ok_or_else(|| format!("Clip {id} was not found"))?;
+                if to < clip.start - 1e-4 || to > clip.end() + 1e-4 {
+                    return Err("Keyframe must stay inside the selected clip".into());
+                }
+                let list = clip.extra.get("keyframes").and_then(Value::as_array)
+                    .ok_or("Clip has no keyframes")?;
+                let index = list.iter().position(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - from).abs() < 0.001)
+                    .ok_or("Keyframe could not be found")?;
+                if list.iter().enumerate().any(|(other, keyframe)| other != index &&
+                    (keyframe["time"].as_f64().unwrap_or(-1.0) - to).abs() < 0.0001) {
+                    return Err("Another keyframe already exists at that time".into());
+                }
+            }
+            let before = begin_history_change(backend, &timeline, live)?;
+            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
+                .ok_or_else(|| format!("Clip {id} was not found"))?;
+            let list = clip.extra.get_mut("keyframes").and_then(Value::as_array_mut)
+                .ok_or("Clip has no keyframes")?;
+            let index = list.iter().position(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - from).abs() < 0.001)
+                .ok_or("Keyframe could not be found")?;
+            list[index]["time"] = json!(to);
+            list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
+            commit_history_change(backend, before)?;
+            if live { Ok(json!({"changed": true})) }
+            else { serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()) }
+        }
+        "timeline_end_property_edit" => {
+            let before = backend.property_edit.lock().map_err(|_| "Property edit lock failed")?.take();
+            if let Some(before) = before { save_history(backend, before)?; }
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
-        "timeline_set_clip_properties" => {
-            let before = timeline.clone();
+        "timeline_set_clip_property" => {
+            let live = request["live"].as_bool().unwrap_or(false);
+            let before = begin_history_change(backend, &timeline, live)?;
             let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let path = request["path"].as_str().ok_or("Property path is required")?;
+            let value = request["value"].clone();
+            set_timeline_clip_property(&mut timeline, id, path, value.clone())?;
+            if let Some(at) = request["at"].as_f64().filter(|value| value.is_finite()) {
+                update_keyframe_property(&mut timeline, id, path, value, at);
+            }
+            commit_history_change(backend, before)?;
+            if live { Ok(json!({"changed": true})) }
+            else { serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()) }
+        }
+        "timeline_set_clip_properties" => {
+            let live = request["live"].as_bool().unwrap_or(false);
+            let before = begin_history_change(backend, &timeline, live)?;
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let at = request["at"].as_f64().filter(|value| value.is_finite());
             let updates = request["properties"].as_array().ok_or("Property updates are required")?;
             let selected_index = timeline.clips.iter().position(|clip| clip.id == id)
                 .ok_or_else(|| format!("Clip {id} was not found"))?;
             let group_id = timeline.clips[selected_index].extra.get("groupId")
                 .and_then(Value::as_str).map(str::to_owned);
-            let indices: Vec<_> = group_id.as_deref().map(|group| timeline.clips.iter().enumerate()
-                .filter_map(|(index, clip)| (clip.extra.get("groupId").and_then(Value::as_str) == Some(group)).then_some(index))
-                .collect()).unwrap_or_else(|| vec![selected_index]);
+            // Transform scrubs only touch the selected clip. Clone sibling clips
+            // only when this batch actually contains a group-shared color/effect
+            // property, keeping per-frame inspector edits proportional to one clip.
+            let update_group = group_id.is_some() && updates.iter().any(|update|
+                update["path"].as_str().is_some_and(is_group_shared_property));
+            let indices: Vec<_> = if update_group {
+                let group = group_id.as_deref().unwrap();
+                timeline.clips.iter().enumerate()
+                    .filter_map(|(index, clip)| (clip.extra.get("groupId").and_then(Value::as_str) == Some(group)).then_some(index))
+                    .collect()
+            } else { vec![selected_index] };
             let mut working: Vec<_> = indices.iter().map(|&index| (index, timeline.clips[index].clone())).collect();
             for update in updates {
                 let path = update["path"].as_str().ok_or("Property path is required")?;
+                let value = update["value"].clone();
                 let shared = is_group_shared_property(path) && group_id.is_some();
                 for (index, clip) in &mut working {
                     if *index == selected_index || shared {
-                        set_clip_property(clip, path, update["value"].clone())?;
+                        set_clip_property(clip, path, value.clone())?;
+                        if *index == selected_index {
+                            if let Some(at) = at { update_keyframe_property_on_clip(clip, path, value.clone(), at); }
+                        }
                     }
                 }
             }
             for (index, clip) in working { timeline.clips[index] = clip; }
-            save_history(backend, before)?;
-            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+            commit_history_change(backend, before)?;
+            if live { Ok(json!({"changed": true})) }
+            else { serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()) }
         }
         _ => Err(format!("Unsupported command: {command}")),
     }
@@ -1448,6 +1526,51 @@ fn save_history(backend: &Backend, before: Timeline) -> Result<(), String> {
     if undo.len() > 64 { undo.remove(0); }
     backend.redo.lock().map_err(|_| "Redo history lock failed")?.clear();
     Ok(())
+}
+
+fn begin_history_change(backend: &Backend, timeline: &Timeline, live: bool) -> Result<Option<Timeline>, String> {
+    let mut pending = backend.property_edit.lock().map_err(|_| "Property edit lock failed")?;
+    if live {
+        // Clone once at gesture start; do not clone the whole timeline on each
+        // subsequent mouse-move frame.
+        if pending.is_none() { *pending = Some(timeline.clone()); }
+        Ok(None)
+    } else {
+        Ok(Some(pending.take().unwrap_or_else(|| timeline.clone())))
+    }
+}
+
+fn commit_history_change(backend: &Backend, before: Option<Timeline>) -> Result<(), String> {
+    if let Some(before) = before { save_history(backend, before)?; }
+    Ok(())
+}
+
+fn keyframe_value_name(path: &str) -> Option<&'static str> {
+    match path.strip_prefix("props.").unwrap_or(path) {
+        "transform.position.x" => Some("x"),
+        "transform.position.y" => Some("y"),
+        "transform.scale.w" => Some("scaleW"),
+        "transform.scale.h" => Some("scaleH"),
+        "transform.rotation" => Some("rotation"),
+        "transform.opacity" => Some("opacity"),
+        _ => None,
+    }
+}
+
+fn update_keyframe_property_on_clip(clip: &mut Clip, path: &str, value: Value, at: f64) {
+    let Some(field) = keyframe_value_name(path) else { return; };
+    let Some(list) = clip.extra.get_mut("keyframes").and_then(Value::as_array_mut) else { return; };
+    if let Some(keyframe) = list.iter_mut().find(|keyframe|
+        (keyframe["time"].as_f64().unwrap_or(f64::NEG_INFINITY) - at).abs() <= 0.001) {
+        if !keyframe["values"].is_object() { keyframe["values"] = json!({}); }
+        keyframe["values"][field] = value;
+    }
+}
+
+fn update_keyframe_property(timeline: &mut Timeline, id: &str, path: &str, value: Value, at: f64) {
+    if let Some(clip) = timeline.clips.iter_mut().find(|clip| clip.id == id) {
+        update_keyframe_property_on_clip(clip, path, value, at);
+    }
 }
 
 fn set_json_path(root: &mut Value, parts: &[&str], value: Value) {
@@ -1704,6 +1827,27 @@ mod tests {
         assert_eq!(props["colors"]["light"]["exposure"].as_f64(), Some(1.5));
         assert_eq!(props["colors"]["hsl"]["0"]["hue"].as_f64(), Some(42.0));
         assert_eq!(props["effects"]["blur"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn inspector_edits_at_a_keyframe_update_only_that_keyframe_channel() {
+        let mut clip = test_clip("keyframe-edit-test");
+        clip.extra.insert("keyframes".into(), json!([
+            {"time": 0.0, "values": {"x": 10.0, "opacity": 100.0}},
+            {"time": 1.0, "values": {"x": 20.0, "opacity": 75.0}},
+            {"time": 2.0, "values": {"x": 30.0, "opacity": 50.0}}
+        ]));
+
+        update_keyframe_property_on_clip(&mut clip, "props.transform.position.x", json!(42.0), 1.0);
+        update_keyframe_property_on_clip(&mut clip, "props.transform.opacity", json!(35.0), 1.0);
+        update_keyframe_property_on_clip(&mut clip, "props.transform.scale.w", json!(150.0), 1.0);
+
+        let frames = clip.extra["keyframes"].as_array().unwrap();
+        assert_eq!(frames[0]["values"]["x"].as_f64(), Some(10.0));
+        assert_eq!(frames[1]["values"]["x"].as_f64(), Some(42.0));
+        assert_eq!(frames[1]["values"]["opacity"].as_f64(), Some(35.0));
+        assert_eq!(frames[1]["values"]["scaleW"].as_f64(), Some(150.0));
+        assert_eq!(frames[2]["values"]["x"].as_f64(), Some(30.0));
     }
 
     #[test]

@@ -206,6 +206,27 @@ static float TimelineDuration(void) {
     return duration > 0.f ? duration : 9.f;
 }
 
+static int TimelineKeyframeHit(int clipIndex, Clay_BoundingBox bounds, Vector2 mouse) {
+    if (clipIndex < 0 || clipIndex >= gTimelineClipCount || bounds.width <= 0.f) return -1;
+    TimelineClipUi *clip = &gTimelineClips[clipIndex];
+    for (int k = 0; k < clip->keyframeCount; k++) {
+        float time = clip->keyframes[k].time;
+        if (time < clip->start - .001f || time > clip->start + clip->duration + .001f) continue;
+        float x = bounds.x + (time - clip->start) / fmaxf(.001f, clip->duration) * bounds.width;
+        float y = bounds.y + 13.f;
+        if (fabsf(mouse.x - x) <= 10.f && fabsf(mouse.y - y) <= 11.f) return k;
+    }
+    return -1;
+}
+
+static bool TimelineKeyframeAtPointer(Vector2 mouse) {
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        Clay_BoundingBox bounds = Clay_GetElementData(CLAY_IDI("TimelineClip", i)).boundingBox;
+        if (TimelineKeyframeHit(i, bounds, mouse) >= 0) return true;
+    }
+    return false;
+}
+
 static int TimelineClipStartCompare(const void *left, const void *right) {
     int a = *(const int *)left, b = *(const int *)right;
     float delta = gTimelineClips[a].start - gTimelineClips[b].start;
@@ -323,7 +344,47 @@ static void TimelineClipLane(int track) {
             Clay_ElementId clipId = CLAY_IDI("TimelineClip", i);
             Bs b = Interact(clipId);
             Clay_BoundingBox bb = Clay_GetElementData(clipId).boundingBox;
-            if (!transitionPressed && !gTimelineScrubbing && !gTimelineContextConsumedClick &&
+            Vector2 pointer = GetMousePosition();
+            bool keyframePressed = false;
+            if (!transitionPressed && gTimelineTool == 0 && !gTimelineScrubbing &&
+                !gTimelineContextConsumedClick && gKeyframeDragClip < 0 &&
+                Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                int hitKeyframe = TimelineKeyframeHit(i, bb, pointer);
+                if (hitKeyframe >= 0) {
+                    keyframePressed = true;
+                    gTransitionFocusClip = -1;
+                    PlutoTimelineSelect(i);
+                    gKeyframeDragClip = i;
+                    gKeyframeDragIndex = hitKeyframe;
+                    gKeyframeDragTime = gTimelineClips[i].keyframes[hitKeyframe].time;
+                    gPlayhead = gKeyframeDragTime;
+                    gPreviewDirty = true;
+                    gPreviewDebounce = 0.f;
+                }
+            }
+            if (gKeyframeDragClip == i && gKeyframeDragIndex >= 0 &&
+                (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonReleased(MOUSE_BUTTON_LEFT))) {
+                float rawTime = gTimelineClips[i].start +
+                    (pointer.x - bb.x) / fmaxf(1.f, bb.width) * gTimelineClips[i].duration;
+                float frameRate = (float)fmaxf(1, gPreviewFps);
+                float nextTime = roundf(rawTime * frameRate) / frameRate;
+                nextTime = fmaxf(gTimelineClips[i].start,
+                    fminf(gTimelineClips[i].start + gTimelineClips[i].duration, nextTime));
+                if (fabsf(nextTime - gKeyframeDragTime) > 0.0005f) {
+                    if (PlutoTimelineMoveKeyframe(i, gKeyframeDragTime, nextTime, true)) {
+                        gKeyframeDragTime = nextTime;
+                        gPlayhead = nextTime;
+                        PlutoApplyKeyframeValues();
+                        gPreviewDirty = true;
+                        gPreviewDebounce = 0.f;
+                    }
+                }
+                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                    gKeyframeDragClip = -1;
+                    gKeyframeDragIndex = -1;
+                }
+            }
+            if (!keyframePressed && gKeyframeDragClip < 0 && !transitionPressed && !gTimelineScrubbing && !gTimelineContextConsumedClick &&
                 Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 gTransitionFocusClip = -1;
                 if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
@@ -346,18 +407,17 @@ static void TimelineClipLane(int track) {
                     }
                 }
             }
-            if (Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            if (gKeyframeDragClip < 0 && Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
                 if (!gTimelineMultiSelect[i]) {
                     memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
                     gTimelineMultiSelect[i] = true;
                 }
-                gTimelineSelected = i;
                 PlutoTimelineSelect(i);
                 gTimelineContextClip = i;
                 gTimelineContextPos = GetMousePosition();
                 gTimelineContextOpen = true;
             }
-            if (gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
+            if (gKeyframeDragClip < 0 && gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
                 if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && lane.width > 0.f) {
                     TimelineRestoreDragSnapshot();
                     int hoveredTrack = TimelineTrackUnderPointer();
@@ -526,7 +586,8 @@ static void Timeline(void) {
     Clay_BoundingBox body = Clay_GetElementData(CLAY_ID("TimeBody")).boundingBox;
     float playheadX = ruler.x + gTimelinePan + gPlayhead * pps;
     bool grabbedPlayhead = mouse.y >= ruler.y && mouse.y <= body.y + body.height && fabsf(mouse.x - playheadX) <= 9.f;
-    if ((Clay_PointerOver(CLAY_ID("Ruler")) || grabbedPlayhead) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gTimelineScrubbing = true;
+    bool overKeyframe = TimelineKeyframeAtPointer(mouse);
+    if (!overKeyframe && (Clay_PointerOver(CLAY_ID("Ruler")) || grabbedPlayhead) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gTimelineScrubbing = true;
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gTimelineScrubbing = false;
     if (gTimelineScrubbing) {
         Clay_BoundingBox bb = Clay_GetElementData(CLAY_ID("Ruler")).boundingBox;
@@ -618,7 +679,7 @@ static void Timeline(void) {
                     float prev = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i] < gPlayhead - .02f && (prev < 0.f || clip->keyframes[i] > prev)) prev = clip->keyframes[i];
+                        if (clip->keyframes[i].time < gPlayhead - .02f && (prev < 0.f || clip->keyframes[i].time > prev)) prev = clip->keyframes[i].time;
                     gPlayhead = prev >= 0.f ? prev : 0.f; gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
                 if (IconBtn(CLAY_ID("KfAdd"), I_KF_DIAMOND, 28, 14, C_DIM, false, 8) && gTimelineSelected >= 0)
@@ -628,7 +689,7 @@ static void Timeline(void) {
                     float next = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i] > gPlayhead + .02f && (next < 0.f || clip->keyframes[i] < next)) next = clip->keyframes[i];
+                        if (clip->keyframes[i].time > gPlayhead + .02f && (next < 0.f || clip->keyframes[i].time < next)) next = clip->keyframes[i].time;
                     gPlayhead = next >= 0.f ? next : TimelineDuration(); gPreviewDirty = true; gPreviewDebounce = 1.f;
                 }
             }

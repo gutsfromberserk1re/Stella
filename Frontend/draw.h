@@ -602,17 +602,19 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (clipIndex >= 0 && clipIndex < gTimelineClipCount) {
             TimelineClipUi *clip = &gTimelineClips[clipIndex];
             for (int k = 0; k < clip->keyframeCount; k++) {
-                float time = clip->keyframes[k];
+                float time = clip->keyframes[k].time;
                 if (time < clip->start || time > clip->start + clip->duration) continue;
                 float x = r.x + (time - clip->start) / fmaxf(.001f, clip->duration) * r.width;
-                float y = r.y + 13.f, half = 5.5f;
-                Color key = fabsf(time - gPlayhead) < (1.f / 60.f) ? (Color){255, 255, 255, 255} : (Color){226, 219, 247, 245};
+                float y = r.y + 13.f, half = 7.f;
+                bool activeKey = fabsf(time - gPlayhead) < (1.f / 60.f);
+                Color key = activeKey ? (Color){255, 255, 255, 255} : (Color){226, 219, 247, 245};
                 Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};
+                DrawCircleV((Vector2){x, y}, 9.5f, (Color){22, 19, 30, 220});
                 DrawTriangle(a, d, b, key); DrawTriangle(c, b, d, key);
-                DrawLineEx(a, b, 1.f, (Color){72, 58, 90, 255});
-                DrawLineEx(b, c, 1.f, (Color){72, 58, 90, 255});
-                DrawLineEx(c, d, 1.f, (Color){72, 58, 90, 255});
-                DrawLineEx(d, a, 1.f, (Color){72, 58, 90, 255});
+                DrawLineEx(a, b, 1.25f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
+                DrawLineEx(b, c, 1.25f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
+                DrawLineEx(c, d, 1.25f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
+                DrawLineEx(d, a, 1.25f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
             }
         }
     } break;
@@ -889,7 +891,7 @@ static void DrawPerfOverlay(void) {
     if (!gPerfOverlay) return;
     char line[8][112];
     const double budget = 1000.0 / (double)(gPreviewFps > 0 ? gPreviewFps : 30);
-    static const char *reasons[] = {"", "transition", "still image", "keyframes", "missing source", "decoder error", "GPU error"};
+    static const char *reasons[] = {"", "transition", "still image", "reserved", "missing source", "decoder error", "GPU error"};
     const int reason = (int)gPerfFallbackReason;
     snprintf(line[0], sizeof(line[0]), "Preview %dp @ %dfps   shown %.1f fps   interval med %.1f / p95 %.1f ms", gPreviewRes, gPreviewFps, gPerfDisplayFps, gPerfIntervalMedMs, gPerfIntervalP95Ms);
     snprintf(line[1], sizeof(line[1]), "end-to-end %.1f ms (budget %.1f)", gPerfEndToEndMs, budget);

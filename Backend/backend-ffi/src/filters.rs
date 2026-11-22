@@ -3,6 +3,41 @@ use serde_json::Value;
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
 fn n(value: &Value, key: &str, fallback: f64) -> f64 { number(value, key, fallback) }
+
+/// Build an FFmpeg expression for a transform channel using the same linear,
+/// clamped interpolation as the native WGPU preview. Keyframe timestamps are
+/// absolute timeline seconds (the video PTS is shifted to that same clock).
+fn keyframed_value_expr(clip: &Value, field: &str) -> Option<String> {
+    keyframed_value_expr_at(clip, field, "t")
+}
+
+fn keyframed_value_expr_at(clip: &Value, field: &str, time_variable: &str) -> Option<String> {
+    let frames = clip["keyframes"].as_array()?;
+    let mut points: Vec<(f64, f64)> = frames.iter().filter_map(|frame| {
+        let time = frame["time"].as_f64().filter(|v| v.is_finite())?;
+        let mut value = frame["values"][field].as_f64().filter(|v| v.is_finite())?;
+        // Compatibility with older saved projects where opacity was 0..1.
+        if field == "opacity" && value > 0.0 && value <= 1.0 { value *= 100.0; }
+        Some((time, value))
+    }).collect();
+    if points.is_empty() { return None; }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    points.dedup_by(|a, b| {
+        if (a.0 - b.0).abs() < 1e-7 { a.1 = b.1; true } else { false }
+    });
+    if points.len() == 1 { return Some(format!("{:.6}", points[0].1)); }
+
+    let mut expression = format!("{:.6}", points[points.len() - 1].1);
+    for pair in points.windows(2).rev() {
+        let (t0, v0) = pair[0];
+        let (t1, v1) = pair[1];
+        let span = (t1 - t0).max(1e-9);
+        let interpolated = format!("({v0:.6}+({:.6})*({time_variable}-{t0:.6})/{span:.6})", v1 - v0);
+        expression = format!("if(lt({time_variable},{t1:.6}),{interpolated},{expression})");
+    }
+    let (first_time, first_value) = points[0];
+    Some(format!("if(lt({time_variable},{first_time:.6}),{first_value:.6},{expression})"))
+}
 pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
     let props = &clip["props"];
     let transform = &props["transform"];
@@ -10,17 +45,24 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let colors = &props["colors"];
     let source_start = n(clip, "sourceOffset", 0.0).max(0.0);
     let mut filters = vec![format!("trim=start={source_start:.5}:duration={length:.5}"), format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
-        format!("scale={width}:{height}:force_original_aspect_ratio=decrease"),
-        format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"), "setsar=1".into(), "format=rgba".into()];
+        format!("scale={width}:{height}:force_original_aspect_ratio=decrease"), "setsar=1".into(), "format=rgba".into()];
 
     let crop = &transform["crop"];
     let left = (n(crop, "left", 0.0) / 1920.0).clamp(0.0, 0.45);
     let right = (n(crop, "right", 0.0) / 1920.0).clamp(0.0, 0.45);
     let top = (n(crop, "top", 0.0) / 1080.0).clamp(0.0, 0.45);
     let bottom = (n(crop, "bottom", 0.0) / 1080.0).clamp(0.0, 0.45);
+    let keep_w = (1.0 - left - right).max(0.1);
+    let keep_h = (1.0 - top - bottom).max(0.1);
     if left + right > 0.0 || top + bottom > 0.0 {
-        filters.push(format!("crop=iw*{:.6}:ih*{:.6}:iw*{left:.6}:ih*{top:.6}", (1.0 - left - right).max(0.1), (1.0 - top - bottom).max(0.1)));
-        filters.push(format!("scale={width}:{height}:force_original_aspect_ratio=decrease"));
+        // Crop the fitted source image, then place the remainder back at its
+        // original canvas position. Reconstruct the pre-crop dimensions in
+        // the pad expressions so letterboxed/pillarboxed media is treated the
+        // same way as the WGPU preview. Never enlarge the remaining picture.
+        filters.push(format!(
+            "crop=iw*{keep_w:.6}:ih*{keep_h:.6}:iw*{left:.6}:ih*{top:.6},pad={width}:{height}:(ow-iw/{keep_w:.6})/2+iw*{left:.6}/{keep_w:.6}:(oh-ih/{keep_h:.6})/2+ih*{top:.6}/{keep_h:.6}:color=black@0"
+        ));
+    } else {
         filters.push(format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
     }
 
@@ -249,20 +291,57 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
 
     let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
     let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
-    if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 { filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}")); }
-    let rotation = n(transform, "rotation", 0.0).to_radians();
-    if rotation.abs() > 0.0001 { filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0")); }
+    let animated_scale_w = keyframed_value_expr(clip, "scaleW");
+    let animated_scale_h = keyframed_value_expr(clip, "scaleH");
+    if animated_scale_w.is_some() || animated_scale_h.is_some() {
+        let w_expr = animated_scale_w.unwrap_or_else(|| format!("{:.6}", scale_w * 100.0));
+        let h_expr = animated_scale_h.unwrap_or_else(|| format!("{:.6}", scale_h * 100.0));
+        filters.push(format!("scale=w='iw*({w_expr})/100':h='ih*({h_expr})/100':eval=frame"));
+    } else if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 {
+        filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}"));
+    }
+
+    let rotation_degrees = n(transform, "rotation", 0.0);
+    let animated_rotation = keyframed_value_expr(clip, "rotation");
+    if let Some(expression) = animated_rotation {
+        // Constant diagonal bounds let the angle change every frame without
+        // changing the filter's output dimensions mid-stream.
+        filters.push(format!("rotate=angle='({expression})*PI/180':ow=iw:oh=ih:c=black@0"));
+    } else if rotation_degrees.abs() > 0.0001 {
+        let rotation = rotation_degrees.to_radians();
+        filters.push(format!("rotate={rotation:.6}:ow=iw:oh=ih:c=black@0"));
+    }
+
     let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
-    if opacity < 0.999 { filters.push(format!("colorchannelmixer=aa={opacity:.4}")); }
-    let x = n(&transform["position"], "x", 0.0) * width as f64 / 1920.0;
-    let y = n(&transform["position"], "y", 0.0) * height as f64 / 1080.0;
+    if let Some(expression) = keyframed_value_expr_at(clip, "opacity", "T") {
+        filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({expression}/100)'"));
+    } else if opacity < 0.999 {
+        filters.push(format!("colorchannelmixer=aa={opacity:.4}"));
+    }
+
+    let static_x = n(&transform["position"], "x", 0.0);
+    let static_y = n(&transform["position"], "y", 0.0);
+    let animated_x = keyframed_value_expr(clip, "x");
+    let animated_y = keyframed_value_expr(clip, "y");
+    let x = animated_x.as_ref().map(|expr| format!("({expr})*{:.6}/1920", width as f64))
+        .unwrap_or_else(|| format!("{:.3}", static_x * width as f64 / 1920.0));
+    let y = animated_y.as_ref().map(|expr| format!("({expr})*{:.6}/1080", height as f64))
+        .unwrap_or_else(|| format!("{:.3}", static_y * height as f64 / 1080.0));
     let (shake_x, shake_y) = if enabled(effects, "shake") {
         let amount = n(&effects["shake"], "amount", 18.0) * width as f64 / 1920.0 * 0.18;
         let freq = (n(&effects["shake"], "frequency", 8.0) * (1.0 - n(&effects["shake"], "smoothness", 35.0) / 120.0)).max(0.5);
         (format!("+sin(2*PI*t*{freq:.3})*{amount:.3}"), format!("+cos(2*PI*t*{freq:.3})*{amount:.3}"))
     } else { (String::new(), String::new()) };
-    let overlay_x = format!("(main_w-overlay_w)/2+{x:.3}{shake_x}");
-    let overlay_y = format!("(main_h-overlay_h)/2+{y:.3}{shake_y}");
+    let overlay_x = if animated_x.is_some() || !shake_x.is_empty() {
+        format!("'(main_w-overlay_w)/2+{x}{shake_x}'")
+    } else {
+        format!("(main_w-overlay_w)/2+{x}{shake_x}")
+    };
+    let overlay_y = if animated_y.is_some() || !shake_y.is_empty() {
+        format!("'(main_h-overlay_h)/2+{y}{shake_y}'")
+    } else {
+        format!("(main_h-overlay_h)/2+{y}{shake_y}")
+    };
     (filters.join(","), overlay_x, overlay_y)
 }
 
@@ -312,3 +391,48 @@ pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     filters.join(",")
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn crop_keeps_the_original_canvas_without_rescaling_the_remainder() {
+        let clip = json!({
+            "props": { "transform": { "crop": { "left": 192.0, "right": 96.0, "top": 108.0, "bottom": 0.0 } } }
+        });
+        let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        assert!(graph.contains("crop=iw*0.850000:ih*0.900000:iw*0.100000:ih*0.100000"));
+        assert!(graph.contains("pad=1920:1080:(ow-iw/0.850000)/2+iw*0.100000/0.850000:(oh-ih/0.900000)/2+ih*0.100000/0.900000:color=black@0"));
+        let scale_at = graph.find("scale=1920:1080:force_original_aspect_ratio=decrease").unwrap();
+        let crop_at = graph.find("crop=iw*0.850000").unwrap();
+        let pad_at = graph.find("pad=1920:1080").unwrap();
+        assert!(scale_at < crop_at && crop_at < pad_at, "crop must be applied to fitted source before the transparent canvas pad");
+    }
+
+    #[test]
+    fn keyframed_transform_channels_are_written_as_frame_evaluated_filters() {
+        let clip = json!({
+            "start": 0.0,
+            "props": { "transform": {
+                "position": { "x": 0.0, "y": 0.0 },
+                "scale": { "w": 100.0, "h": 100.0 },
+                "rotation": 0.0,
+                "opacity": 100.0
+            }},
+            "keyframes": [
+                { "time": 0.0, "values": { "x": 0.0, "y": 0.0, "scaleW": 100.0, "scaleH": 100.0, "rotation": 0.0, "opacity": 100.0 } },
+                { "time": 2.0, "values": { "x": 960.0, "y": 540.0, "scaleW": 150.0, "scaleH": 75.0, "rotation": 90.0, "opacity": 25.0 } }
+            ]
+        });
+        let (graph, x, y) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        assert!(graph.contains("eval=frame"));
+        assert!(graph.contains("rotate=angle="));
+        assert!(graph.contains("ow=iw:oh=ih:c=black@0"));
+        assert!(graph.contains("geq=r='r(X,Y)'"));
+        assert!(x.contains("lt(t,2.000000)"));
+        assert!(y.contains("lt(t,2.000000)"));
+    }
+}

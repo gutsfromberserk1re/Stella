@@ -243,14 +243,26 @@ static char gBackendMessage[256];
 
 #define MAX_TIMELINE_CLIPS 256
 typedef struct {
+    float time;
+    float value[6]; /* x, y, scaleW, scaleH, rotation, opacity (%) */
+    unsigned valueMask;
+} TimelineKeyframeUi;
+
+enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
+       KF_SCALE_H = 1u << 3, KF_ROTATION = 1u << 4, KF_OPACITY = 1u << 5 };
+
+typedef struct {
     char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
     int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
     bool hasAudio;
-    float keyframes[32];
+    TimelineKeyframeUi keyframes[32];
     int keyframeCount;
 } TimelineClipUi;
+static int gKeyframeDragClip = -1, gKeyframeDragIndex = -1;
+static float gKeyframeDragTime;
+
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;
 static float gClipDragSnapshotStart[MAX_TIMELINE_CLIPS];
