@@ -136,6 +136,16 @@ static void Splitter(int which) {
               .custom = {.customData = NC(K_SPLIT, C_ACCENT, C_ACCENT, C_ACCENT, v, 0, vert)}}) {}
 }
 
+static void PlutoApplyKeyframeValues(void);
+
+static void TimelineHistoryAction(bool redo) {
+    if (PlutoTimelineHistory(redo)) {
+        PlutoApplyKeyframeValues();
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* UI: top bar                                                         */
 /* ------------------------------------------------------------------ */
@@ -158,10 +168,6 @@ static void TopBar(void) {
             Icon(I_EXPORT, 14, C_TEXT);
             Tx("Export", 14, C_TEXT, 0);
         }
-        GAPX(18)
-        if (IconBtn(CLAY_ID("Undo"), I_UNDO, 28, 15, C_DIM, false, 8)) PlutoTimelineHistory(false);
-        GAPX(8)
-        if (IconBtn(CLAY_ID("Redo"), I_REDO, 28, 15, RGB(76, 79, 88), false, 8)) PlutoTimelineHistory(true);
         if (gBackendMessage[0]) {
             GAPX(10)
             CLAY(CLAY_ID("BackendStatus"), {.layout = {.sizing = {FIX(300), FIT}}}) {
@@ -372,6 +378,19 @@ int main(void) {
         }
         if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
         if (IsKeyPressed(KEY_F3)) gPerfOverlay = !gPerfOverlay;
+        gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        gShiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        bool altDown = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
+        if (gEditValueId == 0) {
+            if (gCtrlDown && IsKeyPressed(KEY_Z)) TimelineHistoryAction(gShiftDown);
+            else if (gCtrlDown && IsKeyPressed(KEY_Y)) TimelineHistoryAction(true);
+            else if (!gCtrlDown && !altDown) {
+                if (IsKeyPressed(KEY_V)) gTimelineTool = 0;      /* Select */
+                if (IsKeyPressed(KEY_H)) gTimelineTool = 1;      /* Hand */
+                if (IsKeyPressed(KEY_C)) gTimelineTool = 2;      /* Cut */
+                if (IsKeyPressed(KEY_T)) gTimelineTool = 3;      /* Text */
+            }
+        }
         if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
             (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
             int splitCount = 0;
@@ -432,13 +451,18 @@ int main(void) {
         } else playbackRemainder = 0.f;
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        gShiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         Vector2 currentDpi = GetWindowScaleDPI();
         float currentDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(currentDpi.x, currentDpi.y)));
         if (fabsf(currentDpiScale - gDpiScale) > 0.01f) gDpiScale = currentDpiScale;
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
         Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, gCtrlDown ? 0.f : gWheelDelta * 28.f}, gDt);
+        Clay_BoundingBox timeBodyForWheel = Clay_GetElementData(CLAY_ID("TimeBody")).boundingBox;
+        bool shiftTimelineWheel = gShiftDown && !gCtrlDown && timeBodyForWheel.width > 0.f &&
+            CheckCollisionPointRec(m, (Rectangle){timeBodyForWheel.x, timeBodyForWheel.y,
+                                                  timeBodyForWheel.width, timeBodyForWheel.height});
+        Clay_UpdateScrollContainers(false, (Clay_Vector2){0, (gCtrlDown || shiftTimelineWheel) ? 0.f : gWheelDelta * 28.f}, gDt);
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
         PlutoPollBackend();

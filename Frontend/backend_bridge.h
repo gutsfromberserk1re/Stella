@@ -543,7 +543,13 @@ static bool PlutoTimelineAddKeyframe(float at) {
 }
 
 static bool PlutoTimelineHistory(bool redo) {
-    return PlutoTimelineCall(redo ? "{\"command\":\"timeline_redo\"}" : "{\"command\":\"timeline_undo\"}");
+    bool okay = PlutoTimelineCall(redo ? "{\"command\":\"timeline_redo\"}" : "{\"command\":\"timeline_undo\"}");
+    if (okay) {
+        /* Undo/redo returns the authoritative timeline; refresh the preview immediately. */
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    }
+    return okay;
 }
 
 static void PlutoPollBackend(void) {

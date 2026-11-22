@@ -1304,15 +1304,24 @@ static void TextView(void) {
     }
 }
 
+/* Tab switch: the new page slides in horizontally from the side it sits on in the tab bar
+   (+1 = from the right, -1 = from the left) and decelerates into place. No fade. */
+#define TAB_SLIDE_SECS 0.20f   /* total duration: quick, not sluggish */
+#define TAB_SLIDE_PX   36.f    /* starting horizontal offset */
+static int gTabDir = 1;
+
 /* scrolling for the inspector body (wheel + smooth follow + scrollbar thumb) */
 static void UpdateInspScroll(void) {
     Clay_BoundingBox bb = Clay_GetElementData(CLAY_ID("InspBody")).boundingBox;
     Clay_BoundingBox cb = Clay_GetElementData(CLAY_ID("InspContent")).boundingBox;
     gInspViewH = bb.height;
-    gTabT = fminf(1.f, gTabT + gDt / 0.29f);
-    gTabE = gTabT * gTabT * (3.f - 2.f * gTabT);
-    gFadeR = (Rectangle){bb.x, bb.y, bb.width, bb.height};
-    gFadeA = (1.f - gTabE) * 255.f;
+    /* Clamp dt so the heavy first frame of a freshly built tab can't swallow the animation. */
+    gTabT = fminf(1.f, gTabT + fminf(gDt, 1.f / 30.f) / TAB_SLIDE_SECS);
+    {   /* ease-out quartic: fast start, long soft landing */
+        float u = 1.f - gTabT;
+        gTabE = 1.f - u * u * u * u;
+    }
+    gFadeA = 0.f;   /* the old cross-fade overlay is no longer used */
     float maxS = fmaxf(0.f, cb.height - bb.height);
     float wh = gWheelDelta;
     Vector2 m = GetMousePosition();
@@ -1348,12 +1357,12 @@ static void RightPanel(void) {
                                       .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 0)}}) {
                 for (int i = 0; i < 4; i++)
                     if (TabBtn(CLAY_IDI("InspTab", i), tabs[i], gRightTab == i, 15.f, 11, true)) {
-                        if (gRightTab != i) { gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
+                        if (gRightTab != i) { gTabDir = (i > gRightTab) ? 1 : -1; gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
                     }
             }
         }
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
-                                   .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gScroll + (1.f - gTabE) * 18.f}}}) {
+                                   .clip = {.horizontal = true, .vertical = true, .childOffset = {gTabDir * (1.f - gTabE) * TAB_SLIDE_PX, -gScroll}}}) {
             CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}}) {
                 if (gTimelineSelected < 0) {
                     CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {

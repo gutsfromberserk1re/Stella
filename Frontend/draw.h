@@ -450,13 +450,23 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured? */
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        for (int i = 0; i < 72; i++)
-            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
-        Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
+        /* Muted, dark hue wheel: low saturation/value, slightly darker toward the bottom. */
+        for (int i = 0; i < 72; i++) {
+            float a0 = i * 5.f, mid = (a0 + 2.8f) * DEG2RAD;
+            float shade = 1.f - .20f * fmaxf(0.f, sinf(mid));
+            DrawCircleSector(c, rad, a0, a0 + 5.6f, 3, ColorFromHSV(fmodf(a0 + 90.f, 360.f), .56f, .60f * shade));
+        }
+        /* Radial wash: the centre melts into neutral dark grey, the rim keeps its colour. */
+        for (int k = 0; k < 24; k++) {
+            float t0 = k / 24.f, t1 = (k + 1) / 24.f;
+            float fall = powf(1.f - (t0 + t1) * .5f, 1.5f);
+            DrawRing(c, rad * t0, rad * t1 + .6f, 0, 360, 48, (Color){40, 41, 46, U8(205.f * fall)});
+        }
+        Ring(c, rad, 1.5f, (Color){38, 40, 46, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
         float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
-        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
+        DrawCircleV(p, dot + 1.8f, (Color){232, 233, 238, 255});
+        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){212, 213, 219, 255});
     } break;
 
     case K_SWITCH: {
@@ -801,8 +811,6 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
                        (Color){237, 238, 241, 255});
         }
     }
-    if (gFadeA > 2.f && gFadeR.width > 0.f)
-        GradRR(gFadeR, 22, (Color){28, 29, 32, U8(gFadeA)}, (Color){21, 22, 24, U8(gFadeA)});
     if (gLFadeA > 2.f && gLFadeR.width > 0.f)
         FillRR(gLFadeR, 0, (Color){23, 24, 28, U8(gLFadeA)});   /* = C_PANEL */
     if (gSB) FillRR(gSBR, 2, (Color){92, 95, 104, 255});

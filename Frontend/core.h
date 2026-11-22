@@ -79,7 +79,7 @@ static float gFK[3] = {1.f, 1.f, 1.f};   /* per-weight font metrics normalisatio
 static float gDpiScale = 1.f;
 static float gDt;
 static float gWheelDelta;
-static bool gCtrlDown;
+static bool gCtrlDown, gShiftDown;
 static bool  gHand, gCross;
 static int   gLeftTab = 0, gRightTab = 0;
 static int   gPreviewRes = 720;
@@ -166,7 +166,8 @@ static int   gClipDragTrack;
 static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
 static int   gClipTrimIndex = -1, gClipTrimEdge;
 static float gClipTrimOrigStart, gClipTrimOrigEnd, gClipTrimOrigOffset, gClipTrimSourceDuration;
-static bool  gTimelinePanning;
+static bool  gTimelinePanning, gTimelineMiddlePanning;
+static float gTimelinePanMouseY, gTimelineVerticalPanOrig, gTimelineVerticalScroll, gTimelineVerticalScrollT, gTimelineVerticalMax;
 static uint64_t gClipSerial = 1;
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
@@ -275,6 +276,8 @@ static int gTimelineContextClip = -1;
 static Vector2 gTimelineContextPos;
 static Rectangle gTimelineContextRect;
 static int gTimelineVideoTracks = 1, gTimelineAudioTracks = 1;
+static int gTimelineVideoTrackIds[4] = {0, 0, 0, 0};
+static int gTimelinePendingVideoTrack = -1;
 static float TimelinePps(void);
 static float TimelineDuration(void);
 
@@ -401,13 +404,13 @@ static Clay_Color BtnBg(Clay_Color base, Clay_Color hov, Bs b) { return Mix(base
 static Clay_String S(const char *s) { return (Clay_String){.isStaticallyAllocated = false, .length = (int32_t)strlen(s), .chars = s}; }
 
 static void Tx(const char *s, float size, Clay_Color c, int font) {
-    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 4.0f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
 }
 static void TxWrap(const char *s, float size, Clay_Color c, int font) {
-    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = font ? 2 : 0, .fontSize = size + 4.0f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_WORDS}));
 }
 static void TxMedium(const char *s, float size, Clay_Color c) {
-    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = 1, .fontSize = size + 2.25f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+    CLAY_TEXT(S(s), CLAY_TEXT_CONFIG({.fontId = 1, .fontSize = size + 4.0f, .textColor = c, .wrapMode = CLAY_TEXT_WRAP_NONE}));
 }
 static void IconV(int k, float sz, Clay_Color c, float v) {
     CLAY_AUTO_ID({.layout = {.sizing = {.width = FIX(sz), .height = FIX(sz)}},

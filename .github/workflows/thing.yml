@@ -15,6 +15,32 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Restores Cargo's crate downloads and compiled dependency artifacts.
+      # Backend is the Cargo workspace root, so its target directory is Backend/target.
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            Backend -> target
+          cache-on-failure: true
+
+      # Cache the extracted static decoder SDK so the large archive is fetched only on a miss.
+      - name: Cache static FFmpeg decoder SDK
+        id: ffmpeg-static-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-decode-static
+          key: ffmpeg-static-${{ runner.os }}-${{ runner.arch }}-v9.0.2-3
+
+      # LLVM is installed into Program Files on a cache miss and reused on later runs.
+      # Bump llvm-cache-v1 if you intentionally want to refresh the LLVM version.
+      - name: Cache LLVM libclang installation
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\LLVM
+          key: llvm-cache-v1-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install static FFmpeg decoder libraries and libclang
         shell: pwsh
         run: |
@@ -22,17 +48,23 @@ jobs:
           $archiveName = 'ffmpeg-decode-static-x86_64-pc-windows-msvc.tar.xz'
           $archive = Join-Path $env:RUNNER_TEMP $archiveName
           $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-decode-static'
-          $url = "https://github.com/martinfrancois/ffmpeg-decode-static/releases/download/$version/$archiveName"
-          Invoke-WebRequest -Uri $url -OutFile $archive
-          $expectedSha256 = '7821646cb2183f20ef714acaa54575a25d2fe9e50d46bb497e156324d125d766'
-          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "Static FFmpeg decoder archive checksum mismatch: $actualSha256"
+          $header = Join-Path $extract 'include/libavcodec/avcodec.h'
+          $library = Join-Path $extract 'lib/avcodec.lib'
+
+          # A valid cache hit skips both the network download and extraction.
+          if (-not (Test-Path $header) -or -not (Test-Path $library)) {
+            Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+            $url = "https://github.com/martinfrancois/ffmpeg-decode-static/releases/download/$version/$archiveName"
+            Invoke-WebRequest -Uri $url -OutFile $archive
+            $expectedSha256 = '7821646cb2183f20ef714acaa54575a25d2fe9e50d46bb497e156324d125d766'
+            $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -ne $expectedSha256) {
+              throw "Static FFmpeg decoder archive checksum mismatch: $actualSha256"
+            }
+            New-Item -ItemType Directory -Path $extract -Force | Out-Null
+            tar.exe -xf $archive -C $extract
           }
-          New-Item -ItemType Directory -Path $extract -Force | Out-Null
-          tar.exe -xf $archive -C $extract
-          if (-not (Test-Path (Join-Path $extract 'include/libavcodec/avcodec.h')) -or
-              -not (Test-Path (Join-Path $extract 'lib/avcodec.lib'))) {
+          if (-not (Test-Path $header) -or -not (Test-Path $library)) {
             throw 'The static FFmpeg decoder archive did not contain the expected MSVC headers and libraries'
           }
           "FFMPEG_DIR=$($extract -replace '\\','/')" | Add-Content -Path $env:GITHUB_ENV
@@ -62,7 +94,11 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          update: true
+          # Reuse the MSYS2 image already present on windows-latest, instead of
+          # downloading a fresh installer. The action also caches MSYS2 state.
+          release: false
+          # Do not run a full pacman system update on every build.
+          update: false
           cache: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
@@ -95,7 +131,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-${{ runner.os }}-raylib-6.2-${{ github.sha }}
+          key: ccache-${{ runner.os }}-raylib-6.2-${{ github.run_id }}
           restore-keys: |
             ccache-${{ runner.os }}-raylib-6.2-
 
@@ -212,13 +248,28 @@ jobs:
           path: ci-build/out/dist/*
           if-no-files-found: error
 
+      # The full FFmpeg runtime ZIP is large. Cache the compressed archive so
+      # package builds do not download it again. Bump ffmpeg-runtime-cache-v1
+      # when you want to fetch the latest upstream FFmpeg build again.
+      - name: Cache FFmpeg runtime archive
+        id: ffmpeg-runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-win64.zip
+          key: ffmpeg-runtime-cache-v1-${{ runner.os }}-${{ runner.arch }}
+
       - name: Bundle FFmpeg runtime
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64'
           $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
-          Invoke-WebRequest -Uri $url -OutFile $archive
+          if (-not (Test-Path $archive)) {
+            Invoke-WebRequest -Uri $url -OutFile $archive
+          }
+          if (Test-Path $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
           Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
           $bin = Get-ChildItem -LiteralPath $extract -Directory -Filter bin -Recurse | Select-Object -First 1
           if (-not $bin) { throw 'FFmpeg archive did not contain a bin directory' }
