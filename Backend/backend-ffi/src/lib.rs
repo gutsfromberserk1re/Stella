@@ -1461,6 +1461,11 @@ fn set_json_path(root: &mut Value, parts: &[&str], value: Value) {
 }
 
 fn set_clip_property(clip: &mut Clip, path: &str, value: Value) -> Result<(), String> {
+    // The C inspector sends paths rooted at the serialized clip ("props.*"),
+    // but this function has already extracted clip.extra["props"]. Keeping
+    // that prefix would write to props.props.* where neither preview nor export
+    // looks for values. Accept both serialized and relative property paths.
+    let path = path.strip_prefix("props.").unwrap_or(path);
     let parts: Vec<_> = path.split('.').filter(|part| !part.is_empty()).collect();
     if parts.is_empty() || parts.len() > 8 { return Err("Invalid property path".into()); }
     let mut props = clip.extra.remove("props").unwrap_or_else(|| json!({}));
@@ -1635,9 +1640,79 @@ pub unsafe extern "C" fn pluto_backend_free(value: *mut c_char) {
 mod tests {
     use super::*;
 
+    fn test_clip(id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track: TrackId::V1,
+            start: 0.0,
+            duration: 2.0,
+            label: "Test clip".into(),
+            linked_clip_id: None,
+            extra: HashMap::new(),
+        }
+    }
+
     #[test]
     fn ffi_dispatch_returns_structured_error_for_unknown_command() {
         let error = dispatch(json!({"command":"unknown"})).unwrap_err();
         assert!(error.contains("Unsupported command"));
+    }
+
+    #[test]
+    fn inspector_transform_paths_update_the_values_read_by_preview() {
+        let mut clip = test_clip("transform-test");
+
+        // These fully-qualified paths match those emitted by Frontend/right_panel.h.
+        for (path, value) in [
+            ("props.transform.position.x", json!(960.0)),
+            ("props.transform.position.y", json!(540.0)),
+            ("props.transform.scale.w", json!(150.0)),
+            ("props.transform.scale.h", json!(80.0)),
+            ("props.transform.rotation", json!(90.0)),
+            ("props.transform.opacity", json!(25.0)),
+            ("props.transform.crop.left", json!(120.0)),
+            ("props.transform.distort.tl", json!(12.0)),
+        ] {
+            set_clip_property(&mut clip, path, value).unwrap();
+        }
+
+        let props = clip.extra.get("props").expect("clip props should exist");
+        assert!(props.get("props").is_none(), "must not create props.props");
+        assert_eq!(props["transform"]["crop"]["left"].as_f64(), Some(120.0));
+        assert_eq!(props["transform"]["distort"]["tl"].as_f64(), Some(12.0));
+
+        let uniforms = LayerUniforms::from_props(props, 0.0);
+        assert!((uniforms.geo0[0] - 1.5).abs() < 0.0001, "scale X");
+        assert!((uniforms.geo0[1] - 0.8).abs() < 0.0001, "scale Y");
+        assert!((uniforms.geo0[2] - std::f32::consts::FRAC_PI_2).abs() < 0.0001, "rotation");
+        assert!((uniforms.opacity() - 0.25).abs() < 0.0001, "opacity");
+        assert!((uniforms.geo1[0] - 0.5).abs() < 0.0001, "position X");
+        assert!((uniforms.geo1[1] - 0.5).abs() < 0.0001, "position Y");
+        assert!((uniforms.crop[0] - (120.0 / 1920.0)).abs() < 0.0001, "crop left");
+        assert!((uniforms.distort[0] - 12.0).abs() < 0.0001, "distort top-left");
+    }
+
+    #[test]
+    fn inspector_color_and_effect_paths_are_written_at_renderer_root() {
+        let mut clip = test_clip("color-effects-test");
+        set_clip_property(&mut clip, "props.colors.light.exposure", json!(1.5)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.0.hue", json!(42.0)).unwrap();
+        set_clip_property(&mut clip, "props.effects.blur.enabled", json!(true)).unwrap();
+
+        let props = &clip.extra["props"];
+        assert!(props.get("props").is_none(), "must not create props.props");
+        assert_eq!(props["colors"]["light"]["exposure"].as_f64(), Some(1.5));
+        assert_eq!(props["colors"]["hsl"]["0"]["hue"].as_f64(), Some(42.0));
+        assert_eq!(props["effects"]["blur"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn relative_property_paths_remain_supported() {
+        let mut clip = test_clip("relative-path-test");
+        set_clip_property(&mut clip, "audio.fadeInDuration", json!(1.25)).unwrap();
+        assert_eq!(
+            clip.extra["props"]["audio"]["fadeInDuration"].as_f64(),
+            Some(1.25)
+        );
     }
 }
