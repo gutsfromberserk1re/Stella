@@ -5,7 +5,11 @@
 
 use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
+mod decoder;
 mod filters;
+mod renderer;
+use decoder::DecoderPool;
+use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     ffi::{CStr, CString},
@@ -122,7 +126,13 @@ impl Drop for PreviewStream {
 }
 
 #[derive(Default)]
-struct PreviewEngine { stream: Option<PreviewStream> }
+struct PreviewEngine {
+    stream: Option<PreviewStream>,
+    // Native FFmpeg decoder contexts and decoded frames survive across preview
+    // requests. This is the important difference from spawning a new FFmpeg
+    // filter-graph process whenever the playhead jumps.
+    decoder_pool: DecoderPool,
+}
 
 fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
     let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
@@ -837,6 +847,108 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
 }
 
 impl PreviewEngine {
+    /// Fast path for ordinary video playback: reuse in-process FFmpeg decoders,
+    /// then let Stella's existing wgpu layer renderer composite the active clips.
+    /// Timelines containing still images, keyframes or an active transition keep
+    /// using the established FFmpeg graph until those cases have native parity.
+    fn render_native(
+        &mut self,
+        timeline: &Timeline,
+        frame_at: f64,
+        width: u32,
+        height: u32,
+        request_id: u64,
+        decode_ms: &mut f64,
+    ) -> Result<Option<(u32, u32, f64)>, String> {
+        if timeline_transition_start_at(timeline, frame_at).is_some() {
+            return Ok(None);
+        }
+
+        let mut active: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
+            clip.track.is_video()
+                && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+                && frame_at + 1e-7 >= clip.start
+                && frame_at < clip.end() - 1e-7
+        }).collect();
+
+        // A gap is a valid native frame and should not start an FFmpeg process.
+        if active.is_empty() {
+            self.stream = None;
+            publish_black_frame(request_id, width, height, frame_at)?;
+            return Ok(Some((width, height, frame_at)));
+        }
+
+        // Keep the renderer's layer order identical to the timeline's track order.
+        active.sort_by_key(|clip| match clip.track {
+            TrackId::V1 => 0,
+            TrackId::V2 => 1,
+            TrackId::V3 => 2,
+            TrackId::V4 => 3,
+            TrackId::A1 => 4,
+            TrackId::A2 => 5,
+        });
+
+        // The native parameter mapper currently handles static properties. Keep
+        // animated clips on the reference filter graph rather than silently
+        // displaying incorrect keyframe values.
+        for clip in &active {
+            if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
+                return Ok(None);
+            }
+            if clip.extra.get("keyframes").and_then(Value::as_array).is_some_and(|items| !items.is_empty()) {
+                return Ok(None);
+            }
+            let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
+            if source.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let decode_started = Instant::now();
+        let mut decoded = Vec::with_capacity(active.len());
+        for clip in &active {
+            let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
+            let source = preview_source_path(clip);
+            if !std::path::Path::new(&source).is_file() {
+                return Ok(None);
+            }
+            let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
+            let source_time = (source_offset + (frame_at - clip.start)).max(0.0);
+            match self.decoder_pool.frame_at(&source, source_time) {
+                Ok(frame) => decoded.push(frame),
+                Err(error) => {
+                    eprintln!("Stella native preview fallback for '{}': {error}", original);
+                    return Ok(None);
+                }
+            }
+        }
+
+        *decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let null_props = Value::Null;
+        let layers: Vec<GpuLayerFrame<'_>> = active.iter().zip(decoded.iter()).map(|(clip, frame)| {
+            let props = clip.extra.get("props").unwrap_or(&null_props);
+            GpuLayerFrame {
+                key: clip.id.as_str(),
+                pixels: frame.rgba.as_slice(),
+                width: frame.width,
+                height: frame.height,
+                uniforms: LayerUniforms::from_props(props, frame_at),
+            }
+        }).collect();
+
+        let mut pixels = match GpuPreviewRenderer::composite_rgba(&layers, width, height) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                eprintln!("Stella native GPU preview fallback: {error}");
+                return Ok(None);
+            }
+        };
+        // Drop the old CLI stream once the native path has produced a frame.
+        self.stream = None;
+        publish_preview_buffer(request_id, width, height, frame_at, &mut pixels, false)?;
+        Ok(Some((width, height, frame_at)))
+    }
+
     fn render(&mut self, request: &Value, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64, usize) {
         let mut setup_ms = 0.0;
         let mut decode_ms = 0.0;
@@ -849,6 +961,13 @@ impl PreviewEngine {
             let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
             let target_index = (at * fps as f64).round() as u64;
             let frame_at = target_index as f64 / fps as f64;
+
+            // Most playback frames now use persistent in-process decoders and
+            // Stella's GPU compositor. Complex/unsupported cases retain the
+            // old FFmpeg graph path as a correctness fallback.
+            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, &mut decode_ms)? {
+                return Ok(native);
+            }
 
             let mut preview_timeline = timeline;
             preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));

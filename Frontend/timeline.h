@@ -206,6 +206,14 @@ static float TimelineDuration(void) {
     return duration > 0.f ? duration : 9.f;
 }
 
+static int TimelineClipStartCompare(const void *left, const void *right) {
+    int a = *(const int *)left, b = *(const int *)right;
+    float delta = gTimelineClips[a].start - gTimelineClips[b].start;
+    if (delta < -0.000001f) return -1;
+    if (delta > 0.000001f) return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
 static void TimelineClipLane(int track) {
     Clay_ElementId laneId = CLAY_IDI("TrackLane", track);
     Clay_BoundingBox lane = Clay_GetElementData(laneId).boundingBox;
@@ -214,13 +222,11 @@ static void TimelineClipLane(int track) {
     bool transitionPressed = false;
     int order[MAX_TIMELINE_CLIPS], count = 0;
     for (int i = 0; i < gTimelineClipCount; i++) {
-        if (gTimelineClips[i].track != track) continue;
-        int at = count++;
-        while (at > 0 && gTimelineClips[order[at - 1]].start > gTimelineClips[i].start) {
-            order[at] = order[at - 1]; at--;
-        }
-        order[at] = i;
+        if (gTimelineClips[i].track == track) order[count++] = i;
     }
+    /* qsort avoids the old insertion-sort O(n^2) cost when large timelines
+       are edited or redrawn. The index tie-break keeps ordering deterministic. */
+    if (count > 1) qsort(order, (size_t)count, sizeof(order[0]), TimelineClipStartCompare);
 
     /* Mirror Clay's horizontal flow when tiny clips hit the readable 46px
        minimum. Transition badges use these displayed edges, not compressed
@@ -232,6 +238,7 @@ static void TimelineClipLane(int track) {
         int i = order[n];
         float x = gTimelinePan + gTimelineClips[i].start * pps;
         float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
+        if (lane.width > 0.f && x >= lane.width) break; /* sorted: every later clip is also off-screen */
         if (x + width <= 0.f) continue;
         float left = fmaxf(0.f, x);
         float placed = fmaxf(visualCursor, left);
@@ -305,6 +312,7 @@ static void TimelineClipLane(int track) {
             int i = order[n];
             float x = gTimelinePan + gTimelineClips[i].start * pps;
             float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
+            if (lane.width > 0.f && x >= lane.width) break; /* don't create Clay nodes for invisible clips */
             if (x + width <= 0.f) continue;
             float left = fmaxf(0.f, x);
             if (left > cursor) {

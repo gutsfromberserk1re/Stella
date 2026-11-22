@@ -24,7 +24,9 @@ use ffmpeg::{
 };
 
 const MAX_CACHED_FRAME_BYTES: usize = 128 * 1024 * 1024;
-const MAX_OPEN_DECODERS: usize = 8;
+// Match a mid-range editing workload: keep the active source set small and
+// let the frame cache serve recently visited media after decoder eviction.
+const MAX_OPEN_DECODERS: usize = 6;
 const SEEK_REUSE_WINDOW_SECONDS: f64 = 1.25;
 
 static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -532,6 +534,12 @@ impl DecoderPool {
                 self.frame_order.remove(index);
             }
             self.frame_order.push_back(key);
+            // A cache hit is still active use: keep its open decoder near the
+            // MRU end so rapid scrubbing does not evict the current source.
+            if self.decoders.contains_key(path) {
+                self.decoder_order.retain(|item| item != path);
+                self.decoder_order.push_back(path.to_owned());
+            }
             return Ok(frame);
         }
 
