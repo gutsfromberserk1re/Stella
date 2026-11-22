@@ -794,7 +794,7 @@ static void Timeline(void) {
             CLAY(CLAY_ID("RulerRow"), {.layout = {.sizing = {GROW, FIX(30)}}}) {
                 GAPX(60)
                 CLAY(CLAY_ID("Ruler"), {.layout = {.sizing = {GROW, GROW}},
-                                         .custom = {.customData = NC(K_RULER, C_CARD, C_CARD, C_CARD, 0, extra, 0)}}) {}
+                                         .custom = {.customData = NC(K_RULER, C_CARD, C_CARD, C_CARD, 0, 0.f, 0)}}) {}
             }
             CLAY(CLAY_ID("TrackViewport"), {.layout = {COLM, .sizing = {GROW, GROW}},
                 .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gTimelineVerticalScroll}}}) {
