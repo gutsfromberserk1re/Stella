@@ -357,26 +357,6 @@ static void NumField(int n, float *v, const char *unit) {
             gNum[other] = fmaxf(0.f, gLinkedNumOtherStart * ratio);
         }
     }
-    if (gValueDragId == scrubId.id && gValueDragging) {
-        /* live preview while scrubbing; the release below sends the final committed value */
-        static float lastLive[4] = {1e9f, 1e9f, 1e9f, 1e9f};
-        if (fabsf(*v - lastLive[n]) > 0.49f) {
-            lastLive[n] = *v;
-            if (linkedDrag) {
-                int other = n ^ 1;
-                char updates[384];
-                snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
-                         kNumPropertyPaths[n], *v, kNumPropertyPaths[other], gNum[other]);
-                float keep = *v, keepOther = gNum[other];
-                PlutoTimelineSetPropertiesLive(updates);
-                *v = keep; gNum[other] = keepOther;   /* the backend echo must not fight the drag */
-            } else {
-                float keep = *v;
-                PlutoTimelineSetPropertyLive(kNumPropertyPaths[n], *v);
-                *v = keep;
-            }
-        }
-    }
     if (changed) CommitNumField(n, before);
     else if (gLinkedNumDragField == n && gValueDragId != scrubId.id) gLinkedNumDragField = -1;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
@@ -464,11 +444,13 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l1, 19, C_ICON, 0); }
             NumField(n * 2, a, unit);
         }
-        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER}}}) {
+        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
+            HSPACE
             if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) {
                 gLink[link] = !gLink[link];
                 PlutoTimelineSetBoolProperty(link == 0 ? "props.transform.position.linked" : "props.transform.scale.linked", gLink[link]);
             }
+            HSPACE
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l2, 19, C_ICON, 0); }
@@ -604,19 +586,10 @@ static void TransformView(void) {
                 } else gDragId = 0;
             }
             CLAY(rid, {.layout = {.sizing = {GROW, FIX(93)}}, .custom = {.customData = NC(K_ROTRULER, C_CARD, C_CARD, C_CARD, (gRot + 180.f) / 360.f, b.hover, 0)}}) {}
-            static bool rotWasDragging;
-            if (gRotDrag) {
-                if (fabsf(gRotT - sentRotation) > 0.05f) {
-                    float keep = gRot, keepT = gRotT;
-                    PlutoTimelineSetPropertyLive("props.transform.rotation", gRotT);
-                    gRot = keep; gRotT = keepT;
-                    sentRotation = gRotT;
-                }
-            } else if (rotWasDragging || fabsf(gRotT - sentRotation) > 0.01f) {
-                PlutoTimelineSetProperty("props.transform.rotation", gRotT);   /* closes the drag */
+            if (!gRotDrag && fabsf(gRotT - sentRotation) > 0.01f) {
+                PlutoTimelineSetProperty("props.transform.rotation", gRotT);
                 sentRotation = gRotT;
             }
-            rotWasDragging = gRotDrag;
         }
         GAPY(10)
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}}}) {
@@ -633,19 +606,10 @@ static void TransformView(void) {
             Clay_ElementId sid = CLAY_ID("OpacitySlider");
             Bs b = Interact(sid);
             SliderLogic(sid, 0, 8.5f);
-            static bool opacityWasDragging;
-            if (gSlDrag[0]) {
-                if (fabsf(gSlT[0] - sentOpacity) > 0.004f) {
-                    float keep = gSl[0], keepT = gSlT[0];
-                    PlutoTimelineSetPropertyLive("props.transform.opacity", gSlT[0] * 100.f);
-                    gSl[0] = keep; gSlT[0] = keepT;
-                    sentOpacity = gSlT[0];
-                }
-            } else if (opacityWasDragging || fabsf(gSlT[0] - sentOpacity) > 0.002f) {
-                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);   /* closes the drag */
+            if (!gSlDrag[0] && fabsf(gSlT[0] - sentOpacity) > 0.002f) {
+                PlutoTimelineSetProperty("props.transform.opacity", gSlT[0] * 100.f);
                 sentOpacity = gSlT[0];
             }
-            opacityWasDragging = gSlDrag[0];
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},
                        .custom = {.customData = NC(K_SLIDER, RGB(38, 39, 43), RGB(150, 152, 160), C_CARD, gSl[0], (b.hover + (gSlDrag[0] ? 1.f : 0.f)) * 1.5f, 1)}}) {}
         }
@@ -676,7 +640,7 @@ static void WheelItem(int i, const char *label) {
         float hue, len; WheelInfo(gWh[i], &hue, &len);
         bool col = len > 0.02f;
         Color dc = ColorFromHSV(hue, fminf(1.f, .3f + .7f * len), 1.f);
-        CLAY(wid, {.layout = {.sizing = {FIX(94), FIX(94)}},
+        CLAY(wid, {.layout = {.sizing = {FIX(100), FIX(100)}},
                    .custom = {.customData = NC(K_WHEEL, C_CARD, (Clay_Color){gWh[i].x, gWh[i].y, 0, 0}, (Clay_Color){dc.r, dc.g, dc.b, 255},
                                                col ? 1.f : 0.f, fmaxf(b.hover * .6f, gWhDrag[i] ? 1.f : 0.f), 0)}}) {}
         Tx(label, 16, C_TEXT, 1);
@@ -715,11 +679,7 @@ static void AccHeader(int idx, const char *title, int icon, float openAnim, bool
             }
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(16), FIX(16)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(9),
                           .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                /* open state shows a minus, like the reference */
-                if (openAnim <= 0.5f) IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
-                else
-                    CLAY_AUTO_ID({.layout = {.sizing = {FIX(8), FIX(2)}},
-                                  .backgroundColor = Mix(C_DIM, C_TEXT, b.hover), .cornerRadius = CLAY_CORNER_RADIUS(1)}) {}
+                IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
             }
         }
     }
@@ -1094,12 +1054,7 @@ static void EffectsView(void) {
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
     float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    /* Measure the real body (wrapped text changes its height) instead of trusting a constant,
-       and drop the clip entirely once fully open so nothing is cut off or mis-scissored
-       while the inspector scrolls. The clip is only used during the open/close animation. */
-    bool transFull = gTransOpen && o >= 0.999f;
-    float transMeasured = Clay_GetElementData(CLAY_ID("TransInner")).boundingBox.height;
-    float dh = roundf(o * (transMeasured > 1.f ? transMeasured : (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H)));
+    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
     CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
@@ -1110,9 +1065,8 @@ static void EffectsView(void) {
             HSPACE
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (transFull || dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, transFull ? FIT : FIX(dh)}}, .clip = {.vertical = !transFull}}) {
-              CLAY(CLAY_ID("TransInner"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+        if (dh >= 1.f) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
@@ -1160,7 +1114,6 @@ static void EffectsView(void) {
                     CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
                                .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, (gTransitionDuration - .1f) / 1.9f, durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
                 }
-              }
             }
         }
     }
@@ -1215,9 +1168,9 @@ static void EffectsView(void) {
     for (int i = 0; i < 4; i++) {
         oi[i] = Spring(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 680.f, 32.f);
         if (oi[i] < 0.f) oi[i] = 0.f;
-        if (oi[i] > 1.f) oi[i] = 1.f;
-        hb[i] = roundf(oi[i] * (FX_BODY_H + 42.f));
-        if (hb[i] >= 1.f) sum += hb[i] + 12.25f; /* wrapper padding + top spacer */
+        if (oi[i] > 1.04f) oi[i] = 1.04f;
+        hb[i] = roundf(oi[i] * (FX_BODY_H + 12.5f));
+        if (hb[i] >= 1.f) sum += hb[i] + 2.25f; /* wrapper's FIX padding */
     }
     float lh = roundf(ov * (12.25f + (4.f + EXTRA_FX_COUNT) * (FX_ITEM_H + 2.25f) + 13.f * 8.f + sum));
     CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {

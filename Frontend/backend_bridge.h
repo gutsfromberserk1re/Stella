@@ -562,12 +562,15 @@ static void PlutoPollBackend(void) {
                                 PlutoJsonNumber(event, "queueMs", &q);
                                 PlutoJsonNumber(event, "streamSetupMs", &su);
                                 PlutoJsonNumber(event, "decodeWaitMs", &dc);
+                                double rd = 0.0;
                                 PlutoJsonNumber(event, "totalMs", &bk);
+                                PlutoJsonNumber(event, "ringDepth", &rd);
                                 const double a = gPerfShownFrames ? 0.1 : 1.0;
                                 gPerfQueueMs += (q - gPerfQueueMs) * a;
                                 gPerfSetupMs += (su - gPerfSetupMs) * a;
                                 gPerfDecodeMs += (dc - gPerfDecodeMs) * a;
                                 gPerfBackendMs += (bk - gPerfBackendMs) * a;
+                                gPerfRingDepth += (rd - gPerfRingDepth) * a;
                                 gPerfUploadMs += ((now - uploadStartedAt) * 1000.0 - gPerfUploadMs) * a;
                                 gPerfEndToEndMs += ((now - gPreviewRequestStartedAt) * 1000.0 - gPerfEndToEndMs) * a;
                                 if (gPerfLastShownAt > 0.0)

@@ -20,6 +20,7 @@
 - DPI, icons, value editing, panel animations, and timeline colors refined.
 - Preview uses a dedicated Rust-owned persistent FFmpeg raw-frame stream, cached proxies at all preview sizes, reusable frame buffers, and direct C-to-raylib texture upload.
 - Preview telemetry reports queue, stream setup, decode wait, texture upload, backend time, and end-to-end display latency to the Windows debugger.
+- F3 shows an on-screen preview timing overlay; the preview stream decodes ahead into a bounded ring buffer on a reader thread.
 
 ## Next
 - Finish shared keyframe interpolation.

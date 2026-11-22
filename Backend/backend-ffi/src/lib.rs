@@ -5,19 +5,19 @@
 
 use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
-mod decoder;
 mod filters;
-mod renderer;
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     ffi::{CStr, CString},
     hash::{Hash, Hasher},
+    io::Read,
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
+    process::{Child, ChildStdout, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -29,17 +29,13 @@ struct Backend {
     redo: Mutex<Vec<Timeline>>,
     next_task: AtomicU64,
     task_tx: Sender<(u64, Value)>,
-    preview_task_tx: Sender<(u64, Value, Arc<Timeline>)>,
+    preview_task_tx: Sender<(u64, Value)>,
     proxy_task_tx: Sender<(u64, Value)>,
-    preview_timeline: std::sync::RwLock<Arc<Timeline>>,
     event_rx: Mutex<Receiver<String>>,
     preview_inflight: Arc<AtomicBool>,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
-/* True while a drag ("live") property edit session is open: the first live edit records one
-   undo step, later live edits and the closing commit do not, so a drag is a single undo. */
-static LIVE_EDIT: AtomicBool = AtomicBool::new(false);
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
 
@@ -55,10 +51,75 @@ impl Default for PreviewFrame {
     fn default() -> Self { Self { request_id: 0, width: 0, height: 0, at: 0.0, pixels: Vec::new() } }
 }
 
-#[derive(Default)]
-struct PreviewEngine {
-    decoders: decoder::DecoderPool,
+struct PreviewStream {
+    signature: u64,
+    width: u32,
+    height: u32,
+    fps: u32,
+    origin_index: u64,
+    child: Child,
+    ring: Arc<FrameRing>,
+    script: std::path::PathBuf,
+    next_index: u64,
+    last_index: Option<u64>,
 }
+
+/* Decode-ahead ring. A reader thread drains FFmpeg's pipe continuously into this
+   bounded queue so the preview request path normally finds its frame already
+   waiting instead of blocking on the decoder. When the ring is full the reader
+   stops reading, the pipe fills, and FFmpeg itself backs off. */
+struct RingState {
+    frames: VecDeque<(u64, Vec<u8>)>,
+    free: Vec<Vec<u8>>,
+    closed: bool,
+    ended: bool,
+}
+
+struct FrameRing {
+    state: Mutex<RingState>,
+    changed: Condvar,
+    capacity: usize,
+}
+
+fn preview_reader(mut stdout: ChildStdout, ring: Arc<FrameRing>, frame_bytes: usize) {
+    let mut index = 0u64;
+    loop {
+        let mut buf = {
+            let Ok(mut st) = ring.state.lock() else { return; };
+            while st.frames.len() >= ring.capacity && !st.closed {
+                st = match ring.changed.wait(st) { Ok(guard) => guard, Err(_) => return };
+            }
+            if st.closed { return; }
+            st.free.pop().unwrap_or_default()
+        };
+        buf.resize(frame_bytes, 0);
+        if stdout.read_exact(&mut buf).is_err() {
+            if let Ok(mut st) = ring.state.lock() { st.ended = true; }
+            ring.changed.notify_all();
+            return;
+        }
+        {
+            let Ok(mut st) = ring.state.lock() else { return; };
+            if st.closed { return; }
+            st.frames.push_back((index, buf));
+        }
+        index += 1;
+        ring.changed.notify_all();
+    }
+}
+
+impl Drop for PreviewStream {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.ring.state.lock() { st.closed = true; }
+        self.ring.changed.notify_all();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.script);
+    }
+}
+
+#[derive(Default)]
+struct PreviewEngine { stream: Option<PreviewStream> }
 
 fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
     let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
@@ -103,7 +164,7 @@ fn preview_source_path(clip: &Clip) -> String {
 fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
-        let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value, Arc<Timeline>)>();
+        let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value)>();
         let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
         let (event_tx, event_rx) = mpsc::channel::<String>();
         let preview_inflight = Arc::new(AtomicBool::new(false));
@@ -123,16 +184,14 @@ fn backend() -> &'static Backend {
             .name("stella-proxy-worker".into())
             .spawn(move || proxy_worker(proxy_task_rx, proxy_events))
             .expect("failed to start Stella proxy worker");
-        let initial_timeline = Arc::new(Timeline::default());
         Backend {
-            timeline: Mutex::new((*initial_timeline).clone()),
+            timeline: Mutex::new(Timeline::default()),
             undo: Mutex::new(Vec::new()),
             redo: Mutex::new(Vec::new()),
             next_task: AtomicU64::new(1),
             task_tx,
             preview_task_tx,
             proxy_task_tx,
-            preview_timeline: std::sync::RwLock::new(initial_timeline),
             event_rx: Mutex::new(event_rx),
             preview_inflight,
         }
@@ -174,24 +233,25 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, proxy_tas
     }
 }
 
-fn preview_worker(tasks: Receiver<(u64, Value, Arc<Timeline>)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
-    /* This thread owns persistent libav decoder contexts, frame caches, and the
-       wgpu preview renderer. The UI sends only a playhead and display settings. */
+fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
+    /* The preview process and its pipe are owned exclusively by this thread.
+       That gives FFmpeg one clear owner and keeps decode waits off the UI and
+       media-import/export workers. */
     let mut engine = PreviewEngine::default();
-    while let Ok((id, request, timeline)) = tasks.recv() {
+    while let Ok((id, request)) = tasks.recv() {
         let queued_ms = request["submittedAtMs"].as_u64().unwrap_or(0);
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let queue_ms = now_ms.saturating_sub(queued_ms);
         let total_started = Instant::now();
-        let (result, decode_ms, gpu_ms) = engine.render(&request, &timeline, id);
+        let (result, setup_ms, decode_ms, ring_depth) = engine.render(&request, id);
         preview_inflight.store(false, Ordering::Release);
         let response = match result {
             Ok((width, height, at)) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
                 "width":width,"height":height,"at":at,"queueMs":queue_ms,
-                "decodeMs":decode_ms,"gpuRenderMs":gpu_ms,
+                "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
-                "queueMs":queue_ms,"decodeMs":decode_ms,"gpuRenderMs":gpu_ms,
+                "queueMs":queue_ms,"streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
         };
         if events.send(response.to_string()).is_err() { break; }
@@ -211,9 +271,9 @@ fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
             let temporary = destination.with_file_name(format!("proxy-render-{id}.mp4"));
             let mut command = media_command(&ffmpeg);
             command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
-                .args(["-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
-                       "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "17",
-                       "-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-bf", "0",
+                .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                       "-an", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                       "-g", "6", "-keyint_min", "6", "-sc_threshold", "0", "-bf", "0",
                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
                 .arg(&temporary);
             let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
@@ -280,14 +340,13 @@ fn inspect_media(path: &str) -> Result<Value, String> {
 
     let mut duration = 5.0;
     let mut has_audio = false;
-    let mut source_height = 0u64;
     if kind != "image" {
         let output = media_command(multimedia_binary("ffprobe"))
             .args([
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration:stream=codec_type,duration,height",
+                "format=duration:stream=codec_type,duration",
                 "-of",
                 "json",
             ])
@@ -307,8 +366,6 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         has_audio = data["streams"]
             .as_array()
             .is_some_and(|streams| streams.iter().any(|s| s["codec_type"] == "audio"));
-        source_height = data["streams"].as_array().map(|streams| streams.iter()
-            .filter(|s| s["codec_type"] == "video").filter_map(|s| s["height"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
         duration = seconds(&data["format"]["duration"])
             .or_else(|| {
                 data["streams"]
@@ -325,17 +382,11 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
-    // v4 uses in-process libav decoding and a small BMP cache. Bumping the
-    // version makes older missing/failed JPEG thumbnails regenerate automatically.
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v4.bmp"));
-    /* The preview decodes the original file whenever that is cheap (<= 1440p). A proxy is only
-       built for very large sources, where it is a 1080p, high-quality, short-GOP intermediate
-       rather than the old 720p CRF-30 file that made the preview look soft and blocky. */
-    let needs_proxy = kind == "video" && source_height > 1440;
-    let proxy = if needs_proxy {
-        cache_dir.join(format!("{media_hash:016x}-proxy-1080p-g12-q17-v4.mp4"))
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
+    let proxy = if kind == "video" {
+        cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
     } else { std::path::PathBuf::new() };
-    if needs_proxy { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
+    if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
     let waveform_path = if has_audio {
         let generated = if waveform.is_file() {
@@ -354,17 +405,32 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let thumbnail_path = if kind == "audio" {
         None
     } else {
-        let cached = thumbnail.metadata().is_ok_and(|meta| meta.len() >= 54 + 320 * 180 * 3);
-        let generated = if cached {
+        let generated = if thumbnail.metadata().is_ok_and(|meta| meta.len() > 128) {
             true
         } else {
             let _ = std::fs::remove_file(&thumbnail);
-            match decoder::write_thumbnail(&path.to_string_lossy(), &thumbnail, 320, 180) {
-                Ok(()) => thumbnail.metadata().is_ok_and(|meta| meta.len() >= 54 + 320 * 180 * 3),
-                Err(error) => {
-                    eprintln!("[Stella media] thumbnail generation failed for '{}': {error}", path.display());
-                    false
-                }
+            let mut command = media_command(&ffmpeg);
+            command.args(["-v", "error"]);
+            if kind == "video" {
+                let seek = format!("{:.3}", (duration * 0.1).min(2.0));
+                command.args(["-ss", seek.as_str()]);
+            }
+            command.arg("-i").arg(path)
+                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                .arg(&thumbnail);
+            let first_attempt = command.status().is_ok_and(|status| status.success())
+                && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
+            if first_attempt {
+                true
+            } else {
+                let _ = std::fs::remove_file(&thumbnail);
+                let mut fallback = media_command(&ffmpeg);
+                fallback.args(["-v", "error", "-i"]).arg(path)
+                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                    .arg(&thumbnail)
+                    .status()
+                    .is_ok_and(|status| status.success())
+                    && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
             }
         };
         generated.then(|| thumbnail.to_string_lossy().into_owned())
@@ -716,97 +782,168 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     Ok(json!({"outputPath": output_path, "duration": duration, "width": width, "height": height, "fps": fps}))
 }
 
+fn preview_signature(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<u64, String> {
+    let mut hasher = DefaultHasher::new();
+    "stella-preview-stream-v2".hash(&mut hasher);
+    serde_json::to_vec(timeline).map_err(|e| e.to_string())?.hash(&mut hasher);
+    width.hash(&mut hasher); height.hash(&mut hasher); fps.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, id: u64, signature: u64, origin_index: u64) -> Result<PreviewStream, String> {
+    let (graph, inputs, duration, _) = export_filter_graph_mode(timeline, width, height, fps, false)?;
+    let script = filter_script(id, &graph)?;
+    let ffmpeg = multimedia_binary("ffmpeg");
+    let mut command = media_command(&ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error", "-filter_complex_threads", "2"]);
+    append_filter_graph_arg(&mut command, &ffmpeg, &script);
+    for input in inputs {
+        if input.image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
+        else if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
+        command.args(["-threads", "2", "-i"]).arg(input.path);
+    }
+    command.args(["-map", "[vout]", "-an", "-t", &format!("{duration:.5}"),
+        "-r", &fps.to_string(), "-fps_mode", "cfr", "-s", &format!("{width}x{height}"),
+        "-pix_fmt", "rgba", "-flush_packets", "1", "-f", "rawvideo", "pipe:1"])
+        .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        let _ = std::fs::remove_file(&script);
+        format!("Could not start FFmpeg preview stream: {error}")
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill(); let _ = child.wait(); let _ = std::fs::remove_file(&script);
+        return Err("FFmpeg preview stream has no output pipe".into());
+    };
+    let frame_bytes = width as usize * height as usize * 4;
+    let capacity = (96 * 1024 * 1024 / frame_bytes.max(1)).clamp(4, 24);
+    let ring = Arc::new(FrameRing {
+        state: Mutex::new(RingState { frames: VecDeque::new(), free: Vec::new(), closed: false, ended: false }),
+        changed: Condvar::new(),
+        capacity,
+    });
+    let reader_ring = Arc::clone(&ring);
+    thread::Builder::new()
+        .name("stella-preview-reader".into())
+        .spawn(move || preview_reader(stdout, reader_ring, frame_bytes))
+        .map_err(|error| format!("Could not start preview reader: {error}"))?;
+    Ok(PreviewStream {
+        signature, width, height, fps, origin_index, child, ring, script, next_index: 0,
+        last_index: None,
+    })
+}
+
 impl PreviewEngine {
-    fn render(&mut self, request: &Value, timeline: &Timeline, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64) {
+    fn render(&mut self, request: &Value, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64, usize) {
+        let mut setup_ms = 0.0;
         let mut decode_ms = 0.0;
-        let mut gpu_ms = 0.0;
+        let mut ring_depth = 0usize;
         let result = (|| -> Result<(u32, u32, f64), String> {
+            let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
             let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
             let height = request["height"].as_u64().unwrap_or(720).clamp(240, 1080) as u32;
             let width = ((height as f64 * 16.0 / 9.0).round() as u32) & !1;
             let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
-            let frame_at = (at * fps as f64).round() / fps as f64;
+            let target_index = (at * fps as f64).round() as u64;
+            let frame_at = target_index as f64 / fps as f64;
 
-            // Collect clips that are active now plus incoming clips during their
-            // outgoing-neighbour's transition window. Decoder state is retained
-            // by source path in DecoderPool between preview requests.
-            let mut active: Vec<(&Clip, Option<(String, f64, f64)>)> = Vec::new();
-            for clip in timeline.clips.iter().filter(|clip| {
-                clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
-            }) {
-                if frame_at >= clip.start && frame_at < clip.end() {
-                    active.push((clip, None));
-                    continue;
+            let mut preview_timeline = timeline;
+            preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));
+            for clip in &mut preview_timeline.clips {
+                let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let source = preview_source_path(clip);
+                if !std::path::Path::new(&source).is_file() { return Err(format!("Media file is missing: {source}")); }
+                clip.extra.insert("path".into(), Value::String(source));
+                clip.extra.insert("hasAudio".into(), Value::Bool(false));
+                if original.is_empty() { return Err("Video clip has no source path".into()); }
+            }
+            if preview_timeline.clips.is_empty() {
+                self.stream = None;
+                publish_black_frame(id, width, height, frame_at)?;
+                return Ok((width, height, frame_at));
+            }
+            if frame_at >= project_duration(&preview_timeline) {
+                self.stream = None;
+                publish_black_frame(id, width, height, frame_at)?;
+                return Ok((width, height, frame_at));
+            }
+            let signature = preview_signature(&preview_timeline, width, height, fps)?;
+            let transition_start = timeline_transition_start_at(&preview_timeline, frame_at);
+            let restart = self.stream.as_ref().is_none_or(|stream| stream.signature != signature ||
+                stream.width != width || stream.height != height || stream.fps != fps ||
+                (target_index < stream.origin_index + stream.next_index &&
+                    stream.last_index.map(|index| stream.origin_index + index) != Some(target_index)));
+            if restart {
+                self.stream = None;
+                let setup_started = Instant::now();
+                /* Rebuild at the beginning of the active transition. Starting at
+                   timeline zero made a seek into a late transition decode the
+                   entire project again. */
+                let origin_index = transition_start
+                    .map(|start| (start * fps as f64).floor().max(0.0) as u64)
+                    .unwrap_or(target_index);
+                let origin_time = origin_index as f64 / fps as f64;
+                let mut shifted = preview_timeline.clone();
+                shifted.clips.retain(|clip| clip.end() > origin_time);
+                for clip in &mut shifted.clips {
+                    let old_start = clip.start;
+                    let old_end = clip.end();
+                    let old_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
+                    let elapsed = (origin_time - old_start).max(0.0);
+                    let seek = old_offset + elapsed;
+                    clip.start = (old_start - origin_time).max(0.0);
+                    clip.duration = old_end - old_start.max(origin_time);
+                    clip.extra.insert("previewSeek".into(), json!(seek));
+                    clip.extra.insert("sourceOffset".into(), json!(0.0));
+                    if origin_time > 0.0 { clip.extra.insert("previewSeekAdjusted".into(), json!(true)); }
+                    else { clip.extra.remove("previewSeekAdjusted"); }
                 }
-                if frame_at >= clip.start { continue; }
-                let mut incoming = None;
-                for left in timeline.clips.iter().filter(|left| left.track == clip.track && left.end() <= clip.start + 0.04) {
-                    if let Some((kind, duration)) = transition_between(left, clip) {
-                        let start = (clip.start - duration).max(0.0);
-                        if frame_at >= start && frame_at < clip.start {
-                            incoming = Some((kind, duration, frame_at - start));
+                self.stream = Some(start_preview_stream(&shifted, width, height, fps, id, signature, origin_index)?);
+                setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
+            }
+            let stream = self.stream.as_mut().ok_or("Preview stream is unavailable")?;
+            let local_target_index = target_index.saturating_sub(stream.origin_index);
+            let decode_started = Instant::now();
+            let ring = Arc::clone(&stream.ring);
+            let mut frame: Option<Vec<u8>> = None;
+            {
+                let mut st = ring.state.lock().map_err(|_| "Preview ring lock failed".to_string())?;
+                if stream.last_index != Some(local_target_index) {
+                    loop {
+                        /* Frames behind the target are dropped, never shown. */
+                        while st.frames.front().is_some_and(|(index, _)| *index < local_target_index) {
+                            if let Some((_, old)) = st.frames.pop_front() { st.free.push(old); }
+                            ring.changed.notify_all();
+                        }
+                        if st.frames.front().is_some_and(|(index, _)| *index == local_target_index) {
+                            frame = st.frames.pop_front().map(|(_, buf)| buf);
+                            ring.changed.notify_all();
                             break;
                         }
+                        if st.ended {
+                            let status = stream.child.try_wait().ok().flatten().map(|status| status.to_string());
+                            return Err(match status {
+                                Some(status) => format!("FFmpeg preview stream ended before frame {local_target_index} ({status})"),
+                                None => format!("FFmpeg preview stream ended before frame {local_target_index}"),
+                            });
+                        }
+                        st = ring.changed.wait(st).map_err(|_| "Preview ring lock failed".to_string())?;
                     }
                 }
-                if incoming.is_some() { active.push((clip, incoming)); }
+                ring_depth = st.frames.len();
             }
-
-            active.sort_by(|(a, _), (b, _)| {
-                let rank = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, _ => 4 };
-                rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
-            });
-
-            if active.is_empty() {
-                publish_black_frame(id, width, height, frame_at)?;
-                return Ok((width, height, frame_at));
+            decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+            if let Some(mut buf) = frame {
+                stream.last_index = Some(local_target_index);
+                stream.next_index = local_target_index + 1;
+                publish_preview_buffer(id, width, height, frame_at, &mut buf, false)?;
+                if let Ok(mut st) = ring.state.lock() { st.free.push(buf); }
+            } else {
+                publish_preview_buffer(id, width, height, frame_at, &mut Vec::new(), true)?;
             }
-
-            let no_props = Value::Null;
-            let mut decoded_layers: Vec<(String, decoder::DecodedFrame, renderer::LayerUniforms)> = Vec::with_capacity(active.len());
-            for (clip, transition) in active {
-                let transition_progress = transition.as_ref().map(|(_, duration, elapsed)| {
-                    (elapsed / duration.max(0.001)).clamp(0.0, 1.0) as f32
-                });
-                let transition_info = transition.as_ref().map(|(kind, _, _)| (kind.as_str(), transition_progress.unwrap_or(1.0)));
-
-                let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
-                if original.is_empty() { return Err(format!("Video clip '{}' has no source path", clip.label)); }
-                let path = preview_source_path(clip);
-                if !std::path::Path::new(&path).is_file() { return Err(format!("Media file is missing: {path}")); }
-
-                let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-                let clip_elapsed = transition.as_ref().map(|(_, _, elapsed)| *elapsed).unwrap_or_else(|| (frame_at - clip.start).max(0.0));
-                let source_at = source_offset + clip_elapsed;
-                let decode_started = Instant::now();
-                let frame = self.decoders.frame_at(&path, source_at)?;
-                decode_ms += decode_started.elapsed().as_secs_f64() * 1000.0;
-                let props = clip.extra.get("props").unwrap_or(&no_props);
-                let uniforms = renderer::LayerUniforms::from_props_with_transition(props, source_at, transition_info);
-                if uniforms.opacity() <= 0.0 { continue; }
-                decoded_layers.push((clip.id.clone(), frame, uniforms));
-            }
-
-            if decoded_layers.is_empty() {
-                publish_black_frame(id, width, height, frame_at)?;
-                return Ok((width, height, frame_at));
-            }
-
-            let gpu_started = Instant::now();
-            let layers: Vec<renderer::GpuLayerFrame<'_>> = decoded_layers.iter().map(|(key, frame, uniforms)| renderer::GpuLayerFrame {
-                key,
-                pixels: frame.rgba.as_slice(),
-                width: frame.width,
-                height: frame.height,
-                uniforms: *uniforms,
-            }).collect();
-            let composited = renderer::GpuPreviewRenderer::composite_rgba(&layers, width, height)?;
-            gpu_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
-            let mut pixels = composited;
-            publish_preview_buffer(id, width, height, frame_at, &mut pixels, false)?;
             Ok((width, height, frame_at))
         })();
-        (result, decode_ms, gpu_ms)
+        if result.is_err() { self.stream = None; }
+        (result, setup_ms, decode_ms, ring_depth)
     }
 }
 
@@ -817,7 +954,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
         .lock()
         .map_err(|_| "Timeline lock failed".to_owned())?;
     let command = request["command"].as_str().ok_or("Command is required")?;
-    let result = match command {
+    match command {
         "timeline_get" => serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()),
         "timeline_undo" => {
             let previous = backend.undo.lock().map_err(|_| "Undo history lock failed")?.pop()
@@ -961,7 +1098,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let path = request["path"].as_str().ok_or("Property path is required")?;
             set_timeline_clip_property(&mut timeline, id, path, request["value"].clone())?;
-            save_property_history(backend, before, request["live"].as_bool().unwrap_or(false))?;
+            save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_set_clip_properties" => {
@@ -986,32 +1123,10 @@ fn dispatch(request: Value) -> Result<Value, String> {
                 }
             }
             for (index, clip) in working { timeline.clips[index] = clip; }
-            save_property_history(backend, before, request["live"].as_bool().unwrap_or(false))?;
+            save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         _ => Err(format!("Unsupported command: {command}")),
-    };
-    // Maintain a cheap immutable snapshot for preview requests. This moves the
-    // timeline clone to edit time rather than serializing/deserializing the
-    // entire project on every playback frame.
-    if result.is_ok() && command != "timeline_get" {
-        if let Ok(mut snapshot) = backend.preview_timeline.write() {
-            *snapshot = Arc::new(timeline.clone());
-        }
-    }
-    result
-}
-
-fn save_property_history(backend: &Backend, before: Timeline, live: bool) -> Result<(), String> {
-    let in_session = LIVE_EDIT.load(Ordering::Acquire);
-    if live {
-        if !in_session { LIVE_EDIT.store(true, Ordering::Release); save_history(backend, before)?; }
-        Ok(())
-    } else if in_session {
-        LIVE_EDIT.store(false, Ordering::Release); // closing commit of a drag: already recorded
-        Ok(())
-    } else {
-        save_history(backend, before)
     }
 }
 
@@ -1112,27 +1227,25 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             request["submittedAtMs"] = json!(now_ms);
         }
-        if command == "export_project" && request["timeline"].is_null() {
-            let timeline = match backend.preview_timeline.read() {
-                Ok(timeline) => (**timeline).clone(),
-                Err(_) => return 0,
+        if matches!(command.as_str(), "preview_frame" | "export_project") && request["timeline"].is_null() {
+            let timeline = match backend.timeline.lock() {
+                Ok(timeline) => timeline.clone(),
+                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
             };
             request["timeline"] = match serde_json::to_value(timeline) {
                 Ok(value) => value,
-                Err(_) => return 0,
+                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
             };
         }
         let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
-        if is_preview {
-            let snapshot = match backend.preview_timeline.read() {
-                Ok(value) => Arc::clone(&value),
-                Err(_) => { backend.preview_inflight.store(false, Ordering::Release); return 0; }
-            };
-            if backend.preview_task_tx.send((id, request, snapshot)).is_ok() { id }
-            else { backend.preview_inflight.store(false, Ordering::Release); 0 }
+        let sender = if is_preview { &backend.preview_task_tx }
+            else if command == "generate_proxy" { &backend.proxy_task_tx }
+            else { &backend.task_tx };
+        if sender.send((id, request)).is_ok() {
+            id
         } else {
-            let sender = if command == "generate_proxy" { &backend.proxy_task_tx } else { &backend.task_tx };
-            if sender.send((id, request)).is_ok() { id } else { 0 }
+            if is_preview { backend.preview_inflight.store(false, Ordering::Release); }
+            0
         }
     }))
     .unwrap_or(0)

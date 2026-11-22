@@ -450,38 +450,13 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured? */
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        /* Smooth conic hue disc, baked once into a texture: hue follows the angle,
-           saturation/brightness fall toward a deep, muted centre. Edge is anti-aliased. */
-        static Texture2D wheelTex;
-        enum { WHEEL_TEX = 256 };
-        if (wheelTex.id == 0) {
-            Image img = GenImageColor(WHEEL_TEX, WHEEL_TEX, BLANK);
-            Color *px = (Color *)img.data;
-            float half = WHEEL_TEX / 2.f;
-            for (int y = 0; y < WHEEL_TEX; y++) for (int x = 0; x < WHEEL_TEX; x++) {
-                float dx = x + .5f - half, dy = y + .5f - half;
-                float d = sqrtf(dx * dx + dy * dy), t = d / half;
-                float a = fminf(1.f, fmaxf(0.f, (half - d)));      /* 1px AA at the rim */
-                if (a <= 0.f) continue;
-                float ang = atan2f(dy, dx) * RAD2DEG; if (ang < 0.f) ang += 360.f;
-                float tt = fminf(1.f, t);
-                float e = tt * tt * (3.f - 2.f * tt);
-                Color col = ColorFromHSV(fmodf(ang + 90.f, 360.f), .52f + .40f * e, .30f + .46f * e);
-                col.a = (unsigned char)(a * 255.f);
-                px[y * WHEEL_TEX + x] = col;
-            }
-            wheelTex = LoadTextureFromImage(img);
-            UnloadImage(img);
-            SetTextureFilter(wheelTex, TEXTURE_FILTER_BILINEAR);
-        }
-        DrawTexturePro(wheelTex, (Rectangle){0, 0, WHEEL_TEX, WHEEL_TEX},
-                       (Rectangle){c.x - rad, c.y - rad, rad * 2, rad * 2}, (Vector2){0, 0}, 0.f, WHITE);
-        Ring(c, rad, 1.f, (Color){22, 23, 27, 120});
+        for (int i = 0; i < 72; i++)
+            DrawCircleSector(c, rad, i * 5.f, i * 5.f + 5.6f, 3, ColorFromHSV(fmodf(i * 5.f + 90.f, 360.f), .70f, .82f));
+        Ring(c, rad, 1.5f, (Color){54, 56, 63, 255});
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 8.5f + 1.5f * cu->f;
-        DrawCircleV((Vector2){p.x, p.y + 1.5f}, dot + 1.5f, (Color){0, 0, 0, 90});          /* soft drop shadow */
-        DrawCircleV(p, dot, cu->v > .5f ? RC(cu->c) : (Color){214, 216, 222, 255});
-        Ring(p, dot, 1.f, (Color){255, 255, 255, 60});
+        float dot = 9.5f + 1.5f * cu->f;
+        DrawCircleV(p, dot + 1.8f, (Color){245, 246, 249, 255});
+        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){225, 227, 232, 255});
     } break;
 
     case K_SWITCH: {
@@ -908,3 +883,24 @@ static Clay_Dimensions MeasureTxt(Clay_StringSlice t, Clay_TextElementConfig *cf
 }
 static void OnClayError(Clay_ErrorData e) { printf("Clay error: %.*s\n", e.errorText.length, e.errorText.chars); }
 
+
+/* Phase 1: preview timing overlay, toggled with F3. Budget at 30 fps is 33.3 ms per frame. */
+static void DrawPerfOverlay(void) {
+    if (!gPerfOverlay) return;
+    char line[7][96];
+    const double budget = 1000.0 / (double)(gPreviewFps > 0 ? gPreviewFps : 30);
+    snprintf(line[0], sizeof(line[0]), "Preview %dp @ %dfps   shown %.1f fps   interval %.1f ms", gPreviewRes, gPreviewFps, gPerfDisplayFps, gPerfFrameIntervalMs);
+    snprintf(line[1], sizeof(line[1]), "end-to-end %.1f ms (budget %.1f)", gPerfEndToEndMs, budget);
+    snprintf(line[2], sizeof(line[2]), "queue %.1f   setup %.1f   decode wait %.1f", gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs);
+    snprintf(line[3], sizeof(line[3]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);
+    snprintf(line[4], sizeof(line[4]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
+    snprintf(line[5], sizeof(line[5]), "F3 hides");
+    const int rows = 6; const float w = 420.f, h = 16.f * rows + 14.f;
+    Rectangle box = {(float)GetScreenWidth() - w - 12.f, 44.f, w, h};
+    DrawRectangleRec(box, (Color){0, 0, 0, 190});
+    bool over = gPerfEndToEndMs > budget;
+    for (int i = 0; i < rows; i++) {
+        Color c = (i == 1 && over) ? (Color){255, 120, 100, 255} : (Color){225, 225, 230, 255};
+        TxtAt(0, line[i], box.x + 8.f, box.y + 7.f + 16.f * i, 12.f, c);
+    }
+}

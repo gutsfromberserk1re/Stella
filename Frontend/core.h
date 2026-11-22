@@ -103,6 +103,7 @@ static bool   gPerfOverlay;
 static double gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs, gPerfBackendMs, gPerfUploadMs, gPerfEndToEndMs;
 static double gPerfFrameIntervalMs, gPerfLastShownAt, gPerfDisplayFps, gPerfFpsWindowAt;
 static int    gPerfShownInWindow;
+static double gPerfRingDepth;
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;
 static Texture2D gPreviewFrame;
 static uint8_t *gPreviewPixels;
