@@ -566,7 +566,18 @@ static void PlutoPollBackend(void) {
                                 PlutoJsonNumber(event, "totalMs", &bk);
                                 PlutoJsonNumber(event, "ringDepth", &rd);
                                 PlutoJsonNumber(event, "hwDecode", &gPerfHwDecode);
+                                PlutoJsonNumber(event, "path", &gPerfPath);
+                                PlutoJsonNumber(event, "fallbackReason", &gPerfFallbackReason);
+                                double xf = 0.0, cv = 0.0, cp = 0.0, pb = 0.0;
+                                PlutoJsonNumber(event, "transferMs", &xf);
+                                PlutoJsonNumber(event, "convertMs", &cv);
+                                PlutoJsonNumber(event, "compositeMs", &cp);
+                                PlutoJsonNumber(event, "publishMs", &pb);
                                 const double a = gPerfShownFrames ? 0.1 : 1.0;
+                                gPerfTransferMs += (xf - gPerfTransferMs) * a;
+                                gPerfConvertMs += (cv - gPerfConvertMs) * a;
+                                gPerfCompositeMs += (cp - gPerfCompositeMs) * a;
+                                gPerfPublishMs += (pb - gPerfPublishMs) * a;
                                 gPerfQueueMs += (q - gPerfQueueMs) * a;
                                 gPerfSetupMs += (su - gPerfSetupMs) * a;
                                 gPerfDecodeMs += (dc - gPerfDecodeMs) * a;
@@ -588,11 +599,12 @@ static void PlutoPollBackend(void) {
                                 PlutoJsonNumber(event, "streamSetupMs", &setupMs);
                                 PlutoJsonNumber(event, "decodeWaitMs", &decodeMs);
                                 PlutoJsonNumber(event, "totalMs", &renderMs);
-                                char timing[256];
+                                char timing[384];
                                 snprintf(timing, sizeof(timing),
-                                    "[Stella preview] end-to-end=%.1fms queue=%.1fms setup=%.1fms decode=%.1fms upload=%.1fms backend=%.1fms\n",
+                                    "[Stella preview] end-to-end=%.1fms queue=%.1fms setup=%.1fms decode=%.1fms (xfer=%.1f convert=%.1f) composite=%.1fms publish=%.1fms upload=%.1fms backend=%.1fms path=%s\n",
                                     (now - gPreviewRequestStartedAt) * 1000.0, queueMs, setupMs, decodeMs,
-                                    (now - uploadStartedAt) * 1000.0, renderMs);
+                                    gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfPublishMs,
+                                    (now - uploadStartedAt) * 1000.0, renderMs, gPerfPath >= 1.5 ? "FFMPEG-FALLBACK" : "native");
                                 OutputDebugStringA(timing);
                                 gPreviewTelemetryAt = now;
                             }

@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc, OnceLock,
     },
 };
@@ -45,6 +45,14 @@ const HW_ERROR_PREFIX: &str = "Hardware decode failed";
 static LAST_FRAME_HW: AtomicBool = AtomicBool::new(false);
 
 pub fn last_frame_was_hardware() -> bool { LAST_FRAME_HW.load(Relaxed) }
+
+/// Phase 0 timing: microseconds spent moving the last frame to system memory
+/// (hardware transfer) and in the fused convert+scale kernel. These are part of
+/// `decodeWaitMs`; reporting them separately shows where decode time really goes.
+static LAST_TRANSFER_US: AtomicU64 = AtomicU64::new(0);
+static LAST_CONVERT_US: AtomicU64 = AtomicU64::new(0);
+pub fn last_transfer_us() -> u64 { LAST_TRANSFER_US.load(Relaxed) }
+pub fn last_convert_us() -> u64 { LAST_CONVERT_US.load(Relaxed) }
 
 static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -337,9 +345,14 @@ impl VideoDecoder {
     /// to preview RGBA in a single pass.
     fn convert(&mut self, decoded: &frame::Video, pts_seconds: f64) -> Result<DecodedFrame, String> {
         let max_width = self.max_width;
+        let transfer_started = std::time::Instant::now();
         let software = to_software(decoded, &mut self.hw_transfer)?;
+        LAST_TRANSFER_US.store(transfer_started.elapsed().as_micros() as u64, Relaxed);
         LAST_FRAME_HW.store(!std::ptr::eq(software, decoded), Relaxed);
-        convert_frame_to_rgba(software, pts_seconds, max_width)
+        let convert_started = std::time::Instant::now();
+        let converted = convert_frame_to_rgba(software, pts_seconds, max_width);
+        LAST_CONVERT_US.store(convert_started.elapsed().as_micros() as u64, Relaxed);
+        converted
     }
 
     fn seek(&mut self, seconds: f64) -> Result<(), String> {

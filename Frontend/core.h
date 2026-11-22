@@ -111,6 +111,8 @@ static int    gPerfIntervalCount, gPerfIntervalHead;
 static double gPerfIntervalMedMs, gPerfIntervalP95Ms;
 static int    gPerfShownInWindow;
 static double gPerfRingDepth;
+static double gPerfPath, gPerfFallbackReason; /* path: 1 native GPU, 2 FFmpeg fallback */
+static double gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfPublishMs;
 static double gPerfHwDecode; /* 1 when the last shown frame came from a hardware decoder */
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;
 

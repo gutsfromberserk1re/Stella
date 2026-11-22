@@ -887,20 +887,27 @@ static void OnClayError(Clay_ErrorData e) { printf("Clay error: %.*s\n", e.error
 /* Phase 1: preview timing overlay, toggled with F3. Budget at 30 fps is 33.3 ms per frame. */
 static void DrawPerfOverlay(void) {
     if (!gPerfOverlay) return;
-    char line[7][112];
+    char line[8][112];
     const double budget = 1000.0 / (double)(gPreviewFps > 0 ? gPreviewFps : 30);
+    static const char *reasons[] = {"", "transition", "still image", "keyframes", "missing source", "decoder error", "GPU error"};
+    const int reason = (int)gPerfFallbackReason;
     snprintf(line[0], sizeof(line[0]), "Preview %dp @ %dfps   shown %.1f fps   interval med %.1f / p95 %.1f ms", gPreviewRes, gPreviewFps, gPerfDisplayFps, gPerfIntervalMedMs, gPerfIntervalP95Ms);
     snprintf(line[1], sizeof(line[1]), "end-to-end %.1f ms (budget %.1f)", gPerfEndToEndMs, budget);
     snprintf(line[2], sizeof(line[2]), "queue %.1f   setup %.1f   decode wait %.1f", gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs);
-    snprintf(line[3], sizeof(line[3]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);
-    snprintf(line[4], sizeof(line[4]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
-    snprintf(line[5], sizeof(line[5]), "decode: %s   F3 hides", gPerfHwDecode >= .5 ? "HARDWARE" : "SOFTWARE");
-    const int rows = 6; const float w = 420.f, h = 16.f * rows + 14.f;
+    snprintf(line[3], sizeof(line[3]), "  of which: hw transfer %.1f   convert+scale %.1f", gPerfTransferMs, gPerfConvertMs);
+    snprintf(line[4], sizeof(line[4]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);
+    snprintf(line[5], sizeof(line[5]), "gpu composite+readback %.1f   publish %.1f", gPerfCompositeMs, gPerfPublishMs);
+    snprintf(line[6], sizeof(line[6]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
+    if (gPerfPath >= 1.5)
+        snprintf(line[7], sizeof(line[7]), "decode: %s   PATH: FFMPEG FALLBACK (%s)   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW", (reason >= 0 && reason <= 6) ? reasons[reason] : "?");
+    else
+        snprintf(line[7], sizeof(line[7]), "decode: %s   path: native GPU   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW");
+    const int rows = 8; const float w = 440.f, h = 16.f * rows + 14.f;
     Rectangle box = {(float)GetScreenWidth() - w - 12.f, 44.f, w, h};
     DrawRectangleRec(box, (Color){0, 0, 0, 190});
     bool over = gPerfEndToEndMs > budget;
     for (int i = 0; i < rows; i++) {
-        Color c = (i == 1 && over) ? (Color){255, 120, 100, 255} : (Color){225, 225, 230, 255};
+        Color c = ((i == 1 && over) || (i == 7 && gPerfPath >= 1.5)) ? (Color){255, 120, 100, 255} : (Color){225, 225, 230, 255};
         TxtAt(0, line[i], box.x + 8.f, box.y + 7.f + 16.f * i, 12.f, c);
     }
 }

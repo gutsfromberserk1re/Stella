@@ -43,6 +43,18 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 static PREVIEW_RESTARTS: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_PROXY_CLIPS: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_ORIGINAL_CLIPS: AtomicU64 = AtomicU64::new(0);
+/// Phase 0 telemetry. PATH: 0 = none yet, 1 = native GPU compositor, 2 = FFmpeg graph fallback.
+/// A fallback frame is far slower, so F3 must say when it is happening and why.
+static PREVIEW_PATH: AtomicU64 = AtomicU64::new(0);
+/// Why the last frame left the native path: 0 none, 1 transition, 2 still image, 3 keyframes,
+/// 4 missing/empty source, 5 decoder error, 6 GPU composite error.
+static PREVIEW_FALLBACK_REASON: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_COMPOSITE_US: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_PUBLISH_US: AtomicU64 = AtomicU64::new(0);
+fn note_fallback(reason: u64) -> Result<Option<(u32, u32, f64)>, String> {
+    PREVIEW_FALLBACK_REASON.store(reason, Ordering::Relaxed);
+    Ok(None)
+}
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
 /// Latest timeline as an immutable `Arc`. Preview requests used to clone the
@@ -386,6 +398,11 @@ fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview
                 "width":width,"height":height,"at":at,"queueMs":queue_ms,
                 "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
                 "hwDecode":decoder::last_frame_was_hardware() as u8,
+                "path":PREVIEW_PATH.load(Ordering::Relaxed),"fallbackReason":PREVIEW_FALLBACK_REASON.load(Ordering::Relaxed),
+                "compositeMs":PREVIEW_COMPOSITE_US.load(Ordering::Relaxed) as f64/1000.0,
+                "publishMs":PREVIEW_PUBLISH_US.load(Ordering::Relaxed) as f64/1000.0,
+                "transferMs":decoder::last_transfer_us() as f64/1000.0,
+                "convertMs":decoder::last_convert_us() as f64/1000.0,
                 "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),"proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),"originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
@@ -989,7 +1006,7 @@ impl PreviewEngine {
         ring_depth: &mut usize,
     ) -> Result<Option<(u32, u32, f64)>, String> {
         if timeline_transition_start_at(timeline, frame_at).is_some() {
-            return Ok(None);
+            return note_fallback(1);
         }
 
         let mut active: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
@@ -1021,14 +1038,14 @@ impl PreviewEngine {
         // displaying incorrect keyframe values.
         for clip in &active {
             if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
-                return Ok(None);
+                return note_fallback(2);
             }
             if clip.extra.get("keyframes").and_then(Value::as_array).is_some_and(|items| !items.is_empty()) {
-                return Ok(None);
+                return note_fallback(3);
             }
             let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             if source.is_empty() {
-                return Ok(None);
+                return note_fallback(4);
             }
         }
 
@@ -1037,14 +1054,14 @@ impl PreviewEngine {
             let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             let source = preview_source_path(clip);
             if !std::path::Path::new(&source).is_file() {
-                return Ok(None);
+                return note_fallback(4);
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
             let source_time = (source_offset + (frame_at - clip.start)).max(0.0);
             let remaining = (clip.end() - frame_at).max(0.0);
             if source.is_empty() {
                 eprintln!("Stella native preview fallback for '{}': empty source path", original);
-                return Ok(None);
+                return note_fallback(4);
             }
             sources.push(DecodeSource { path: source, source_time, remaining });
         }
@@ -1070,7 +1087,7 @@ impl PreviewEngine {
             Ok(batch) => batch,
             Err(error) => {
                 eprintln!("Stella native preview fallback: {error}");
-                return Ok(None);
+                return note_fallback(5);
             }
         };
         *decode_ms = batch.decode_ms;
@@ -1088,16 +1105,22 @@ impl PreviewEngine {
             }
         }).collect();
 
+        let composite_started = Instant::now();
         let mut pixels = match GpuPreviewRenderer::composite_rgba(&layers, width, height) {
             Ok(pixels) => pixels,
             Err(error) => {
                 eprintln!("Stella native GPU preview fallback: {error}");
-                return Ok(None);
+                return note_fallback(6);
             }
         };
+        PREVIEW_COMPOSITE_US.store(composite_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Drop the old CLI stream once the native path has produced a frame.
         self.stream = None;
+        let publish_started = Instant::now();
         publish_preview_buffer(request_id, width, height, frame_at, &mut pixels, false)?;
+        PREVIEW_PUBLISH_US.store(publish_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREVIEW_PATH.store(1, Ordering::Relaxed);
+        PREVIEW_FALLBACK_REASON.store(0, Ordering::Relaxed);
         Ok(Some((width, height, frame_at)))
     }
 
@@ -1128,6 +1151,7 @@ impl PreviewEngine {
             if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, fps, playing, stepping, &mut decode_ms, &mut ring_depth)? {
                 return Ok(native);
             }
+            PREVIEW_PATH.store(2, Ordering::Relaxed);
 
             let mut preview_timeline = (*timeline).clone();
             preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));
