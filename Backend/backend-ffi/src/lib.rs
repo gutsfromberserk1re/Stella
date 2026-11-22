@@ -795,12 +795,16 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
     let script = filter_script(id, &graph)?;
     let ffmpeg = multimedia_binary("ffmpeg");
     let mut command = media_command(&ffmpeg);
-    command.args(["-hide_banner", "-loglevel", "error", "-filter_complex_threads", "2"]);
+    command.args(["-hide_banner", "-loglevel", "error", "-filter_complex_threads", "4"]);
     append_filter_graph_arg(&mut command, &ffmpeg, &script);
     for input in inputs {
         if input.image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
-        else if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
-        command.args(["-threads", "2", "-i"]).arg(input.path);
+        else {
+            // Hardware decode; FFmpeg copies frames back to system memory for the CPU filter graph.
+            command.args(["-hwaccel", "d3d11va"]);
+            if input.seek > 0.0001 { command.args(["-accurate_seek", "-ss", &format!("{:.6}", input.seek)]); }
+        }
+        command.args(["-threads", "0", "-i"]).arg(input.path);
     }
     command.args(["-map", "[vout]", "-an", "-t", &format!("{duration:.5}"),
         "-r", &fps.to_string(), "-fps_mode", "cfr", "-s", &format!("{width}x{height}"),
