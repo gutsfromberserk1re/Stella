@@ -822,15 +822,15 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
 static void DrawPreviewQualityDropdown(void) {
     float t = gPreviewMenuT;
     if (t < .01f || gPreviewQualityRect.width <= 0.f) return;
-    const int options[] = {240, 360, 480, 720, 1080};
+    const int options[] = {240, 480, 720, 1080};
     Rectangle box = {gPreviewQualityRect.x + gPreviewQualityRect.width - 96.f,
-                     gPreviewQualityRect.y - 166.f + 8.f * (1.f - t), 96.f, 160.f};
+                     gPreviewQualityRect.y - 134.f + 8.f * (1.f - t), 96.f, 128.f};
     Vector2 mouse = GetMousePosition();
     bool over = mouse.x >= box.x && mouse.x <= box.x + box.width && mouse.y >= box.y && mouse.y <= box.y + box.height;
     if (over && gPreviewMenuOpen) gHand = true;
     FillRR(box, 9.f, (Color){24, 25, 28, U8(255.f * t)});
     StrokeRR(box, 9.f, 1.f, (Color){54, 56, 62, U8(255.f * t)});
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
         Rectangle row = {box.x + 4.f, box.y + 4.f + i * 30.f, box.width - 8.f, 28.f};
         bool rowHover = gPreviewMenuOpen && mouse.x >= row.x && mouse.x <= row.x + row.width && mouse.y >= row.y && mouse.y <= row.y + row.height;
         if (options[i] == gPreviewRes) FillRR(row, 6.f, (Color){45, 47, 53, U8(255.f * t)});

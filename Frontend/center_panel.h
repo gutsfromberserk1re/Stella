@@ -10,18 +10,18 @@ static const char *Timecode(float seconds) {
 }
 
 static void CenterPanel(void) {
-    static const int resolutions[] = {240, 360, 480, 720, 1080};
+    static const int resolutions[] = {240, 480, 720, 1080};
     Clay_BoundingBox qb = Clay_GetElementData(CLAY_ID("PreviewQuality")).boundingBox;
     gPreviewQualityRect = (Rectangle){qb.x, qb.y, qb.width, qb.height};
     Clay_BoundingBox fb = Clay_GetElementData(CLAY_ID("PreviewFps")).boundingBox;
     gPreviewFpsRect = (Rectangle){fb.x, fb.y, fb.width, fb.height};
-    Rectangle menu = {gPreviewQualityRect.x, gPreviewQualityRect.y - 5 * 32.f - 6.f, 96.f, 5 * 32.f};
+    Rectangle menu = {gPreviewQualityRect.x, gPreviewQualityRect.y - 4 * 32.f - 6.f, 96.f, 4 * 32.f};
     Rectangle fpsMenu = {gPreviewFpsRect.x + gPreviewFpsRect.width - 88.f, gPreviewFpsRect.y - 3 * 32.f - 6.f, 88.f, 3 * 32.f};
     if (gPreviewMenuOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         Vector2 mouse = GetMousePosition();
         if (mouse.x >= menu.x && mouse.x <= menu.x + menu.width && mouse.y >= menu.y && mouse.y <= menu.y + menu.height) {
             int option = (int)((mouse.y - menu.y) / 32.f);
-            if (option >= 0 && option < 5) { gPreviewRes = resolutions[option]; gPreviewDirty = true; }
+            if (option >= 0 && option < 4) { gPreviewRes = resolutions[option]; gPreviewDirty = true; }
             gPreviewMenuOpen = false;
         } else if (!(mouse.x >= gPreviewQualityRect.x && mouse.x <= gPreviewQualityRect.x + gPreviewQualityRect.width &&
                      mouse.y >= gPreviewQualityRect.y && mouse.y <= gPreviewQualityRect.y + gPreviewQualityRect.height)) gPreviewMenuOpen = false;

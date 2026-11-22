@@ -50,6 +50,7 @@ pub struct DecodedFrame {
 struct FrameKey {
     path: String,
     index: i64,
+    max_width: u32,
 }
 
 struct VideoDecoder {
@@ -59,10 +60,14 @@ struct VideoDecoder {
     time_base: Rational,
     frame_rate: f64,
     cursor_seconds: f64,
+    // Maximum decoded RGBA width for preview. Keeping this near the monitor's
+    // effective resolution avoids uploading full 1080p/4K frames for a small
+    // preview surface.
+    max_width: u32,
 }
 
 impl VideoDecoder {
-    fn open(path: &str) -> Result<Self, String> {
+    fn open(path: &str, max_width: u32) -> Result<Self, String> {
         ensure_ffmpeg()?;
         if !Path::new(path).is_file() {
             return Err(format!("Media file is missing: {path}"));
@@ -80,8 +85,11 @@ impl VideoDecoder {
             let rate = stream.avg_frame_rate();
             let fps = f64::from(rate);
             let fps = if fps.is_finite() && fps > 0.1 && fps < 1000.0 { fps } else { 30.0 };
-            let context = codec::context::Context::from_parameters(stream.parameters())
+            let mut context = codec::context::Context::from_parameters(stream.parameters())
                 .map_err(|error| format!("Could not read video stream parameters: {error}"))?;
+            // Match Yoru's frame-threaded decoder setup. It lets FFmpeg parallelise
+            // codecs such as H.264/HEVC instead of leaving the preview worker on one core.
+            context.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
             let decoder = context.decoder().video()
                 .map_err(|error| format!("Could not initialize video decoder: {error}"))?;
             (stream_index, time_base, fps, decoder)
@@ -93,6 +101,7 @@ impl VideoDecoder {
             time_base,
             frame_rate,
             cursor_seconds: -1.0,
+            max_width: max_width.max(2) & !1,
         })
     }
 
@@ -118,7 +127,7 @@ impl VideoDecoder {
                         while self.decoder.receive_frame(&mut decoded).is_ok() {
                             let timestamp = decoded.timestamp().or_else(|| decoded.pts())
                                 .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
-                            return convert_frame_to_rgba(&decoded, timestamp);
+                            return convert_frame_to_rgba(&decoded, timestamp, self.max_width);
                         }
                     }
                 }
@@ -128,7 +137,7 @@ impl VideoDecoder {
                     while self.decoder.receive_frame(&mut decoded).is_ok() {
                         let timestamp = decoded.timestamp().or_else(|| decoded.pts())
                             .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
-                        return convert_frame_to_rgba(&decoded, timestamp);
+                        return convert_frame_to_rgba(&decoded, timestamp, self.max_width);
                     }
                     return Err("No video frame was available for this media thumbnail".into());
                 }
@@ -157,7 +166,7 @@ impl VideoDecoder {
                     .unwrap_or(target);
                 self.cursor_seconds = pts_seconds;
                 if pts_seconds + tolerance >= target {
-                    return convert_frame_to_rgba(&decoded, pts_seconds);
+                    return convert_frame_to_rgba(&decoded, pts_seconds, self.max_width);
                 }
             }
 
@@ -177,7 +186,7 @@ impl VideoDecoder {
                             .unwrap_or(target);
                         self.cursor_seconds = pts_seconds;
                         if pts_seconds + tolerance >= target {
-                            return convert_frame_to_rgba(&decoded, pts_seconds);
+                            return convert_frame_to_rgba(&decoded, pts_seconds, self.max_width);
                         }
                     }
                     return Err(format!("No decoded video frame at {target:.3}s"));
@@ -197,7 +206,7 @@ pub fn write_thumbnail(path: &str, destination: &Path, target_width: u32, target
     if target_width == 0 || target_height == 0 {
         return Err("Thumbnail dimensions must be nonzero".into());
     }
-    let mut decoder = VideoDecoder::open(path)?;
+    let mut decoder = VideoDecoder::open(path, target_width)?;
     let decoded = decoder.decode_first_frame()?;
     let thumbnail = resize_rgba_fit(&decoded, target_width, target_height)?;
     write_bmp24(destination, target_width, target_height, &thumbnail)
@@ -418,7 +427,82 @@ fn convert_semi_planar(source: &frame::Video, width: usize, height: usize, rgba:
     });
 }
 
-fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64) -> Result<DecodedFrame, String> {
+/// Area-average downsample packed RGBA to a maximum width. This mirrors the
+/// half-resolution decode path used by Yoru: at a 480p monitor setting, Stella
+/// keeps a 960x540 source image and lets the compositor make the final small
+/// reduction. The area filter avoids the aliasing produced by sampling a 1080p
+/// texture directly at 480p, while sharply reducing upload/cache bandwidth.
+fn downsample_rgba_box(
+    source: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    if source_width == 0 || source_height == 0 || max_width == 0 {
+        return Err("Preview frame dimensions must be nonzero".into());
+    }
+    let expected = (source_width as usize)
+        .checked_mul(source_height as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "Preview frame dimensions overflowed".to_owned())?;
+    if source.len() != expected {
+        return Err(format!("Decoded frame has {} bytes; expected {expected}", source.len()));
+    }
+    if source_width <= max_width {
+        return Ok((source_width, source_height, source));
+    }
+
+    let out_width = (max_width & !1).max(2);
+    let out_height = (((source_height as u64 * out_width as u64 + source_width as u64 / 2)
+        / source_width as u64) as u32 & !1).max(2);
+    let out_len = (out_width as usize)
+        .checked_mul(out_height as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "Scaled preview frame dimensions overflowed".to_owned())?;
+    let mut output = vec![0u8; out_len];
+    let sx = source_width as f64 / out_width as f64;
+    let sy = source_height as f64 / out_height as f64;
+    let source_stride = source_width as usize * 4;
+    let output_stride = out_width as usize * 4;
+
+    for y in 0..out_height as usize {
+        let y0 = y as f64 * sy;
+        let y1 = (y + 1) as f64 * sy;
+        let iy0 = y0.floor() as usize;
+        let iy1 = (y1.ceil() as usize).min(source_height as usize);
+        for x in 0..out_width as usize {
+            let x0 = x as f64 * sx;
+            let x1 = (x + 1) as f64 * sx;
+            let ix0 = x0.floor() as usize;
+            let ix1 = (x1.ceil() as usize).min(source_width as usize);
+            let mut sums = [0.0f64; 4];
+            let mut total = 0.0f64;
+            for iy in iy0..iy1 {
+                let wy = (y1.min(iy as f64 + 1.0) - y0.max(iy as f64)).max(0.0);
+                if wy <= 0.0 { continue; }
+                for ix in ix0..ix1 {
+                    let wx = (x1.min(ix as f64 + 1.0) - x0.max(ix as f64)).max(0.0);
+                    let weight = wx * wy;
+                    if weight <= 0.0 { continue; }
+                    let at = iy * source_stride + ix * 4;
+                    for channel in 0..4 {
+                        sums[channel] += source[at + channel] as f64 * weight;
+                    }
+                    total += weight;
+                }
+            }
+            let dst = y * output_stride + x * 4;
+            let denominator = total.max(1.0);
+            for channel in 0..4 {
+                output[dst + channel] = (sums[channel] / denominator)
+                    .round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok((out_width, out_height, output))
+}
+
+fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32) -> Result<DecodedFrame, String> {
     let width = source.width();
     let height = source.height();
     if width == 0 || height == 0 { return Err("Decoder returned an empty video frame".into()); }
@@ -489,6 +573,7 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64) -> Result<Deco
         other => return Err(format!("Preview decoder does not yet convert pixel format {other:?}. Try generating a compatible proxy (8-bit RGB/YUV or supported 9/10/12/16-bit planar YUV and P010).")),
     }
 
+    let (width, height, rgba) = downsample_rgba_box(rgba, width, height, max_width)?;
     Ok(DecodedFrame { width, height, pts_seconds, rgba: Arc::new(rgba) })
 }
 
@@ -515,20 +600,21 @@ impl DecoderPool {
         }
     }
 
-    pub fn frame_at(&mut self, path: &str, seconds: f64) -> Result<DecodedFrame, String> {
+    pub fn frame_at(&mut self, path: &str, seconds: f64, max_width: u32) -> Result<DecodedFrame, String> {
+        let max_width = max_width.max(2) & !1;
         // Check the frame cache before reopening a decoder. This matters when a
         // source was evicted from the small open-decoder pool but its pixels
         // are still hot in the larger decoded-frame cache.
         let frame_rate = if let Some(rate) = self.frame_rates.get(path).copied() {
             rate
         } else {
-            let decoder = VideoDecoder::open(path)?;
+            let decoder = VideoDecoder::open(path, max_width)?;
             let rate = decoder.frame_rate;
             self.remember_decoder(path, decoder);
             rate
         };
         let frame_index = (seconds.max(0.0) * frame_rate).round() as i64;
-        let key = FrameKey { path: path.to_owned(), index: frame_index };
+        let key = FrameKey { path: path.to_owned(), index: frame_index, max_width };
         if let Some(frame) = self.frames.get(&key).cloned() {
             if let Some(index) = self.frame_order.iter().position(|item| item == &key) {
                 self.frame_order.remove(index);
@@ -543,8 +629,14 @@ impl DecoderPool {
             return Ok(frame);
         }
 
+        let decoder_width_changed = self.decoders.get(path)
+            .map_or(false, |decoder| decoder.max_width != max_width);
+        if decoder_width_changed {
+            self.decoders.remove(path);
+            self.decoder_order.retain(|item| item != path);
+        }
         if !self.decoders.contains_key(path) {
-            let decoder = VideoDecoder::open(path)?;
+            let decoder = VideoDecoder::open(path, max_width)?;
             self.remember_decoder(path, decoder);
         } else {
             self.decoder_order.retain(|item| item != path);

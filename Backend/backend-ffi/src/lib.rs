@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 mod decoder;
 mod filters;
 mod renderer;
-use decoder::DecoderPool;
+use decoder::{DecodedFrame, DecoderPool};
 use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
@@ -125,13 +125,118 @@ impl Drop for PreviewStream {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct DecodeSource {
+    path: String,
+    source_time: f64,
+    remaining: f64,
+}
+
+struct DecodeTask {
+    sources: Vec<DecodeSource>,
+    fps: f64,
+    max_width: u32,
+}
+
+struct DecodeBatch {
+    frames: Vec<DecodedFrame>,
+    decode_ms: f64,
+    prefetched_frames: usize,
+}
+
+/// Yoru-style decode worker: FFmpeg decoder contexts stay on one dedicated
+/// thread, the current frame is returned immediately, then a tiny two-frame
+/// look-ahead is filled while the GPU compositor renders the current frame.
+/// The request/reply channel is bounded so rapid seeks cannot build a backlog.
+struct DecodeAheadWorker {
+    requests: mpsc::SyncSender<DecodeTask>,
+    replies: Receiver<Result<DecodeBatch, String>>,
+}
+
+impl DecodeAheadWorker {
+    fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<DecodeTask>(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<DecodeBatch, String>>(1);
+        thread::Builder::new()
+            .name("stella-decode-ahead".into())
+            .spawn(move || decode_ahead_loop(request_rx, reply_tx))
+            .expect("failed to start Stella decode-ahead worker");
+        Self { requests: request_tx, replies: reply_rx }
+    }
+
+    fn decode(&self, task: DecodeTask) -> Result<DecodeBatch, String> {
+        self.requests.send(task).map_err(|_| "Stella decode worker stopped".to_owned())?;
+        self.replies.recv().map_err(|_| "Stella decode worker did not return a frame".to_owned())?
+    }
+}
+
+fn decode_ahead_loop(
+    requests: Receiver<DecodeTask>,
+    replies: mpsc::SyncSender<Result<DecodeBatch, String>>,
+) {
+    let mut pool = DecoderPool::default();
+    let mut pending: Option<DecodeTask> = None;
+    let mut prefetched_from_previous = 0usize;
+    loop {
+        let task = match pending.take() {
+            Some(task) => task,
+            None => match requests.recv() { Ok(task) => task, Err(_) => return },
+        };
+
+        let decode_started = Instant::now();
+        let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
+            .map(|source| pool.frame_at(&source.path, source.source_time, task.max_width))
+            .collect();
+        let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let Ok(frames) = current else {
+            let error = current.err().unwrap_or_else(|| "Video frame decode failed".into());
+            if replies.send(Err(error)).is_err() { return; }
+            continue;
+        };
+
+        // Return the requested frame before look-ahead. The caller can composite
+        // and upload it while this worker advances FFmpeg and fills the frame cache.
+        if replies.send(Ok(DecodeBatch {
+            frames,
+            decode_ms,
+            prefetched_frames: prefetched_from_previous,
+        })).is_err() {
+            return;
+        }
+        prefetched_from_previous = 0;
+
+        let mut prefetched = 0usize;
+        'prefetch: for step in 1..=2 {
+            let ahead_seconds = step as f64 / task.fps.max(1.0);
+            for source in &task.sources {
+                // A new seek/playback request takes priority over warming old frames.
+                match requests.try_recv() {
+                    Ok(next) => { pending = Some(next); break 'prefetch; }
+                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => {}
+                }
+                if ahead_seconds >= source.remaining { continue; }
+                if pool.frame_at(&source.path, source.source_time + ahead_seconds, task.max_width).is_ok() {
+                    prefetched += 1;
+                }
+            }
+        }
+        // The bounded decode cache owns the actual frames. Report the warmed
+        // frame count with the next request; a fresh seek can interrupt this loop
+        // at any time without building a stale playback backlog.
+        prefetched_from_previous = prefetched;
+    }
+}
+
 struct PreviewEngine {
     stream: Option<PreviewStream>,
-    // Native FFmpeg decoder contexts and decoded frames survive across preview
-    // requests. This is the important difference from spawning a new FFmpeg
-    // filter-graph process whenever the playhead jumps.
-    decoder_pool: DecoderPool,
+    decoder_worker: DecodeAheadWorker,
+}
+
+impl Default for PreviewEngine {
+    fn default() -> Self {
+        Self { stream: None, decoder_worker: DecodeAheadWorker::new() }
+    }
 }
 
 fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
@@ -285,9 +390,9 @@ fn proxy_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>) {
             let temporary = destination.with_file_name(format!("proxy-render-{id}.mp4"));
             let mut command = media_command(&ffmpeg);
             command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(source)
-                .args(["-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                       "-an", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-                       "-g", "6", "-keyint_min", "6", "-sc_threshold", "0", "-bf", "0",
+                .args(["-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                       "-an", "-threads", "2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                       "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-bf", "0",
                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"])
                 .arg(&temporary);
             let output = command.output().map_err(|e| format!("Could not start FFmpeg proxy encode: {e}"))?;
@@ -398,7 +503,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
     let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
     let proxy = if kind == "video" {
-        cache_dir.join(format!("{media_hash:016x}-proxy-720p-g6-v3.mp4"))
+        cache_dir.join(format!("{media_hash:016x}-proxy-1080p-g30-v4.mp4"))
     } else { std::path::PathBuf::new() };
     if kind == "video" { remember_media_proxy(&path.to_string_lossy(), proxy.clone()); }
     let ffmpeg = multimedia_binary("ffmpeg");
@@ -858,7 +963,9 @@ impl PreviewEngine {
         width: u32,
         height: u32,
         request_id: u64,
+        fps: u32,
         decode_ms: &mut f64,
+        ring_depth: &mut usize,
     ) -> Result<Option<(u32, u32, f64)>, String> {
         if timeline_transition_start_at(timeline, frame_at).is_some() {
             return Ok(None);
@@ -904,8 +1011,7 @@ impl PreviewEngine {
             }
         }
 
-        let decode_started = Instant::now();
-        let mut decoded = Vec::with_capacity(active.len());
+        let mut sources = Vec::with_capacity(active.len());
         for clip in &active {
             let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             let source = preview_source_path(clip);
@@ -914,16 +1020,39 @@ impl PreviewEngine {
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
             let source_time = (source_offset + (frame_at - clip.start)).max(0.0);
-            match self.decoder_pool.frame_at(&source, source_time) {
-                Ok(frame) => decoded.push(frame),
-                Err(error) => {
-                    eprintln!("Stella native preview fallback for '{}': {error}", original);
-                    return Ok(None);
-                }
+            let remaining = (clip.end() - frame_at).max(0.0);
+            if source.is_empty() {
+                eprintln!("Stella native preview fallback for '{}': empty source path", original);
+                return Ok(None);
             }
+            sources.push(DecodeSource { path: source, source_time, remaining });
         }
 
-        *decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        // Resolution-aware source sizing. Decode enough pixels to keep the
+        // selected preview crisp without paying 1080p conversion/upload costs
+        // when the user deliberately chooses a smaller preview quality.
+        // The caps are 4:2:0 friendly and retain modest oversampling before the
+        // GPU compositor scales to the exact selected output size.
+        let max_source_width = match height {
+            0..=240 => 640,   // 240p output: 426x240
+            241..=480 => 960, // 480p output: 854x480
+            481..=720 => 1440,// 720p output: 1280x720
+            _ => 1920,        // 1080p output: 1920x1080
+        };
+        let batch = match self.decoder_worker.decode(DecodeTask {
+            sources,
+            fps: fps as f64,
+            max_width: max_source_width,
+        }) {
+            Ok(batch) => batch,
+            Err(error) => {
+                eprintln!("Stella native preview fallback: {error}");
+                return Ok(None);
+            }
+        };
+        *decode_ms = batch.decode_ms;
+        let decoded = batch.frames;
+        *ring_depth = batch.prefetched_frames;
         let null_props = Value::Null;
         let layers: Vec<GpuLayerFrame<'_>> = active.iter().zip(decoded.iter()).map(|(clip, frame)| {
             let props = clip.extra.get("props").unwrap_or(&null_props);
@@ -965,7 +1094,7 @@ impl PreviewEngine {
             // Most playback frames now use persistent in-process decoders and
             // Stella's GPU compositor. Complex/unsupported cases retain the
             // old FFmpeg graph path as a correctness fallback.
-            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, &mut decode_ms)? {
+            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, fps, &mut decode_ms, &mut ring_depth)? {
                 return Ok(native);
             }
 
