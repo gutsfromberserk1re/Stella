@@ -565,6 +565,7 @@ static void PlutoPollBackend(void) {
                                 double rd = 0.0;
                                 PlutoJsonNumber(event, "totalMs", &bk);
                                 PlutoJsonNumber(event, "ringDepth", &rd);
+                                PlutoJsonNumber(event, "hwDecode", &gPerfHwDecode);
                                 const double a = gPerfShownFrames ? 0.1 : 1.0;
                                 gPerfQueueMs += (q - gPerfQueueMs) * a;
                                 gPerfSetupMs += (su - gPerfSetupMs) * a;
@@ -664,8 +665,13 @@ static void PlutoUnloadMedia(void) {
 
 static uint64_t PlutoRequestPreview(void) {
     if (!gBackend.submit || gPreviewTaskId) return 0;
-    char request[128];
-    snprintf(request, sizeof(request), "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d}", gPlayhead, gPreviewRes, gPreviewFps);
+    char request[192];
+    /* "playing" enables decode-ahead; "stepping" (arrow keys) makes the backend cache the
+       frames before a seek target so repeated reverse steps do not each re-seek (Yoru). */
+    snprintf(request, sizeof(request),
+             "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d,\"playing\":%s,\"stepping\":%s}",
+             gPlayhead, gPreviewRes, gPreviewFps,
+             gTimelinePlaying ? "true" : "false", gPreviewNavigating ? "true" : "false");
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
         gPreviewTaskId = taskId;

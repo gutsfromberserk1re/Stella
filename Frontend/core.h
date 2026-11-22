@@ -104,6 +104,7 @@ static double gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs, gPerfBackendMs, gPerfUp
 static double gPerfFrameIntervalMs, gPerfLastShownAt, gPerfDisplayFps, gPerfFpsWindowAt;
 static int    gPerfShownInWindow;
 static double gPerfRingDepth;
+static double gPerfHwDecode; /* 1 when the last shown frame came from a hardware decoder */
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;
 static Texture2D gPreviewFrame;
 static uint8_t *gPreviewPixels;

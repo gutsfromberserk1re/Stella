@@ -45,6 +45,11 @@ static PREVIEW_PROXY_CLIPS: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_ORIGINAL_CLIPS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
+/// Latest timeline as an immutable `Arc`. Preview requests used to clone the
+/// whole timeline, serialize it to JSON on the UI thread, and re-parse it on the
+/// worker for *every frame*. Now the snapshot is rebuilt only when the timeline
+/// actually changed, and playback frames just clone the `Arc`.
+static PREVIEW_SNAPSHOT: OnceLock<Mutex<Option<Arc<Timeline>>>> = OnceLock::new();
 
 struct PreviewFrame {
     request_id: u64,
@@ -136,6 +141,11 @@ struct DecodeTask {
     sources: Vec<DecodeSource>,
     fps: f64,
     max_width: u32,
+    /// Decode ahead only while the transport is playing (Yoru's worker idles
+    /// when paused/scrubbing); look-ahead during a scrub only delays the next seek.
+    prefetch: bool,
+    /// Explicit frame-step (arrow keys): cache the frames before a seek target.
+    stepping: bool,
 }
 
 struct DecodeBatch {
@@ -145,8 +155,9 @@ struct DecodeBatch {
 }
 
 /// Yoru-style decode worker: FFmpeg decoder contexts stay on one dedicated
-/// thread, the current frame is returned immediately, then a tiny two-frame
-/// look-ahead is filled while the GPU compositor renders the current frame.
+/// thread, the current frame is returned immediately, then a small look-ahead
+/// (Yoru's VIDEO_QUEUE depth, 3 frames) is filled while the GPU compositor
+/// renders the current frame. Look-ahead runs only during playback.
 /// The request/reply channel is bounded so rapid seeks cannot build a backlog.
 struct DecodeAheadWorker {
     requests: mpsc::SyncSender<DecodeTask>,
@@ -185,7 +196,7 @@ fn decode_ahead_loop(
 
         let decode_started = Instant::now();
         let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
-            .map(|source| pool.frame_at(&source.path, source.source_time, task.max_width))
+            .map(|source| pool.frame_at(&source.path, source.source_time, task.max_width, task.stepping))
             .collect();
         let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
         let Ok(frames) = current else {
@@ -206,9 +217,13 @@ fn decode_ahead_loop(
         prefetched_from_previous = 0;
 
         let mut prefetched = 0usize;
-        'prefetch: for step in 1..=2 {
-            let ahead_seconds = step as f64 / task.fps.max(1.0);
+        'prefetch: for step in 1..=PREFETCH_FRAMES {
+            if !task.prefetch { break; }
             for source in &task.sources {
+                // Step in *source* frames (Yoru's queue counts decoded frames); at a 60 fps
+                // preview over 30 fps footage, timeline-fps steps only covered half as far.
+                let source_fps = pool.frame_rate_of(&source.path).unwrap_or(task.fps).max(1.0);
+                let ahead_seconds = step as f64 / source_fps;
                 // A new seek/playback request takes priority over warming old frames.
                 match requests.try_recv() {
                     Ok(next) => { pending = Some(next); break 'prefetch; }
@@ -216,7 +231,7 @@ fn decode_ahead_loop(
                     Err(TryRecvError::Empty) => {}
                 }
                 if ahead_seconds >= source.remaining { continue; }
-                if pool.frame_at(&source.path, source.source_time + ahead_seconds, task.max_width).is_ok() {
+                if pool.frame_at(&source.path, source.source_time + ahead_seconds, task.max_width, false).is_ok() {
                     prefetched += 1;
                 }
             }
@@ -227,6 +242,9 @@ fn decode_ahead_loop(
         prefetched_from_previous = prefetched;
     }
 }
+
+/// Frames decoded ahead of the playhead during playback (Yoru: VIDEO_QUEUE = 3).
+const PREFETCH_FRAMES: usize = 3;
 
 struct PreviewEngine {
     stream: Option<PreviewStream>,
@@ -367,6 +385,7 @@ fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview
             Ok((width, height, at)) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
                 "width":width,"height":height,"at":at,"queueMs":queue_ms,
                 "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
+                "hwDecode":decoder::last_frame_was_hardware() as u8,
                 "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),"proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),"originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
@@ -964,6 +983,8 @@ impl PreviewEngine {
         height: u32,
         request_id: u64,
         fps: u32,
+        playing: bool,
+        stepping: bool,
         decode_ms: &mut f64,
         ring_depth: &mut usize,
     ) -> Result<Option<(u32, u32, f64)>, String> {
@@ -1043,6 +1064,8 @@ impl PreviewEngine {
             sources,
             fps: fps as f64,
             max_width: max_source_width,
+            prefetch: playing,
+            stepping,
         }) {
             Ok(batch) => batch,
             Err(error) => {
@@ -1083,7 +1106,15 @@ impl PreviewEngine {
         let mut decode_ms = 0.0;
         let mut ring_depth = 0usize;
         let result = (|| -> Result<(u32, u32, f64), String> {
-            let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
+            let timeline: Arc<Timeline> = if request["useSnapshot"].as_bool() == Some(true) {
+                PREVIEW_SNAPSHOT.get()
+                    .and_then(|slot| slot.lock().ok().and_then(|slot| slot.clone()))
+                    .ok_or("Preview timeline snapshot is unavailable")?
+            } else {
+                Arc::new(serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?)
+            };
+            let playing = request["playing"].as_bool().unwrap_or(false);
+            let stepping = request["stepping"].as_bool().unwrap_or(false);
             let at = request["at"].as_f64().filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
             let height = request["height"].as_u64().unwrap_or(720).clamp(240, 1080) as u32;
             let width = ((height as f64 * 16.0 / 9.0).round() as u32) & !1;
@@ -1094,11 +1125,11 @@ impl PreviewEngine {
             // Most playback frames now use persistent in-process decoders and
             // Stella's GPU compositor. Complex/unsupported cases retain the
             // old FFmpeg graph path as a correctness fallback.
-            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, fps, &mut decode_ms, &mut ring_depth)? {
+            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, fps, playing, stepping, &mut decode_ms, &mut ring_depth)? {
                 return Ok(native);
             }
 
-            let mut preview_timeline = timeline;
+            let mut preview_timeline = (*timeline).clone();
             preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));
             let (mut proxied, mut originals) = (0u64, 0u64);
             for clip in &mut preview_timeline.clips {
@@ -1484,7 +1515,27 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             request["submittedAtMs"] = json!(now_ms);
         }
-        if matches!(command.as_str(), "preview_frame" | "export_project") && request["timeline"].is_null() {
+        if is_preview && request["timeline"].is_null() {
+            let snapshot_ready = match backend.timeline.lock() {
+                Ok(timeline) => {
+                    let slot = PREVIEW_SNAPSHOT.get_or_init(|| Mutex::new(None));
+                    match slot.lock() {
+                        Ok(mut slot) => {
+                            // Rebuild only when the timeline really changed; this is a plain
+                            // structural compare, with no serialization or allocation.
+                            if !slot.as_ref().is_some_and(|snapshot| **snapshot == *timeline) {
+                                *slot = Some(Arc::new(timeline.clone()));
+                            }
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            };
+            if !snapshot_ready { backend.preview_inflight.store(false, Ordering::Release); return 0; }
+            request["useSnapshot"] = json!(true);
+        } else if matches!(command.as_str(), "preview_frame" | "export_project") && request["timeline"].is_null() {
             let timeline = match backend.timeline.lock() {
                 Ok(timeline) => timeline.clone(),
                 Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }

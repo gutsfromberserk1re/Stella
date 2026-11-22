@@ -4,8 +4,9 @@
 /* ------------------------------------------------------------------ */
 static const char *Timecode(float seconds) {
     if (seconds < 0.f) seconds = 0.f;
-    int frame = (int)floorf(seconds * 30.f + .5f);
-    int whole = frame / 30, frames = frame % 30;
+    const int fps = gPreviewFps > 0 ? gPreviewFps : 30;
+    int frame = (int)floorf(seconds * (float)fps + .5f);
+    int whole = frame / fps, frames = frame % fps;
     return Fmt("%02d:%02d:%02d:%02d", whole / 3600, (whole / 60) % 60, whole % 60, frames);
 }
 
@@ -58,7 +59,7 @@ static void CenterPanel(void) {
             }
             CLAY(CLAY_ID("TransC"), {.layout = {.sizing = {FIT, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
                 if (IconBtn(CLAY_ID("SkipB"), I_SKIP_B, 32, 16, C_DIM, false, 16)) { gPlayhead = 0.f; gPreviewDirty = true; }
-                if (IconBtn(CLAY_ID("PrevF"), I_CHEV_L, 28, 14, C_DIM, false, 14)) { gPlayhead = fmaxf(0.f, gPlayhead - 1.f / 30.f); gPreviewDirty = true; }
+                if (IconBtn(CLAY_ID("PrevF"), I_CHEV_L, 28, 14, C_DIM, false, 14)) { gPlayhead = fmaxf(0.f, gPlayhead - 1.f / (float)fmaxf(1, gPreviewFps)); gPreviewDirty = true; }
                 Clay_ElementId pid = CLAY_ID("Play");
                 Bs b = Interact(pid);
                 if (b.clicked) gTimelinePlaying = !gTimelinePlaying;
@@ -69,7 +70,7 @@ static void CenterPanel(void) {
                         Icon(gTimelinePlaying ? I_PAUSE : I_PLAY, 18, RGB(12, 12, 14));
                     }
                 }
-                if (IconBtn(CLAY_ID("NextF"), I_CHEV_R, 28, 14, C_DIM, false, 14)) { gPlayhead = fminf(TimelineDuration(), gPlayhead + 1.f / 30.f); gPreviewDirty = true; }
+                if (IconBtn(CLAY_ID("NextF"), I_CHEV_R, 28, 14, C_DIM, false, 14)) { gPlayhead = fminf(TimelineDuration(), gPlayhead + 1.f / (float)fmaxf(1, gPreviewFps)); gPreviewDirty = true; }
                 if (IconBtn(CLAY_ID("SkipF"), I_SKIP_F, 32, 16, C_DIM, false, 16)) { gPlayhead = TimelineDuration(); gPreviewDirty = true; }
             }
             CLAY(CLAY_ID("TransR"), {.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_CENTER}}}) {

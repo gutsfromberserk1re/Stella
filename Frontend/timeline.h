@@ -532,7 +532,7 @@ static void Timeline(void) {
         Clay_BoundingBox bb = Clay_GetElementData(CLAY_ID("Ruler")).boundingBox;
         if (bb.width > 0.f) {
             float seconds = fmaxf(0.f, (mouse.x - bb.x - gTimelinePan) / pps);
-            gPlayhead = floorf(seconds * 30.f + .5f) / 30.f;
+            { const float scrubFps = (float)fmaxf(1, gPreviewFps); gPlayhead = floorf(seconds * scrubFps + .5f) / scrubFps; }
             gPreviewDirty = true;
         }
     }

@@ -8,12 +8,16 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc, OnceLock,
+    },
 };
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{
     codec,
+    ffi,
     format,
     frame,
     media::Type,
@@ -28,6 +32,19 @@ const MAX_CACHED_FRAME_BYTES: usize = 128 * 1024 * 1024;
 // let the frame cache serve recently visited media after decoder eviction.
 const MAX_OPEN_DECODERS: usize = 6;
 const SEEK_REUSE_WINDOW_SECONDS: f64 = 1.25;
+/// Frames converted *before* a step-seek target so repeated reverse frame
+/// steps are served from the cache instead of re-seeking to a keyframe
+/// (ported from Yoru's `Player::past` history).
+const STEP_HISTORY_FRAMES: usize = 8;
+/// Prefix on errors that mean "the hardware decode path failed", so the
+/// decoder can reopen itself in software instead of failing the preview.
+const HW_ERROR_PREFIX: &str = "Hardware decode failed";
+
+/// True when the most recent converted frame came from a hardware decoder
+/// (reported in the F3 overlay so HW vs SW decode is visible).
+static LAST_FRAME_HW: AtomicBool = AtomicBool::new(false);
+
+pub fn last_frame_was_hardware() -> bool { LAST_FRAME_HW.load(Relaxed) }
 
 static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -54,8 +71,14 @@ struct FrameKey {
 }
 
 struct VideoDecoder {
+    path: String,
     input: format::context::Input,
     decoder: ffmpeg::decoder::Video,
+    /// Kept alive for the lifetime of the decoder because `AVCodecContext::opaque`
+    /// points at it. Declared after `decoder` so the decoder drops first.
+    hw_callback_state: Option<Box<AtomicBool>>,
+    /// Reusable system-memory target for `av_hwframe_transfer_data()`.
+    hw_transfer: frame::Video,
     stream_index: usize,
     time_base: Rational,
     frame_rate: f64,
@@ -66,8 +89,190 @@ struct VideoDecoder {
     max_width: u32,
 }
 
+// ---- Hardware decode (ported from Yoru) ------------------------------------
+// Tries CUDA/NVDEC, then D3D11VA, then DXVA2. If the device or codec has no
+// matching configuration, nothing is changed and FFmpeg decodes in software.
+#[cfg(windows)]
+fn configure_hardware_decoder(
+    context: &mut codec::context::Context,
+    callback_state: &mut Option<Box<AtomicBool>>,
+) -> bool {
+    use ffi::AVHWDeviceType;
+
+    let candidates = [
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, "CUDA"),
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, "D3D11VA"),
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2, "DXVA2"),
+    ];
+    unsafe {
+        let codec_ctx = context.as_mut_ptr();
+        let decoder = if !(*codec_ctx).codec.is_null() {
+            (*codec_ctx).codec
+        } else {
+            ffi::avcodec_find_decoder((*codec_ctx).codec_id)
+        };
+        if decoder.is_null() {
+            return false;
+        }
+        for (device_type, name) in candidates {
+            let mut index = 0;
+            let mut supported = false;
+            loop {
+                let config = ffi::avcodec_get_hw_config(decoder, index);
+                if config.is_null() {
+                    break;
+                }
+                if (*config).device_type == device_type && ((*config).methods & 1) != 0 {
+                    supported = true; // AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX
+                    break;
+                }
+                index += 1;
+            }
+            if !supported {
+                continue;
+            }
+            let mut device_ref = std::ptr::null_mut();
+            let result = ffi::av_hwdevice_ctx_create(
+                &mut device_ref,
+                device_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if result < 0 || device_ref.is_null() {
+                continue;
+            }
+            // AVCodecContext owns this reference after assignment.
+            (*codec_ctx).hw_device_ctx = device_ref;
+            let mut state = Box::new(AtomicBool::new(false));
+            (*codec_ctx).opaque = (&mut *state as *mut AtomicBool).cast();
+            (*codec_ctx).get_format = Some(select_hardware_pixel_format);
+            (*codec_ctx).extra_hw_frames = 8;
+            *callback_state = Some(state);
+            eprintln!("Stella: trying {name} hardware decoding");
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn configure_hardware_decoder(
+    _context: &mut codec::context::Context,
+    _callback_state: &mut Option<Box<AtomicBool>>,
+) -> bool {
+    false
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn select_hardware_pixel_format(
+    context: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    use ffi::{AVHWDeviceType, AVPixelFormat};
+    if context.is_null() || formats.is_null() {
+        return AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    let wanted = unsafe {
+        let device_ref = (*context).hw_device_ctx;
+        if device_ref.is_null() || (*device_ref).data.is_null() {
+            AVPixelFormat::AV_PIX_FMT_NONE
+        } else {
+            let device = &*((*device_ref).data.cast::<ffi::AVHWDeviceContext>());
+            match device.type_ {
+                AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => AVPixelFormat::AV_PIX_FMT_CUDA,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA => AVPixelFormat::AV_PIX_FMT_D3D11,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2 => AVPixelFormat::AV_PIX_FMT_DXVA2_VLD,
+                _ => AVPixelFormat::AV_PIX_FMT_NONE,
+            }
+        }
+    };
+    // FFmpeg re-invokes get_format after a failed hardware init; the flag lets
+    // the second call fall through to a software format.
+    let retrying_after_hw_failure = unsafe {
+        !(*context).opaque.is_null()
+            && (*((*context).opaque.cast::<AtomicBool>())).swap(true, Relaxed)
+    };
+    let mut current = formats;
+    let mut first_software = AVPixelFormat::AV_PIX_FMT_NONE;
+    unsafe {
+        while *current != AVPixelFormat::AV_PIX_FMT_NONE {
+            let value = *current;
+            if value == wanted && !retrying_after_hw_failure {
+                return value;
+            }
+            let is_hardware = matches!(value,
+                AVPixelFormat::AV_PIX_FMT_CUDA |
+                AVPixelFormat::AV_PIX_FMT_D3D11 |
+                AVPixelFormat::AV_PIX_FMT_DXVA2_VLD |
+                AVPixelFormat::AV_PIX_FMT_D3D11VA_VLD
+            );
+            if !is_hardware && first_software == AVPixelFormat::AV_PIX_FMT_NONE {
+                first_software = value;
+            }
+            current = current.add(1);
+        }
+        if first_software != AVPixelFormat::AV_PIX_FMT_NONE { first_software } else { *formats }
+    }
+}
+
+/// Hardware decode is worth its GPU->CPU readback on large frames (1080p and
+/// up). Smaller sources decode fast enough in software. `STELLA_HWDEC=1|0`
+/// forces it on/off for A/B testing.
+fn hw_decode_wanted(coded_width: u32) -> bool {
+    match std::env::var("STELLA_HWDEC").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => coded_width >= 1920,
+    }
+}
+
+/// Hardware frames are opaque device surfaces. Copy them to a reusable system
+/// memory frame (NV12 / P010, both handled by the converter below). Software
+/// frames are returned untouched.
+fn to_software<'a>(decoded: &'a frame::Video, scratch: &'a mut frame::Video) -> Result<&'a frame::Video, String> {
+    if !matches!(decoded.format(), Pixel::CUDA | Pixel::D3D11 | Pixel::DXVA2_VLD) {
+        return Ok(decoded);
+    }
+    let fail = |what: &str| format!("{HW_ERROR_PREFIX}: {what}");
+    unsafe {
+        let src = decoded.as_ptr();
+        let frames_ref = (*src).hw_frames_ctx;
+        if frames_ref.is_null() || (*frames_ref).data.is_null() {
+            return Err(fail("frame has no hardware frames context"));
+        }
+        let frames = &*((*frames_ref).data.cast::<ffi::AVHWFramesContext>());
+        let sw_format = frames.sw_format;
+        if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            return Err(fail("unknown software surface format"));
+        }
+        let dst = scratch.as_mut_ptr();
+        let needs_reallocation = (*dst).buf[0].is_null()
+            || (*dst).format != sw_format as i32
+            || (*dst).width != (*src).width
+            || (*dst).height != (*src).height;
+        if needs_reallocation {
+            ffi::av_frame_unref(dst);
+            (*dst).format = sw_format as i32;
+        }
+        if ffi::av_hwframe_transfer_data(dst, src, 0) < 0 {
+            // A driver may change allocation requirements after a format change.
+            ffi::av_frame_unref(dst);
+            (*dst).format = sw_format as i32;
+            if ffi::av_hwframe_transfer_data(dst, src, 0) < 0 {
+                return Err(fail("surface transfer to system memory failed"));
+            }
+        }
+    }
+    Ok(&*scratch)
+}
+
 impl VideoDecoder {
     fn open(path: &str, max_width: u32) -> Result<Self, String> {
+        Self::open_with(path, max_width, true)
+    }
+
+    fn open_with(path: &str, max_width: u32, allow_hardware: bool) -> Result<Self, String> {
         ensure_ffmpeg()?;
         if !Path::new(path).is_file() {
             return Err(format!("Media file is missing: {path}"));
@@ -75,7 +280,7 @@ impl VideoDecoder {
 
         let input = format::input(path)
             .map_err(|error| format!("Could not open video source '{path}': {error}"))?;
-        let (stream_index, time_base, frame_rate, decoder) = {
+        let (stream_index, time_base, frame_rate, decoder, hw_callback_state) = {
             let stream = input
                 .streams()
                 .best(Type::Video)
@@ -87,16 +292,37 @@ impl VideoDecoder {
             let fps = if fps.is_finite() && fps > 0.1 && fps < 1000.0 { fps } else { 30.0 };
             let mut context = codec::context::Context::from_parameters(stream.parameters())
                 .map_err(|error| format!("Could not read video stream parameters: {error}"))?;
-            // Match Yoru's frame-threaded decoder setup. It lets FFmpeg parallelise
-            // codecs such as H.264/HEVC instead of leaving the preview worker on one core.
+            // Frame-threaded decode lets FFmpeg parallelise H.264/HEVC across cores.
             context.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
-            let decoder = context.decoder().video()
-                .map_err(|error| format!("Could not initialize video decoder: {error}"))?;
-            (stream_index, time_base, fps, decoder)
+            let coded_width = unsafe { (*context.as_ptr()).width }.max(0) as u32;
+            let mut hw_callback_state = None;
+            let hw_configured = allow_hardware
+                && hw_decode_wanted(coded_width)
+                && configure_hardware_decoder(&mut context, &mut hw_callback_state);
+            let decoder = match context.decoder().video() {
+                Ok(decoder) => decoder,
+                Err(hw_error) if hw_configured => {
+                    // A driver may create a device but fail while the codec
+                    // initialises it. Re-open from the original stream
+                    // parameters without hardware rather than failing.
+                    eprintln!("Stella: hardware decoder init failed for {path} ({hw_error}); using software");
+                    hw_callback_state = None;
+                    let mut fallback = codec::context::Context::from_parameters(stream.parameters())
+                        .map_err(|error| format!("Could not read video stream parameters: {error}"))?;
+                    fallback.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
+                    fallback.decoder().video()
+                        .map_err(|error| format!("Could not initialize video decoder: {error}"))?
+                }
+                Err(error) => return Err(format!("Could not initialize video decoder: {error}")),
+            };
+            (stream_index, time_base, fps, decoder, hw_callback_state)
         };
         Ok(Self {
+            path: path.to_owned(),
             input,
             decoder,
+            hw_callback_state,
+            hw_transfer: frame::Video::empty(),
             stream_index,
             time_base,
             frame_rate,
@@ -105,10 +331,29 @@ impl VideoDecoder {
         })
     }
 
+    fn hardware_in_use(&self) -> bool { self.hw_callback_state.is_some() }
+
+    /// Move a decoded frame into system memory if needed, then convert + scale it
+    /// to preview RGBA in a single pass.
+    fn convert(&mut self, decoded: &frame::Video, pts_seconds: f64) -> Result<DecodedFrame, String> {
+        let max_width = self.max_width;
+        let software = to_software(decoded, &mut self.hw_transfer)?;
+        LAST_FRAME_HW.store(!std::ptr::eq(software, decoded), Relaxed);
+        convert_frame_to_rgba(software, pts_seconds, max_width)
+    }
+
     fn seek(&mut self, seconds: f64) -> Result<(), String> {
         let timestamp = (seconds.max(0.0) * 1_000_000.0).round() as i64;
-        self.input.seek(timestamp, ..timestamp)
-            .map_err(|error| format!("Video seek failed: {error}"))?;
+        if let Err(error) = self.input.seek(timestamp, ..timestamp) {
+            // Some containers reject timestamp seeks. Reopen from the start and
+            // let the decode loop scan forward (discarding before conversion)
+            // instead of leaving the preview stuck at its old position (Yoru).
+            eprintln!("Stella: video seek to {seconds:.3}s failed for {} ({error}); reopening source", self.path);
+            let hardware = self.hardware_in_use();
+            let fresh = Self::open_with(&self.path, self.max_width, hardware)
+                .map_err(|reopen| format!("Video seek failed ({error}) and reopen failed ({reopen})"))?;
+            *self = fresh;
+        }
         self.input.clear_eof();
         self.decoder.flush();
         self.cursor_seconds = -1.0;
@@ -127,7 +372,7 @@ impl VideoDecoder {
                         while self.decoder.receive_frame(&mut decoded).is_ok() {
                             let timestamp = decoded.timestamp().or_else(|| decoded.pts())
                                 .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
-                            return convert_frame_to_rgba(&decoded, timestamp, self.max_width);
+                            return self.convert(&decoded, timestamp);
                         }
                     }
                 }
@@ -137,7 +382,7 @@ impl VideoDecoder {
                     while self.decoder.receive_frame(&mut decoded).is_ok() {
                         let timestamp = decoded.timestamp().or_else(|| decoded.pts())
                             .map(|pts| pts as f64 * f64::from(self.time_base)).unwrap_or(0.0);
-                        return convert_frame_to_rgba(&decoded, timestamp, self.max_width);
+                        return self.convert(&decoded, timestamp);
                     }
                     return Err("No video frame was available for this media thumbnail".into());
                 }
@@ -146,13 +391,34 @@ impl VideoDecoder {
         }
     }
 
-    fn decode_at(&mut self, target_seconds: f64) -> Result<DecodedFrame, String> {
+    /// Decode the frame at `target_seconds`. Frames before the target are
+    /// discarded *before* any pixel conversion. With `stepping`, the few frames
+    /// immediately before the target are converted and returned as history so
+    /// reverse frame-steps do not each pay for a keyframe seek.
+    fn decode_at(&mut self, target_seconds: f64, stepping: bool) -> Result<(DecodedFrame, Vec<DecodedFrame>), String> {
+        match self.decode_at_inner(target_seconds, stepping) {
+            Err(error) if self.hardware_in_use() && !error.starts_with("No decoded video frame") => {
+                // The hardware path misbehaved on this file; reopen in software
+                // and retry once (the new decoder never uses hardware).
+                eprintln!("Stella: {error}; falling back to software decode for {}", self.path);
+                let fresh = Self::open_with(&self.path, self.max_width, false)?;
+                *self = fresh;
+                self.decode_at_inner(target_seconds, stepping)
+            }
+            other => other,
+        }
+    }
+
+    fn decode_at_inner(&mut self, target_seconds: f64, stepping: bool) -> Result<(DecodedFrame, Vec<DecodedFrame>), String> {
         let target = target_seconds.max(0.0);
         let tolerance = (0.5 / self.frame_rate).max(0.002);
         let must_seek = self.cursor_seconds < 0.0
             || target + tolerance < self.cursor_seconds
             || target - self.cursor_seconds > SEEK_REUSE_WINDOW_SECONDS;
         if must_seek { self.seek(target)?; }
+        let keep_history = stepping && must_seek;
+        let history_start = target - STEP_HISTORY_FRAMES as f64 / self.frame_rate - tolerance;
+        let mut history: Vec<DecodedFrame> = Vec::new();
 
         let mut decoded = frame::Video::empty();
         let mut packet = ffmpeg::Packet::empty();
@@ -166,15 +432,27 @@ impl VideoDecoder {
                     .unwrap_or(target);
                 self.cursor_seconds = pts_seconds;
                 if pts_seconds + tolerance >= target {
-                    return convert_frame_to_rgba(&decoded, pts_seconds, self.max_width);
+                    let frame = self.convert(&decoded, pts_seconds)?;
+                    return Ok((frame, history));
+                }
+                if keep_history && pts_seconds >= history_start {
+                    if let Ok(frame) = self.convert(&decoded, pts_seconds) {
+                        history.push(frame);
+                        if history.len() > STEP_HISTORY_FRAMES { history.remove(0); }
+                    }
                 }
             }
 
             match packet.read(&mut self.input) {
                 Ok(()) => {
                     if packet.stream() == self.stream_index {
-                        self.decoder.send_packet(&packet)
-                            .map_err(|error| format!("Video packet decode failed: {error}"))?;
+                        if let Err(error) = self.decoder.send_packet(&packet) {
+                            if self.hardware_in_use() {
+                                return Err(format!("{HW_ERROR_PREFIX}: packet rejected ({error})"));
+                            }
+                            // A damaged software packet is skipped, like Yoru, so one bad
+                            // packet does not drop the whole preview to the slow fallback.
+                        }
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
@@ -186,7 +464,8 @@ impl VideoDecoder {
                             .unwrap_or(target);
                         self.cursor_seconds = pts_seconds;
                         if pts_seconds + tolerance >= target {
-                            return convert_frame_to_rgba(&decoded, pts_seconds, self.max_width);
+                            let frame = self.convert(&decoded, pts_seconds)?;
+                            return Ok((frame, history));
                         }
                     }
                     return Err(format!("No decoded video frame at {target:.3}s"));
@@ -195,7 +474,6 @@ impl VideoDecoder {
             }
         }
     }
-
 }
 
 /// Decode a single source frame in-process, downscale it to a small 16:9 bitmap,
@@ -206,7 +484,8 @@ pub fn write_thumbnail(path: &str, destination: &Path, target_width: u32, target
     if target_width == 0 || target_height == 0 {
         return Err("Thumbnail dimensions must be nonzero".into());
     }
-    let mut decoder = VideoDecoder::open(path, target_width)?;
+    // Software only: a one-off thumbnail is not worth creating a GPU decode device.
+    let mut decoder = VideoDecoder::open_with(path, target_width, false)?;
     let decoded = decoder.decode_first_frame()?;
     let thumbnail = resize_rgba_fit(&decoded, target_width, target_height)?;
     write_bmp24(destination, target_width, target_height, &thumbnail)
@@ -357,7 +636,7 @@ fn matrix_and_range(source: &frame::Video, height: u32) -> (f64, f64, bool) {
 }
 
 /// Split an RGBA image into row bands and fill them on all cores. Frames are converted
-/// on the preview worker, so this is what keeps 1080p decode-to-texture latency low.
+/// on the decode worker, so this is what keeps 1080p decode-to-texture latency low.
 fn par_rows(rgba: &mut [u8], width: usize, height: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
     let row_bytes = width * 4;
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(height.max(1));
@@ -376,130 +655,100 @@ fn par_rows(rgba: &mut [u8], width: usize, height: usize, f: impl Fn(usize, &mut
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn convert_planar(source: &frame::Video, width: usize, height: usize, rgba: &mut [u8],
-                  depth: u32, sx: usize, sy: usize, coef: Coef) {
-    let (yp, up, vp) = (source.data(0), source.data(1), source.data(2));
-    let (ys, us, vs) = (source.stride(0), source.stride(1), source.stride(2));
-    if depth == 8 {
-        par_rows(rgba, width, height, |y, row| {
-            let (yr, ur, vr) = (&yp[y * ys..], &up[(y >> sy) * us..], &vp[(y >> sy) * vs..]);
-            for x in 0..width {
-                let rgb = coef.rgb(yr[x] as i64, ur[x >> sx] as i64, vr[x >> sx] as i64);
-                row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            }
-        });
-    } else {
-        par_rows(rgba, width, height, |y, row| {
-            let (yo, uo, vo) = (y * ys, (y >> sy) * us, (y >> sy) * vs);
-            for x in 0..width {
-                let rgb = coef.rgb(read_u16_le(yp, yo + x * 2) as i64,
-                                   read_u16_le(up, uo + (x >> sx) * 2) as i64,
-                                   read_u16_le(vp, vo + (x >> sx) * 2) as i64);
-                row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            }
-        });
-    }
+/// Preview size for a decoded frame: never upscales, keeps the aspect ratio and
+/// uses even dimensions when it has to shrink.
+fn scaled_size(source_width: u32, source_height: u32, max_width: u32) -> (u32, u32) {
+    if source_width <= max_width { return (source_width, source_height); }
+    let out_width = (max_width & !1).max(2);
+    let out_height = (((source_height as u64 * out_width as u64 + source_width as u64 / 2)
+        / source_width as u64) as u32 & !1).max(2);
+    (out_width, out_height)
 }
 
-/// NV12 / NV21 (8-bit) and P010LE (10-bit, stored in the high bits of 16).
-fn convert_semi_planar(source: &frame::Video, width: usize, height: usize, rgba: &mut [u8],
-                       swap_uv: bool, high_bit_depth: bool, coef: Coef) {
-    let (yp, uvp) = (source.data(0), source.data(1));
-    let (ys, uvs) = (source.stride(0), source.stride(1));
-    par_rows(rgba, width, height, |y, row| {
-        for x in 0..width {
-            let (yy, u, v);
-            if high_bit_depth {
-                yy = (read_u16_le(yp, y * ys + x * 2) >> 6) as i64;
-                let o = (y >> 1) * uvs + (x >> 1) * 4;
-                u = (read_u16_le(uvp, o) >> 6) as i64;
-                v = (read_u16_le(uvp, o + 2) >> 6) as i64;
-            } else {
-                yy = yp[y * ys + x] as i64;
-                let o = (y >> 1) * uvs + (x & !1);
-                let (a, b) = (uvp[o] as i64, uvp[o + 1] as i64);
-                if swap_uv { u = b; v = a; } else { u = a; v = b; }
+/// Integer box edges mapping `dst` output samples onto `src` source samples
+/// (`dst <= src`). Every box holds at least one source sample.
+fn box_edges(src: usize, dst: usize) -> Vec<usize> {
+    (0..=dst).map(|i| i * src / dst.max(1)).collect()
+}
+
+/// Chroma sample range covering the luma range `[a, b)` for a plane subsampled by `shift` bits.
+#[inline(always)]
+fn chroma_range(a: usize, b: usize, shift: usize) -> (usize, usize) {
+    let start = a >> shift;
+    let end = ((b + (1 << shift) - 1) >> shift).max(start + 1);
+    (start, end)
+}
+
+/// Fused YCbCr -> RGBA conversion and area downscale in ONE pass.
+///
+/// The previous pipeline converted every source pixel to RGBA at full size and
+/// then ran a floating-point box filter over the result, so a 1080p frame cost
+/// ~2M colour conversions plus ~8M f64 multiplies before it ever reached the
+/// GPU. Averaging in YCbCr space (the RGB matrix is linear) and converting once
+/// per *output* pixel gives the same area-averaged image for a quarter of the
+/// conversions and no float work. `luma`/`chroma` read raw plane samples, so the
+/// same loop serves planar, semi-planar and high-bit-depth layouts.
+#[allow(clippy::too_many_arguments)]
+fn scale_yuv_to_rgba<FY, FC>(
+    rgba: &mut [u8], src_w: usize, src_h: usize, out_w: usize, out_h: usize,
+    sx: usize, sy: usize, coef: Coef, luma: FY, chroma: FC,
+) where
+    FY: Fn(usize, usize) -> i64 + Sync,
+    FC: Fn(usize, usize) -> (i64, i64) + Sync,
+{
+    let xe = box_edges(src_w, out_w);
+    let ye = box_edges(src_h, out_h);
+    let (xe, ye) = (&xe[..], &ye[..]);
+    par_rows(rgba, out_w, out_h, |oy, row| {
+        let (y0, y1) = (ye[oy], ye[oy + 1]);
+        let (cy0, cy1) = chroma_range(y0, y1, sy);
+        for ox in 0..out_w {
+            let (x0, x1) = (xe[ox], xe[ox + 1]);
+            let (cx0, cx1) = chroma_range(x0, x1, sx);
+            let mut y_sum = 0i64;
+            for yy in y0..y1 { for xx in x0..x1 { y_sum += luma(xx, yy); } }
+            let y_n = ((y1 - y0) * (x1 - x0)) as i64;
+            let (mut u_sum, mut v_sum) = (0i64, 0i64);
+            for cy in cy0..cy1 {
+                for cx in cx0..cx1 {
+                    let (u, v) = chroma(cx, cy);
+                    u_sum += u;
+                    v_sum += v;
+                }
             }
-            let rgb = coef.rgb(yy, u, v);
-            row[x * 4..x * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            let c_n = ((cy1 - cy0) * (cx1 - cx0)) as i64;
+            let rgb = coef.rgb((y_sum + y_n / 2) / y_n, (u_sum + c_n / 2) / c_n, (v_sum + c_n / 2) / c_n);
+            row[ox * 4..ox * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     });
 }
 
-/// Area-average downsample packed RGBA to a maximum width. This mirrors the
-/// half-resolution decode path used by Yoru: at a 480p monitor setting, Stella
-/// keeps a 960x540 source image and lets the compositor make the final small
-/// reduction. The area filter avoids the aliasing produced by sampling a 1080p
-/// texture directly at 480p, while sharply reducing upload/cache bandwidth.
-fn downsample_rgba_box(
-    source: Vec<u8>,
-    source_width: u32,
-    source_height: u32,
-    max_width: u32,
-) -> Result<(u32, u32, Vec<u8>), String> {
-    if source_width == 0 || source_height == 0 || max_width == 0 {
-        return Err("Preview frame dimensions must be nonzero".into());
-    }
-    let expected = (source_width as usize)
-        .checked_mul(source_height as usize)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| "Preview frame dimensions overflowed".to_owned())?;
-    if source.len() != expected {
-        return Err(format!("Decoded frame has {} bytes; expected {expected}", source.len()));
-    }
-    if source_width <= max_width {
-        return Ok((source_width, source_height, source));
-    }
-
-    let out_width = (max_width & !1).max(2);
-    let out_height = (((source_height as u64 * out_width as u64 + source_width as u64 / 2)
-        / source_width as u64) as u32 & !1).max(2);
-    let out_len = (out_width as usize)
-        .checked_mul(out_height as usize)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| "Scaled preview frame dimensions overflowed".to_owned())?;
-    let mut output = vec![0u8; out_len];
-    let sx = source_width as f64 / out_width as f64;
-    let sy = source_height as f64 / out_height as f64;
-    let source_stride = source_width as usize * 4;
-    let output_stride = out_width as usize * 4;
-
-    for y in 0..out_height as usize {
-        let y0 = y as f64 * sy;
-        let y1 = (y + 1) as f64 * sy;
-        let iy0 = y0.floor() as usize;
-        let iy1 = (y1.ceil() as usize).min(source_height as usize);
-        for x in 0..out_width as usize {
-            let x0 = x as f64 * sx;
-            let x1 = (x + 1) as f64 * sx;
-            let ix0 = x0.floor() as usize;
-            let ix1 = (x1.ceil() as usize).min(source_width as usize);
-            let mut sums = [0.0f64; 4];
-            let mut total = 0.0f64;
-            for iy in iy0..iy1 {
-                let wy = (y1.min(iy as f64 + 1.0) - y0.max(iy as f64)).max(0.0);
-                if wy <= 0.0 { continue; }
-                for ix in ix0..ix1 {
-                    let wx = (x1.min(ix as f64 + 1.0) - x0.max(ix as f64)).max(0.0);
-                    let weight = wx * wy;
-                    if weight <= 0.0 { continue; }
-                    let at = iy * source_stride + ix * 4;
-                    for channel in 0..4 {
-                        sums[channel] += source[at + channel] as f64 * weight;
-                    }
-                    total += weight;
+/// Packed RGB(A) sources: area-average each channel straight into the output size.
+fn scale_packed_to_rgba(
+    rgba: &mut [u8], src: &[u8], stride: usize, bytes_per_pixel: usize, order: [usize; 4],
+    src_w: usize, src_h: usize, out_w: usize, out_h: usize,
+) {
+    let xe = box_edges(src_w, out_w);
+    let ye = box_edges(src_h, out_h);
+    let (xe, ye) = (&xe[..], &ye[..]);
+    par_rows(rgba, out_w, out_h, |oy, row| {
+        let (y0, y1) = (ye[oy], ye[oy + 1]);
+        for ox in 0..out_w {
+            let (x0, x1) = (xe[ox], xe[ox + 1]);
+            let mut sums = [0u32; 4];
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let s = yy * stride + xx * bytes_per_pixel;
+                    sums[0] += src[s + order[0]] as u32;
+                    sums[1] += src[s + order[1]] as u32;
+                    sums[2] += src[s + order[2]] as u32;
+                    sums[3] += if bytes_per_pixel == 4 { src[s + order[3]] as u32 } else { 255 };
                 }
             }
-            let dst = y * output_stride + x * 4;
-            let denominator = total.max(1.0);
-            for channel in 0..4 {
-                output[dst + channel] = (sums[channel] / denominator)
-                    .round().clamp(0.0, 255.0) as u8;
-            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            for c in 0..4 { row[ox * 4 + c] = ((sums[c] + n / 2) / n) as u8; }
         }
-    }
-    Ok((out_width, out_height, output))
+    });
 }
 
 fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32) -> Result<DecodedFrame, String> {
@@ -507,38 +756,25 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32
     let height = source.height();
     if width == 0 || height == 0 { return Err("Decoder returned an empty video frame".into()); }
     let (w, h) = (width as usize, height as usize);
-    let mut rgba = vec![0u8; w * h * 4];
+    let (out_width, out_height) = scaled_size(width, height, max_width);
+    let (ow, oh) = (out_width as usize, out_height as usize);
+    let mut rgba = vec![0u8; ow * oh * 4];
     let pixel_format = source.format();
     let (kr, kb, tagged_full) = matrix_and_range(source, height);
 
     match pixel_format {
         Pixel::RGBA | Pixel::BGRA | Pixel::ARGB | Pixel::ABGR => {
-            let (src, stride) = (source.data(0), source.stride(0));
-            par_rows(&mut rgba, w, h, |y, row| {
-                let line = &src[y * stride..y * stride + w * 4];
-                for x in 0..w {
-                    let s = x * 4;
-                    let (r, g, b, a) = match pixel_format {
-                        Pixel::RGBA => (line[s], line[s + 1], line[s + 2], line[s + 3]),
-                        Pixel::BGRA => (line[s + 2], line[s + 1], line[s], line[s + 3]),
-                        Pixel::ARGB => (line[s + 1], line[s + 2], line[s + 3], line[s]),
-                        _ => (line[s + 3], line[s + 2], line[s + 1], line[s]),
-                    };
-                    row[s..s + 4].copy_from_slice(&[r, g, b, a]);
-                }
-            });
+            let order = match pixel_format {
+                Pixel::RGBA => [0, 1, 2, 3],
+                Pixel::BGRA => [2, 1, 0, 3],
+                Pixel::ARGB => [1, 2, 3, 0],
+                _ => [3, 2, 1, 0],
+            };
+            scale_packed_to_rgba(&mut rgba, source.data(0), source.stride(0), 4, order, w, h, ow, oh);
         }
         Pixel::RGB24 | Pixel::BGR24 => {
-            let (src, stride) = (source.data(0), source.stride(0));
-            let rgb_order = pixel_format == Pixel::RGB24;
-            par_rows(&mut rgba, w, h, |y, row| {
-                let line = &src[y * stride..y * stride + w * 3];
-                for x in 0..w {
-                    let s = x * 3;
-                    let (r, g, b) = if rgb_order { (line[s], line[s + 1], line[s + 2]) } else { (line[s + 2], line[s + 1], line[s]) };
-                    row[x * 4..x * 4 + 4].copy_from_slice(&[r, g, b, 255]);
-                }
-            });
+            let order = if pixel_format == Pixel::RGB24 { [0, 1, 2, 0] } else { [2, 1, 0, 0] };
+            scale_packed_to_rgba(&mut rgba, source.data(0), source.stride(0), 3, order, w, h, ow, oh);
         }
         Pixel::YUV420P | Pixel::YUVJ420P | Pixel::YUV422P | Pixel::YUVJ422P | Pixel::YUV444P | Pixel::YUVJ444P => {
             let (sx, sy, jpeg) = match pixel_format {
@@ -546,10 +782,25 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32
                 Pixel::YUV422P => (1, 0, false), Pixel::YUVJ422P => (1, 0, true),
                 Pixel::YUV444P => (0, 0, false), _ => (0, 0, true),
             };
-            convert_planar(source, w, h, &mut rgba, 8, sx, sy, Coef::new(8, jpeg || tagged_full, kr, kb));
+            let coef = Coef::new(8, jpeg || tagged_full, kr, kb);
+            let (yp, up, vp) = (source.data(0), source.data(1), source.data(2));
+            let (ys, us, vs) = (source.stride(0), source.stride(1), source.stride(2));
+            scale_yuv_to_rgba(&mut rgba, w, h, ow, oh, sx, sy, coef,
+                |x, y| yp[y * ys + x] as i64,
+                |cx, cy| (up[cy * us + cx] as i64, vp[cy * vs + cx] as i64));
         }
         Pixel::NV12 | Pixel::NV21 => {
-            convert_semi_planar(source, w, h, &mut rgba, pixel_format == Pixel::NV21, false, Coef::new(8, tagged_full, kr, kb));
+            let swap = pixel_format == Pixel::NV21;
+            let coef = Coef::new(8, tagged_full, kr, kb);
+            let (yp, uvp) = (source.data(0), source.data(1));
+            let (ys, uvs) = (source.stride(0), source.stride(1));
+            scale_yuv_to_rgba(&mut rgba, w, h, ow, oh, 1, 1, coef,
+                |x, y| yp[y * ys + x] as i64,
+                |cx, cy| {
+                    let o = cy * uvs + cx * 2;
+                    let (a, b) = (uvp[o] as i64, uvp[o + 1] as i64);
+                    if swap { (b, a) } else { (a, b) }
+                });
         }
         Pixel::YUV420P9LE | Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P16LE
         | Pixel::YUV422P9LE | Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P16LE
@@ -565,16 +816,28 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32
                 Pixel::YUV422P9LE | Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P16LE => (1, 0),
                 _ => (0, 0),
             };
-            convert_planar(source, w, h, &mut rgba, depth, sx, sy, Coef::new(depth, tagged_full, kr, kb));
+            let coef = Coef::new(depth, tagged_full, kr, kb);
+            let (yp, up, vp) = (source.data(0), source.data(1), source.data(2));
+            let (ys, us, vs) = (source.stride(0), source.stride(1), source.stride(2));
+            scale_yuv_to_rgba(&mut rgba, w, h, ow, oh, sx, sy, coef,
+                |x, y| read_u16_le(yp, y * ys + x * 2) as i64,
+                |cx, cy| (read_u16_le(up, cy * us + cx * 2) as i64, read_u16_le(vp, cy * vs + cx * 2) as i64));
         }
         Pixel::P010LE => {
-            convert_semi_planar(source, w, h, &mut rgba, false, true, Coef::new(10, tagged_full, kr, kb));
+            let coef = Coef::new(10, tagged_full, kr, kb);
+            let (yp, uvp) = (source.data(0), source.data(1));
+            let (ys, uvs) = (source.stride(0), source.stride(1));
+            scale_yuv_to_rgba(&mut rgba, w, h, ow, oh, 1, 1, coef,
+                |x, y| (read_u16_le(yp, y * ys + x * 2) >> 6) as i64,
+                |cx, cy| {
+                    let o = cy * uvs + cx * 4;
+                    ((read_u16_le(uvp, o) >> 6) as i64, (read_u16_le(uvp, o + 2) >> 6) as i64)
+                });
         }
         other => return Err(format!("Preview decoder does not yet convert pixel format {other:?}. Try generating a compatible proxy (8-bit RGB/YUV or supported 9/10/12/16-bit planar YUV and P010).")),
     }
 
-    let (width, height, rgba) = downsample_rgba_box(rgba, width, height, max_width)?;
-    Ok(DecodedFrame { width, height, pts_seconds, rgba: Arc::new(rgba) })
+    Ok(DecodedFrame { width: out_width, height: out_height, pts_seconds, rgba: Arc::new(rgba) })
 }
 
 #[derive(Default)]
@@ -600,7 +863,29 @@ impl DecoderPool {
         }
     }
 
-    pub fn frame_at(&mut self, path: &str, seconds: f64, max_width: u32) -> Result<DecodedFrame, String> {
+    /// Native frame rate of an already-opened source.
+    pub fn frame_rate_of(&self, path: &str) -> Option<f64> {
+        self.frame_rates.get(path).copied()
+    }
+
+    /// Insert one frame into the bounded cache (no-op if already present).
+    fn cache_insert(&mut self, key: FrameKey, frame: &DecodedFrame) {
+        if self.frames.contains_key(&key) { return; }
+        self.cached_bytes += frame.rgba.len();
+        self.frames.insert(key.clone(), frame.clone());
+        self.frame_order.push_back(key);
+        while self.cached_bytes > MAX_CACHED_FRAME_BYTES {
+            let Some(oldest) = self.frame_order.pop_front() else { break; };
+            if let Some(removed) = self.frames.remove(&oldest) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(removed.rgba.len());
+            }
+        }
+    }
+
+    /// `stepping` marks an explicit frame-step (arrow keys). Only then are the
+    /// frames just before a seek target converted and cached, so ordinary
+    /// timeline scrubbing keeps its cheap discard-before-convert path.
+    pub fn frame_at(&mut self, path: &str, seconds: f64, max_width: u32, stepping: bool) -> Result<DecodedFrame, String> {
         let max_width = max_width.max(2) & !1;
         // Check the frame cache before reopening a decoder. This matters when a
         // source was evicted from the small open-decoder pool but its pixels
@@ -643,18 +928,16 @@ impl DecoderPool {
             self.decoder_order.push_back(path.to_owned());
         }
 
-        let decoded = self.decoders.get_mut(path)
-            .ok_or("Video decoder cache lost its source")?.decode_at(seconds)?;
-        let frame_bytes = decoded.rgba.len();
-        self.frames.insert(key.clone(), decoded.clone());
-        self.frame_order.push_back(key);
-        self.cached_bytes += frame_bytes;
-        while self.cached_bytes > MAX_CACHED_FRAME_BYTES {
-            let Some(oldest) = self.frame_order.pop_front() else { break; };
-            if let Some(removed) = self.frames.remove(&oldest) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(removed.rgba.len());
+        let (decoded, history) = self.decoders.get_mut(path)
+            .ok_or("Video decoder cache lost its source")?.decode_at(seconds, stepping)?;
+        // History first so the requested frame ends up most-recently-used.
+        for earlier in &history {
+            let index = (earlier.pts_seconds.max(0.0) * frame_rate).round() as i64;
+            if index != frame_index {
+                self.cache_insert(FrameKey { path: path.to_owned(), index, max_width }, earlier);
             }
         }
+        self.cache_insert(key, &decoded);
         Ok(decoded)
     }
 }
@@ -688,5 +971,66 @@ mod thumbnail_tests {
         assert_eq!(u32::from_le_bytes(bytes[22..26].try_into().unwrap()), 4);
         assert_eq!(bytes.len(), 54 + 4 * 4 * 3);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod scaler_tests {
+    use super::*;
+
+    #[test]
+    fn scaled_size_never_upscales_and_stays_even() {
+        assert_eq!(scaled_size(1920, 1080, 960), (960, 540));
+        assert_eq!(scaled_size(3840, 2160, 960), (960, 540));
+        assert_eq!(scaled_size(640, 360, 960), (640, 360));
+        let (w, h) = scaled_size(1919, 1081, 854);
+        assert!(w % 2 == 0 && h % 2 == 0 && w <= 854);
+    }
+
+    #[test]
+    fn box_edges_cover_the_source_without_gaps_or_empty_boxes() {
+        let edges = box_edges(1080, 540);
+        assert_eq!(edges.len(), 541);
+        assert_eq!((edges[0], edges[540]), (0, 1080));
+        assert!(edges.windows(2).all(|pair| pair[1] > pair[0]));
+        let uneven = box_edges(1920, 854);
+        assert_eq!(*uneven.last().unwrap(), 1920);
+        assert!(uneven.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[test]
+    fn chroma_range_is_never_empty_and_stays_inside_the_plane() {
+        for shift in 0..=1usize {
+            for a in 0..8usize {
+                for b in (a + 1)..=9usize {
+                    let (start, end) = chroma_range(a, b, shift);
+                    assert!(end > start);
+                    assert!(end <= (9 + (1 << shift) - 1) >> shift);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_scaler_keeps_flat_colour_and_area_averages_luma() {
+        let coef = Coef::new(8, true, 0.2126, 0.0722);
+        let mut flat = vec![0u8; 2 * 2 * 4];
+        scale_yuv_to_rgba(&mut flat, 4, 4, 2, 2, 1, 1, coef, |_, _| 128, |_, _| (128, 128));
+        for pixel in flat.chunks_exact(4) {
+            assert_eq!(pixel.to_vec(), vec![128u8, 128, 128, 255]);
+        }
+        // Luma 0,60 | 120,180 over two rows: each 2x2 box averages to 30 and 150.
+        let mut ramp = vec![0u8; 2 * 4];
+        scale_yuv_to_rgba(&mut ramp, 4, 2, 2, 1, 1, 1, coef, |x, _| x as i64 * 60, |_, _| (128, 128));
+        assert_eq!((ramp[0], ramp[4]), (30, 150));
+    }
+
+    #[test]
+    fn packed_scaler_averages_channels() {
+        // 2x1 RGBA: pure red and pure blue average into one purple pixel.
+        let src = [255u8, 0, 0, 255, 0, 0, 255, 255];
+        let mut out = vec![0u8; 4];
+        scale_packed_to_rgba(&mut out, &src, 8, 4, [0, 1, 2, 3], 2, 1, 1, 1);
+        assert_eq!(out, vec![128u8, 0, 128, 255]);
     }
 }

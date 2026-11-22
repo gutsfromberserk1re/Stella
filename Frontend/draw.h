@@ -894,7 +894,7 @@ static void DrawPerfOverlay(void) {
     snprintf(line[2], sizeof(line[2]), "queue %.1f   setup %.1f   decode wait %.1f", gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs);
     snprintf(line[3], sizeof(line[3]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);
     snprintf(line[4], sizeof(line[4]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
-    snprintf(line[5], sizeof(line[5]), "F3 hides");
+    snprintf(line[5], sizeof(line[5]), "decode: %s   F3 hides", gPerfHwDecode >= .5 ? "HARDWARE" : "SOFTWARE");
     const int rows = 6; const float w = 420.f, h = 16.f * rows + 14.f;
     Rectangle box = {(float)GetScreenWidth() - w - 12.f, 44.f, w, h};
     DrawRectangleRec(box, (Color){0, 0, 0, 190});

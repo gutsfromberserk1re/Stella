@@ -406,9 +406,10 @@ int main(void) {
             }
         } else navigationRepeat = 0.f;
         if (navStep) {
-            float frame = floorf(gPlayhead * 30.f + .5f);
+            const float stepFps = (float)fmaxf(1, gPreviewFps);
+            float frame = floorf(gPlayhead * stepFps + .5f);
             frame += navLeft ? -1.f : 1.f;
-            gPlayhead = fmaxf(0.f, fminf(TimelineDuration(), frame / 30.f));
+            gPlayhead = fmaxf(0.f, fminf(TimelineDuration(), frame / stepFps));
             gPreviewDirty = true;
             gPreviewDebounce = 1.f;
         }
@@ -443,7 +444,7 @@ int main(void) {
         Clay_RenderCommandArray cmds = BuildUI();
         if (gPreviewDirty && !gPreviewTaskId) {
             gPreviewDebounce += gDt;
-            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying || gPreviewNavigating ? .016f : .075f)) {
+            if (gPreviewDebounce >= (gTimelineScrubbing || gTimelinePlaying || gPreviewNavigating ? 0.f : .075f)) {
                 if (PlutoRequestPreview()) { gPreviewDirty = false; gPreviewDebounce = 0.f; }
                 else { gPreviewDebounce = .045f; }
             }
