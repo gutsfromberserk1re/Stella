@@ -1680,49 +1680,116 @@ static void TextColorButton(int i) {
     Bs b = Interact(id);
     if (b.clicked) gTextColorIndex = i;
     Clay_Color color = {gStellaTextColors[i].r, gStellaTextColors[i].g, gStellaTextColors[i].b, 255};
+    bool sel = gTextColorIndex == i;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_C},
-              .backgroundColor = color, .cornerRadius = CLAY_CORNER_RADIUS(9),
-              .border = {.color = Mix(gTextColorIndex == i ? C_TEXT : RGB(52, 54, 61), RGB(255, 255, 255), gTextColorIndex == i ? .9f : b.hover * .25f),
-                         .width = CLAY_BORDER_OUTSIDE(gTextColorIndex == i ? 2 : 1)}}) {
-        if (gTextColorIndex == i)
+              .backgroundColor = color, .cornerRadius = CLAY_CORNER_RADIUS(10),
+              .border = {.color = Mix(sel ? C_TEXT : RGB(52, 54, 61), RGB(255, 255, 255), sel ? .9f : b.hover * .3f),
+                         .width = CLAY_BORDER_OUTSIDE(sel ? 2 : 1)}}) {
+        if (sel)
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = RGB(22, 23, 26), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
     }
 }
 
+/* Light primary button, same family as the Import button / selected pills. */
 static bool TextActionButton(const char *idName, const char *label, bool primary) {
     Clay_ElementId id = TextDynamicElementId(idName);
     Bs b = Interact(id);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(42)}, .padding = {14, 12, 0, 0}, .childAlignment = AL_C},
-              .backgroundColor = primary ? Mix(RGB(60, 111, 224), RGB(83, 132, 245), b.hover) : BtnBg(C_RFIELD, RGB(48, 50, 58), b),
+    Clay_Color fill = primary ? Mix(RGB(226, 228, 234), RGB(246, 247, 250), b.hover) : BtnBg(C_RFIELD, RGB(46, 47, 54), b);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(44)}, .padding = {14, 14, 0, 0}, .childAlignment = AL_C},
+              .backgroundColor = fill, .cornerRadius = CLAY_CORNER_RADIUS(14),
+              .border = {.color = primary ? RGBA(0, 0, 0, 0) : Mix(C_RCARDB, RGB(80, 83, 92), b.hover * .7f),
+                         .width = CLAY_BORDER_OUTSIDE(primary ? 0 : 1)}}) {
+        Tx(label, 16, primary ? RGB(22, 23, 26) : C_TEXT, 1);
+    }
+    return b.clicked;
+}
+
+/* Toggle / segmented button: same field surface as the number fields. */
+static bool TextChoiceButton(Clay_ElementId id, const char *label, bool on, bool dot) {
+    Bs b = Interact(id);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(36)}, .padding = {10, 10, 0, 0}, .childGap = 7, .childAlignment = AL_C},
+              .backgroundColor = on ? RGB(52, 54, 62) : BtnBg(C_RFIELD, RGB(46, 47, 54), b),
               .cornerRadius = CLAY_CORNER_RADIUS(11),
-              .border = {.color = Mix(primary ? RGB(81, 127, 237) : C_RCARDB, C_TEXT, b.hover * .25f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        Tx(label, 15, C_TEXT, 1);
+              .border = {.color = Mix(on ? RGB(92, 96, 106) : C_RCARDB, RGB(84, 87, 96), b.hover * .5f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        if (dot)
+            CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}},
+                          .backgroundColor = on ? C_TEXT : RGB(74, 77, 85), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+        Tx(label, 14.5f, on ? C_TEXT : C_DIM, 0);
     }
     return b.clicked;
 }
 
 static void TextStyleToggle(const char *idName, const char *label, bool *value) {
-    Clay_ElementId id = TextDynamicElementId(idName);
+    if (TextChoiceButton(TextDynamicElementId(idName), label, *value, true)) *value = !*value;
+}
+
+/* X / Y field for the text position. Stored 0..1 across the frame, shown as 0..100 %.
+   Same look and behaviour as NumField (scrub, double-click to type, steppers). */
+static void TextPosField(int n, const char *lab, float *norm, float lo, float hi) {
+    Clay_ElementId id = CLAY_IDI("TxtPosF", n);
+    Clay_ElementId scrubId = CLAY_IDI("TxtPosScrub", n);
     Bs b = Interact(id);
-    if (b.clicked) *value = !*value;
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {10, 8, 0, 0}, .childAlignment = AL_Y},
-              .backgroundColor = *value ? RGB(48, 58, 78) : BtnBg(C_RFIELD, RGB(48, 50, 58), b),
-              .cornerRadius = CLAY_CORNER_RADIUS(9),
-              .border = {.color = Mix(*value ? RGB(86, 125, 207) : C_RCARDB, C_TEXT, b.hover * .2f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        Tx(label, 13.5f, *value ? C_TEXT : C_DIM, 0);
+    float pct = *norm * 100.f;
+    ValueFieldLogicEx(scrubId, &pct, .3f, false);
+    pct = fmaxf(lo * 100.f, fminf(hi * 100.f, pct));
+    *norm = pct / 100.f;
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(39)}, .childGap = 7, .childAlignment = AL_Y}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {FIX(18), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(lab, 19, C_ICON, 0); }
+        CLAY(id, {.layout = {.sizing = {GROW, FIX(39)}, .padding = {10, 5, 0, 0}, .childGap = 6, .childAlignment = AL_Y},
+                  .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(11),
+                  .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+            CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
+                HSPACE
+                Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(pct)), 22, C_TEXT, 0);
+                Tx("%", 17, C_ICON, 0);
+            }
+            GAPX(3)
+            CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}}}) {
+                if (Arrow(CLAY_IDI("TxtPosU", n), I_CHEV_UP)) *norm = fminf(hi, *norm + .01f);
+                if (Arrow(CLAY_IDI("TxtPosD", n), I_CHEV_DN)) *norm = fmaxf(lo, *norm - .01f);
+            }
+        }
+    }
+}
+
+/* 3 x 3 dot grid: snaps the text to a corner / edge / centre of the frame. */
+static void TextPosGrid(void) {
+    static const float xs[3] = {.1f, .5f, .9f};
+    static const float ys[3] = {.12f, .5f, .88f};
+    CLAY(CLAY_ID("TxtPosGrid"), {.layout = {COLM, .sizing = {FIX(100), FIX(88)}, .padding = CLAY_PADDING_ALL(6)},
+                                 .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
+                                 .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        for (int row = 0; row < 3; row++) {
+            CLAY(CLAY_IDI("TxtPosRow", row), {.layout = {.sizing = {GROW, GROW}}}) {
+                for (int col = 0; col < 3; col++) {
+                    int i = row * 3 + col;
+                    Clay_ElementId cid = CLAY_IDI("TxtPosCell", i);
+                    Bs cb = Interact(cid);
+                    if (cb.clicked) { gTextPosX = xs[col]; gTextPosY = ys[row]; }
+                    bool sel = fabsf(gTextPosX - xs[col]) < .02f && fabsf(gTextPosY - ys[row]) < .02f;
+                    float dot = sel ? 9.f : 6.f + 2.f * cb.hover;
+                    CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {FIX(dot), FIX(dot)}},
+                                      .backgroundColor = sel ? C_TEXT : Mix(RGB(88, 91, 100), RGB(150, 152, 160), cb.hover),
+                                      .cornerRadius = CLAY_CORNER_RADIUS(dot * .5f)}) {}
+                    }
+                }
+            }
+        }
     }
 }
 
 static void TextView(void) {
-    CLAY(CLAY_ID("TextEditorCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 12}, RCARD}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
-            Icon(I_TEXT, 21, C_ICON);
-            Tx("Text", 18, C_TEXT, 1);
-            HSPACE
-            Tx(gTextTitleSelected ? "TITLE SELECTED" : "TITLE EDITOR", 11, C_MUTED, 1);
-        }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 5}}) {
-            Tx("Content", 14, C_DIM, 1);
+    CLAY(CLAY_ID("TextCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
+
+        /* ---- Content ---- */
+        CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .padding = {3, 0, 0, 0}, .childGap = 10, .childAlignment = AL_Y}}) {
+                Icon(I_TEXT, 20, C_ICON);
+                Tx("Content", 19, C_TEXT, 1);
+                HSPACE
+                if (gTextTitleSelected) Tx("Editing title", 13, C_MUTED, 0);
+            }
             Clay_ElementId field = CLAY_ID("TextContentField");
             bool over = Clay_PointerOver(field);
             Bs fb = Interact(field);
@@ -1735,63 +1802,91 @@ static void TextView(void) {
                 int cp;
                 while ((cp = GetCharPressed()) != 0) PlutoTextAppendCodepoint(cp);
             }
-            CLAY(field, {.layout = {COLM, .sizing = {GROW, FIX(116)}, .padding = {12, 12, 10, 10}, .childGap = 4},
-                         .backgroundColor = gTextInputFocused ? RGB(34, 38, 49) : C_RFIELD,
+            CLAY(field, {.layout = {COLM, .sizing = {GROW, FIX(104)}, .padding = {12, 12, 10, 10}},
+                         .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), gTextInputFocused ? .45f : fb.hover * .3f),
                          .cornerRadius = CLAY_CORNER_RADIUS(11),
-                         .border = {.color = gTextInputFocused ? RGB(76, 113, 190) : C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 15, gTextContent[0] ? C_TEXT : C_MUTED, 0);
+                         .border = {.color = gTextInputFocused ? RGB(104, 108, 120) : Mix(C_RFIELD, RGB(76, 79, 88), fb.hover),
+                                    .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 16, gTextContent[0] ? C_TEXT : C_MUTED, 0);
             }
-            Tx("Enter creates a new line. Click the preview with the Text tool to place it.", 12.5f, C_MUTED, 0);
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
-                Tx("Font size", 14, C_DIM, 1);
+
+        /* ---- Position (where the title sits in the frame) ---- */
+        CLAY(CLAY_ID("TextPosCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .padding = {3, 0, 0, 0}, .childGap = 10, .childAlignment = AL_Y}}) {
+                Icon(I_POS, 20, C_ICON);
+                Tx("Position", 19, C_TEXT, 1);
+                HSPACE
+                if (IconBtn(CLAY_ID("TxtPosReset"), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) {
+                    gTextPosX = .5f; gTextPosY = .78f;
+                }
+            }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
+                TextPosGrid();
+                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
+                    TextPosField(0, "X", &gTextPosX, .03f, .97f);
+                    TextPosField(1, "Y", &gTextPosY, .04f, .96f);
+                }
+            }
+        }
+
+        /* ---- Font ---- */
+        CLAY(CLAY_ID("TextFontCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
+                Tx("Font size", 18, C_TEXT, 0);
                 HSPACE
                 float sizeValue = (float)gTextFontSize;
-                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 28, 14, 11, 8, 24.f, 180.f, 0))
+                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 27, 16, 13, 8, 24.f, 180.f, 0))
                     gTextFontSize = (int)roundf(sizeValue);
             }
+            {
+                static bool sizeDrag;
+                Clay_ElementId sid = CLAY_ID("TextSizeSlider");
+                Bs sb = Interact(sid);
+                float t = ((float)gTextFontSize - 24.f) / 156.f;
+                float before = t;
+                FxSliderLogic(sid, &t, &sizeDrag, 7.f);
+                if (fabsf(t - before) > .0001f) gTextFontSize = (int)roundf(24.f + t * 156.f);
+                CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
+                           .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD,
+                                                       ((float)gTextFontSize - 24.f) / 156.f,
+                                                       (sb.hover + (sizeDrag ? 1.f : 0.f)) * 1.5f, 0)}}) {}
+            }
+            Tx("Alignment", 16, C_DIM, 0);
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                Tx("Color", 14, C_DIM, 1);
-                for (int row = 0; row < 2; row++) {
-                    CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
-                        for (int col = 0; col < 4; col++) TextColorButton(row * 4 + col);
-                    }
+                static const char *alignNames[3] = {"Left", "Center", "Right"};
+                for (int i = 0; i < 3; i++)
+                    if (TextChoiceButton(CLAY_IDI("TextAlign", i), alignNames[i], gTextAlign == i, false)) gTextAlign = i;
+            }
+        }
+
+        /* ---- Appearance ---- */
+        CLAY(CLAY_ID("TextLookCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
+            Tx("Color", 18, C_TEXT, 0);
+            for (int row = 0; row < 2; row++) {
+                CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
+                    for (int col = 0; col < 4; col++) TextColorButton(row * 4 + col);
                 }
             }
+            GAPY(2)
+            Tx("Style", 18, C_TEXT, 0);
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                Tx("Alignment", 14, C_DIM, 1);
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
-                    static const char *alignNames[3] = {"Left", "Center", "Right"};
-                    for (int i = 0; i < 3; i++) {
-                        Clay_ElementId aid = CLAY_IDI("TextAlign", i);
-                        Bs ab = Interact(aid);
-                        if (ab.clicked) gTextAlign = i;
-                        CLAY(aid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
-                                   .backgroundColor = gTextAlign == i ? RGB(48, 58, 78) : BtnBg(C_RFIELD, RGB(48, 50, 58), ab),
-                                   .cornerRadius = CLAY_CORNER_RADIUS(9),
-                                   .border = {.color = Mix(gTextAlign == i ? RGB(86, 125, 207) : C_RCARDB, C_TEXT, ab.hover * .2f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                            Tx(alignNames[i], 13, gTextAlign == i ? C_TEXT : C_DIM, 0);
-                        }
-                    }
-                }
+                TextStyleToggle("TextBold", "Bold", &gTextBold);
+                TextStyleToggle("TextOutline", "Outline", &gTextOutline);
             }
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                Tx("Style", 14, C_DIM, 1);
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
-                    TextStyleToggle("TextBold", "Bold", &gTextBold);
-                    TextStyleToggle("TextOutline", "Outline", &gTextOutline);
-                }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
-                    TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
-                    TextStyleToggle("TextBackground", "Background", &gTextBackground);
-                }
+                TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
+                TextStyleToggle("TextBackground", "Background", &gTextBackground);
             }
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
-                Tx("Default clip length", 14, C_DIM, 0);
+        }
+
+        /* ---- Clip length + actions ---- */
+        CLAY(CLAY_ID("TextClipCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
+                Tx("Clip length", 18, C_TEXT, 0);
                 HSPACE
                 float durationValue = gTextDuration;
-                if (ValBoxEditable(CLAY_ID("TextDuration"), &durationValue, "s", 82, 28, 14, 11, 8, .5f, 30.f, 1))
+                if (ValBoxEditable(CLAY_ID("TextDuration"), &durationValue, "s", 82, 27, 16, 13, 8, .5f, 30.f, 1))
                     gTextDuration = durationValue;
             }
         }
@@ -1799,15 +1894,15 @@ static void TextView(void) {
             PlutoTextApply(false);
         if (TextActionButton("TextNew", "Create another title", false))
             PlutoTextApply(true);
-        if (TextActionButton("TextToolPlace", gTimelineTool == 3 ? "Text tool active  ·  click preview" : "Activate text placement tool", false)) {
+        if (TextActionButton("TextToolPlace", gTimelineTool == 3 ? "Text tool active  \xC2\xB7  click preview" : "Place with text tool", false)) {
             gTimelineTool = 3;
             gRightTab = 3;
             gTextInputFocused = false;
         }
-        if (gTextTitleSelected) {
-            Tx("Editing a title clip. Changes are applied with Update selected title.", 12.5f, C_MUTED, 0);
-        } else {
-            Tx("Titles are transparent overlay clips on the upper video track. Drag and trim them like video.", 12.5f, C_MUTED, 0);
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {4, 4, 0, 6}}}) {
+            TxWrap(gTextTitleSelected ? "Editing a title clip. Changes apply with Update selected title."
+                                      : "Titles are transparent overlays on the upper video track. Drag and trim them like video.",
+                   12.5f, C_MUTED, 0);
         }
     }
 }
