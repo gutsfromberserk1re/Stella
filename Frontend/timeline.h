@@ -7,8 +7,19 @@ static float TimelinePps(void) { return 21.5f * gTimelineZoom; }
 #define TIMELINE_LANE_MAX 80.f
 static float gTimelineLaneHeight = TIMELINE_LANE_MIN;
 
+/* Track rows animate independently. A row remains in the Clay layout while it
+   is fading out, so the rows below it do not jump when a clip is removed. */
+static float gTimelineTrackVis[4] = {1.f, 0.f, 0.f, 0.f};
+static bool gTimelineTrackWanted[4] = {true, false, false, false};
+static int gTimelineDragTargetTrack = -1;
+typedef struct TimelineSnapPoint { float time; int clipIndex; } TimelineSnapPoint;
+static TimelineSnapPoint gTimelineSnapPoints[MAX_TIMELINE_CLIPS * 2];
+static int gTimelineSnapPointCount;
+static bool gTimelineSnapCacheValid;
+
 static bool TimelineTrackIsVideo(int track) { return track >= 0 && track < 4; }
 static int TimelineTrackUnderPointer(void);
+static int TimelineTrackUnderPointerForDrag(void);
 static float gTimelineLastRevealY = -1.f;
 static bool gTimelineWasDraggingVideo;
 
@@ -33,17 +44,39 @@ static void TimelineAddVisibleVideoTrack(int track) {
 }
 
 static void TimelineRebuildVisibleVideoTracks(void) {
-    /* V1 is the permanent base lane. Higher video lanes only occupy space
-       while they contain media or are temporarily exposed during a drag. */
-    gTimelineVideoTracks = 0;
-    TimelineAddVisibleVideoTrack(0);
+    /* V1 is permanent. Other video rows are wanted while occupied or while a
+       drag is temporarily exposing them. Rows already fading out stay mounted
+       until their visibility reaches zero. This avoids a one-frame layout pop. */
+    bool wanted[4] = {true, false, false, false};
     for (int i = 0; i < gTimelineClipCount; i++) {
         int track = gTimelineClips[i].track;
-        if (TimelineTrackIsVideo(track)) TimelineAddVisibleVideoTrack(track);
+        if (TimelineTrackIsVideo(track)) wanted[track] = true;
     }
-    if (gTimelinePendingVideoTrack >= 1)
-        for (int track = 1; track <= gTimelinePendingVideoTrack; track++)
+    if (gTimelinePendingVideoTrack >= 1) {
+        int last = gTimelinePendingVideoTrack < 3 ? gTimelinePendingVideoTrack : 3;
+        for (int track = 1; track <= last; track++) wanted[track] = true;
+    }
+    for (int track = 0; track < 4; track++) gTimelineTrackWanted[track] = wanted[track];
+
+    gTimelineVideoTracks = 0;
+    for (int track = 3; track >= 0; track--) {
+        if (wanted[track] || gTimelineTrackVis[track] > 0.001f)
             TimelineAddVisibleVideoTrack(track);
+    }
+}
+
+static void TimelineUpdateTrackVisibility(void) {
+    const float dt = fminf(fmaxf(gDt, 0.f), 0.05f);
+    const float k = 1.f - expf(-24.f * dt);
+    for (int track = 0; track < 4; track++) {
+        float target = gTimelineTrackWanted[track] ? 1.f : 0.f;
+        float delta = target - gTimelineTrackVis[track];
+        if (fabsf(delta) < 0.002f) {
+            gTimelineTrackVis[track] = target;
+        } else {
+            gTimelineTrackVis[track] += delta * k;
+        }
+    }
 }
 
 static void TimelineExpandVideoTracksForDrag(void) {
@@ -57,8 +90,19 @@ static void TimelineExpandVideoTracksForDrag(void) {
                strcmp(gImported[gMediaDragIndex].kind, "audio") != 0) {
         draggingVideo = true;
     }
-    if (!draggingVideo || (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
-                           !IsMouseButtonReleased(MOUSE_BUTTON_LEFT))) {
+    bool draggingAny = draggingVideo ||
+        (gClipDragIndex >= 0 && gClipDragIndex < gTimelineClipCount) ||
+        (gMediaDragIndex >= 0 && gMediaDragIndex < gImportedCount);
+    if (!draggingAny || (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+                         !IsMouseButtonReleased(MOUSE_BUTTON_LEFT))) {
+        gTimelineWasDraggingVideo = false;
+        gTimelineLastRevealY = -1.f;
+        gTimelineDragTargetTrack = -1;
+        return;
+    }
+    if (!draggingVideo) {
+        /* Audio drags use the same stable lane targeting, but do not reveal
+           video rows. The target is refreshed by the drag hit-test below. */
         gTimelineWasDraggingVideo = false;
         gTimelineLastRevealY = -1.f;
         return;
@@ -67,8 +111,11 @@ static void TimelineExpandVideoTracksForDrag(void) {
     Vector2 mouse = GetMousePosition();
     if (!gTimelineWasDraggingVideo) {
         int highestAtStart = 0;
-        for (int i = 0; i < gTimelineVideoTracks; i++)
-            if (gTimelineVideoTrackIds[i] > highestAtStart) highestAtStart = gTimelineVideoTrackIds[i];
+        for (int i = 0; i < gTimelineVideoTracks; i++) {
+            int track = gTimelineVideoTrackIds[i];
+            if ((gTimelineTrackWanted[track] || gTimelineTrackVis[track] >= 0.18f) && track > highestAtStart)
+                highestAtStart = track;
+        }
         Clay_BoundingBox top = Clay_GetElementData(CLAY_IDI("TrackLane", highestAtStart)).boundingBox;
         /* A clip drag starts inside a lane, so require a deliberate 12px
            upward movement from the grab point. A media-library drag starts
@@ -78,7 +125,7 @@ static void TimelineExpandVideoTracksForDrag(void) {
     }
     gTimelineWasDraggingVideo = true;
 
-    int hovered = TimelineTrackUnderPointer();
+    int hovered = TimelineTrackUnderPointerForDrag();
     if (TimelineTrackIsVideo(hovered)) {
         /* Reveal skipped tracks between the source lane and the lane under
            the pointer. During the drag those intermediate rows stay mounted;
@@ -96,8 +143,11 @@ static void TimelineExpandVideoTracksForDrag(void) {
        so each new lane requires another small upward step instead of all
        four lanes popping open at once. */
     int highest = -1;
-    for (int i = 0; i < gTimelineVideoTracks; i++)
-        if (gTimelineVideoTrackIds[i] > highest) highest = gTimelineVideoTrackIds[i];
+    for (int i = 0; i < gTimelineVideoTracks; i++) {
+        int track = gTimelineVideoTrackIds[i];
+        if ((gTimelineTrackWanted[track] || gTimelineTrackVis[track] >= 0.18f) && track > highest)
+            highest = track;
+    }
     if (highest >= 0 && highest < 3) {
         Clay_BoundingBox top = Clay_GetElementData(CLAY_IDI("TrackLane", highest)).boundingBox;
         if (top.height > 0.f && mouse.y <= gTimelineLastRevealY &&
@@ -120,23 +170,67 @@ static int TimelineTrackUnderPointer(void) {
     for (int i = 0; i < gTimelineVideoTracks; i++) {
         int track = gTimelineVideoTrackIds[i];
         Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", track)).boundingBox;
+        if (lane.width <= 0.f || lane.height < 10.f) continue;
         float center = lane.y + lane.height * .5f;
         float distance = fabsf(mouse.y - center);
-        if (lane.width > 0.f && mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
-            distance <= lane.height * .5f + fmaxf(8.f, gTimelineLaneHeight * .25f) && distance < best) {
+        if (mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
+            distance <= lane.height * .5f + fmaxf(6.f, lane.height * .18f) && distance < best) {
             best = distance; bestTrack = track;
         }
     }
     for (int track = 4; track < 4 + gTimelineAudioTracks; track++) {
         Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", track)).boundingBox;
+        if (lane.width <= 0.f || lane.height < 10.f) continue;
         float center = lane.y + lane.height * .5f;
         float distance = fabsf(mouse.y - center);
-        if (lane.width > 0.f && mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
-            distance <= lane.height * .5f + fmaxf(8.f, gTimelineLaneHeight * .25f) && distance < best) {
+        if (mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
+            distance <= lane.height * .5f + fmaxf(6.f, lane.height * .18f) && distance < best) {
             best = distance; bestTrack = track;
         }
     }
     return bestTrack;
+}
+
+/* Keep the currently targeted row until the pointer has clearly crossed its
+   edge. This is the small hysteresis that stops a dragged clip/media item from
+   flipping between adjacent tracks while the pointer rests on their boundary. */
+static int TimelineTrackUnderPointerForDrag(void) {
+    /* Outside an active drag this is an ordinary hover query; do not let idle
+       pointer movement seed a stale preferred lane for the next drag. */
+    if (gClipDragIndex < 0 && gMediaDragIndex < 0) return TimelineTrackUnderPointer();
+    Vector2 mouse = GetMousePosition();
+    Clay_BoundingBox viewport = Clay_GetElementData(CLAY_ID("TrackViewport")).boundingBox;
+    if (viewport.width > 0.f && !CheckCollisionPointRec(mouse,
+        (Rectangle){viewport.x, viewport.y, viewport.width, viewport.height})) return -1;
+    int preferred = gTimelineDragTargetTrack;
+    if (preferred >= 0 && preferred < 6) {
+        Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", preferred)).boundingBox;
+        if (lane.width > 0.f && lane.height >= 10.f &&
+            mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
+            mouse.y >= lane.y - 4.f && mouse.y <= lane.y + lane.height + 4.f)
+            return preferred;
+    }
+    int next = TimelineTrackUnderPointer();
+    if (next >= 0) gTimelineDragTargetTrack = next;
+    return next;
+}
+
+static void TimelineBuildSnapCache(void) {
+    gTimelineSnapPointCount = 0;
+    for (int i = 0; i < gTimelineClipCount && gTimelineSnapPointCount + 1 < MAX_TIMELINE_CLIPS * 2; i++) {
+        if (!TimelineTrackIsVideo(gTimelineClips[i].track)) continue;
+        gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start, i};
+        gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start + gTimelineClips[i].duration, i};
+    }
+    gTimelineSnapCacheValid = true;
+}
+
+static void TimelinePrepareSnapCache(void) {
+    if (gClipDragIndex < 0 && gMediaDragIndex < 0) {
+        gTimelineSnapCacheValid = false;
+    } else if (!gTimelineSnapCacheValid) {
+        TimelineBuildSnapCache();
+    }
 }
 
 static float TimelineSnapStart(float start, float duration, bool video, int movingIndex, float playhead, bool snapPlayhead, const char *excludeGroup) {
@@ -144,8 +238,34 @@ static float TimelineSnapStart(float start, float duration, bool video, int movi
 
     /* The magnet is proximity snapping only. The desired mouse position remains
        the anchor; do not silently lock to the previous clip edge when snapping
-       is disabled. Magnetic gap-closing is handled separately by the timeline core. */
+       is disabled. Dragging uses a prebuilt edge cache instead of rescanning all
+       clips on every pointer event. */
     float bestDistance = 0.25f, snapped = fmaxf(0.f, start);
+    if (gClipDragIndex >= 0 || gMediaDragIndex >= 0) {
+        if (!gTimelineSnapCacheValid) TimelineBuildSnapCache();
+        for (int i = 0; i < gTimelineSnapPointCount; i++) {
+            TimelineSnapPoint point = gTimelineSnapPoints[i];
+            if (point.clipIndex == movingIndex ||
+                (excludeGroup && *excludeGroup &&
+                 strcmp(gTimelineClips[point.clipIndex].groupId, excludeGroup) == 0)) continue;
+            for (int edge = 0; edge < 2; edge++) {
+                float value = point.time - (edge ? duration : 0.f);
+                float distance = fabsf(value - start);
+                if (distance < bestDistance) { bestDistance = distance; snapped = fmaxf(0.f, value); }
+            }
+        }
+        if (snapPlayhead) {
+            for (int edge = 0; edge < 2; edge++) {
+                float value = playhead - (edge ? duration : 0.f);
+                float distance = fabsf(value - start);
+                if (distance < bestDistance) { bestDistance = distance; snapped = fmaxf(0.f, value); }
+            }
+        }
+        return snapped;
+    }
+
+    /* Non-drag edits keep the uncached path so it always reflects the latest
+       project state. */
     for (int n = -1; n < gTimelineClipCount; n++) {
         if (n == movingIndex || (n >= 0 && (!TimelineTrackIsVideo(gTimelineClips[n].track) ||
             (excludeGroup && *excludeGroup && strcmp(gTimelineClips[n].groupId, excludeGroup) == 0)))) continue;
@@ -190,7 +310,7 @@ static const char *TimelineTrackLabel(int track) {
     return labels[track < 0 ? 0 : track > 5 ? 5 : track];
 }
 
-static void TimelineClipLane(int track);
+static void TimelineClipLane(int track, float height);
 
 static void TimelineTrackRow(int track, float height) {
     Clay_ElementId row = CLAY_IDI("TrackRow", track);
@@ -200,12 +320,13 @@ static void TimelineTrackRow(int track, float height) {
     /* FIX: Clay's backgroundColor is a Clay_Color (floats), not a raylib Color (unsigned char). */
     Clay_Color bg = (Clay_Color){(float)bgRaylib.r, (float)bgRaylib.g, (float)bgRaylib.b, (float)bgRaylib.a};
     CLAY(row, {.layout = {.sizing = {GROW, FIX(height)}, .childAlignment = AL_Y}, .backgroundColor = bg,
+               .clip = {.horizontal = true, .vertical = true},
                .border = {.color = RGB(41, 42, 46), .width = {.bottom = 1}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
             Icon(track < 4 ? I_FILM : I_NOTE, 14, C_MUTED);
             TxMedium(TimelineTrackLabel(track), 13, C_MUTED);
         }
-        TimelineClipLane(track);
+        TimelineClipLane(track, height);
     }
 }
 
@@ -368,9 +489,17 @@ static int TimelineClipStartCompare(const void *left, const void *right) {
     return a < b ? -1 : a > b ? 1 : 0;
 }
 
-static void TimelineClipLane(int track) {
+static void TimelineClipLane(int track, float height) {
     Clay_ElementId laneId = CLAY_IDI("TrackLane", track);
     Clay_BoundingBox lane = Clay_GetElementData(laneId).boundingBox;
+    /* Collapsing/brand-new rows can be only a few pixels tall. Keep their Clay
+       node alive for layout animation, but defer clip sorting and hit targets
+       until the row is large enough to interact with. */
+    if (lane.height < 10.f) {
+        CLAY(laneId, {.layout = {.sizing = {GROW, FIX(height)}, .childGap = 0},
+                      .clip = {.horizontal = true, .vertical = true}}) {}
+        return;
+    }
     float pps = TimelinePps();
     if (gTimelineTool == 2 && Clay_PointerOver(laneId)) gCross = true;
     bool transitionPressed = false;
@@ -439,8 +568,9 @@ static void TimelineClipLane(int track) {
         }
     }
 
-    CLAY(laneId, {.layout = {.sizing = {GROW, FIX(gTimelineLaneHeight)}, .childGap = 0}, .clip = {.horizontal = true}}) {
-        int mediaTarget = TimelineTrackUnderPointer();
+    CLAY(laneId, {.layout = {.sizing = {GROW, FIX(height)}, .childGap = 0},
+                  .clip = {.horizontal = true, .vertical = true}}) {
+        int mediaTarget = TimelineTrackUnderPointerForDrag();
         if (gMediaDragIndex >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && mediaTarget >= 0 &&
             mediaTarget == track && gMediaDragIndex < gImportedCount) {
             ImportedMedia *media = &gImported[gMediaDragIndex];
@@ -456,7 +586,7 @@ static void TimelineClipLane(int track) {
                 float w = fmaxf(46.f, media->duration * pps);
                 float left = fmaxf(targetBox.x, x), right = fminf(targetBox.x + targetBox.width, x + w);
                 if (right > left) {
-                    float h = fmaxf(30.f, targetBox.height - 8.f);
+                    float h = fmaxf(1.f, targetBox.height - 8.f);
                     gMediaDropPreview = (Rectangle){left, targetBox.y + (targetBox.height - h) * .5f, right - left, h};
                     gMediaDropPreviewClip = -1;
                     gMediaDropPreviewMedia = gMediaDragIndex;
@@ -572,6 +702,7 @@ static void TimelineClipLane(int track) {
                 if (gTimelineTool == 0 || gTimelineTool == 1) {
                     gClipDragIndex = i;
                     gClipDragTrack = track;
+                    gTimelineDragTargetTrack = track;
                     gClipDragOrigStart = gTimelineClips[i].start;
                     gClipDragOffset = GetMousePosition().x - bb.x;
                     for (int j = 0; j < gTimelineClipCount; j++) {
@@ -594,7 +725,7 @@ static void TimelineClipLane(int track) {
             }
             if (gClipTrimIndex < 0 && gKeyframeDragClip < 0 && gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
                 if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && lane.width > 0.f) {
-                    int hoveredTrack = TimelineTrackUnderPointer();
+                    int hoveredTrack = TimelineTrackUnderPointerForDrag();
                     int requestedTrack = hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
                         ? hoveredTrack : gClipDragTrack;
                     Clay_BoundingBox targetLane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
@@ -609,7 +740,7 @@ static void TimelineClipLane(int track) {
                     float w = fmaxf(46.f, gTimelineClips[i].duration * pps);
                     float left = fmaxf(targetBox.x, x), right = fminf(targetBox.x + targetBox.width, x + w);
                     if (right > left) {
-                        float h = fmaxf(30.f, targetBox.height - 8.f);
+                        float h = fmaxf(1.f, targetBox.height - 8.f);
                         gMediaDropPreview = (Rectangle){left, targetBox.y + (targetBox.height - h) * .5f, right - left, h};
                         gMediaDropPreviewClip = i;
                         gMediaDropPreviewMedia = gTimelineClips[i].mediaIndex;
@@ -617,7 +748,7 @@ static void TimelineClipLane(int track) {
                         gHand = true;
                     }
                 } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-                    int hoveredTrack = TimelineTrackUnderPointer();
+                    int hoveredTrack = TimelineTrackUnderPointerForDrag();
                     int requestedTrack = hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
                         ? hoveredTrack : gClipDragTrack;
                     Clay_BoundingBox targetLane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
@@ -635,6 +766,7 @@ static void TimelineClipLane(int track) {
                     }
                     gClipDragIndex = -1;
                     gTimelinePendingVideoTrack = -1;
+                    gTimelineDragTargetTrack = -1;
                     gMediaDropPreviewVisible = false;
                     gMediaDropPreviewClip = -1;
                     gMediaDropPreviewMedia = -1;
@@ -654,7 +786,7 @@ static void TimelineClipLane(int track) {
                 if ((leftDistance >= -1.f && leftDistance <= 9.f) ||
                     (rightDistance >= -1.f && rightDistance <= 9.f)) gResize = 1;
             }
-            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fmaxf(30.f, lane.height - 8.f))}, .padding = {8, 5, 5, 0}, .childGap = 6, .childAlignment = {.y = CLAY_ALIGN_Y_TOP}},
+            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fmaxf(1.f, lane.height - 8.f))}, .padding = {8, 5, 5, 0}, .childGap = 6, .childAlignment = {.y = CLAY_ALIGN_Y_TOP}},
                           .clip = {.horizontal = true, .vertical = true},
                           .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, b.hover,
                                                      (i << 1) | (clipSelected ? 1 : 0))}}) {
@@ -757,6 +889,7 @@ static void DrawTimelineContextMenu(void) {
 
 static void Timeline(void) {
     gTransitionButtonCount = 0;
+    TimelinePrepareSnapCache();
     TimelineContextLogic();
     TimelineUpdateTrimDrag();
     gMediaDropPreviewVisible = false;
@@ -769,6 +902,29 @@ static void Timeline(void) {
     Clay_BoundingBox timelineBounds = Clay_GetElementData(CLAY_ID("Timeline")).boundingBox;
     Clay_BoundingBox body = Clay_GetElementData(CLAY_ID("TimeBody")).boundingBox;
     Clay_BoundingBox ruler = Clay_GetElementData(CLAY_ID("Ruler")).boundingBox;
+    Clay_BoundingBox trackViewport = Clay_GetElementData(CLAY_ID("TrackViewport")).boundingBox;
+
+    /* Dragging near the viewport edges scrolls the timeline underneath the
+       pointer. This keeps long media drops and clip moves from feeling like
+       they hit an invisible horizontal wall. */
+    if ((gClipDragIndex >= 0 || gMediaDragIndex >= 0) && IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+        trackViewport.width > 0.f && mouse.y >= trackViewport.y &&
+        mouse.y <= trackViewport.y + trackViewport.height) {
+        const float edgeZone = 38.f;
+        float depth = 0.f;
+        bool toEarlier = false;
+        if (mouse.x < trackViewport.x + edgeZone) {
+            depth = (trackViewport.x + edgeZone - mouse.x) / edgeZone;
+            toEarlier = true;
+        } else if (mouse.x > trackViewport.x + trackViewport.width - edgeZone) {
+            depth = (mouse.x - (trackViewport.x + trackViewport.width - edgeZone)) / edgeZone;
+        }
+        if (depth > 0.f) {
+            float pxPerSecond = 250.f + 1150.f * fminf(1.5f, depth);
+            gTimelinePan += (toEarlier ? 1.f : -1.f) * pxPerSecond * gDt;
+            if (toEarlier) gTimelinePan = fminf(0.f, gTimelinePan);
+        }
+    }
 
     float playheadX = ruler.x + gTimelinePan + gPlayhead * pps;
     bool grabbedPlayhead = mouse.y >= ruler.y && mouse.y <= body.y + body.height && fabsf(mouse.x - playheadX) <= 9.f;
@@ -785,7 +941,7 @@ static void Timeline(void) {
     }
 
     if (gMediaDragIndex >= 0 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        int targetTrack = TimelineTrackUnderPointer();
+        int targetTrack = TimelineTrackUnderPointerForDrag();
         if (targetTrack >= 0 && gMediaDragIndex < gImportedCount) {
             ImportedMedia *media = &gImported[gMediaDragIndex];
             bool audioTrack = targetTrack >= 4;
@@ -799,6 +955,7 @@ static void Timeline(void) {
         }
         gMediaDragIndex = -1;
         gTimelinePendingVideoTrack = -1;
+        gTimelineDragTargetTrack = -1;
     }
 
     /* Middle mouse is a temporary hand tool. It never changes the selected tool. */
@@ -849,14 +1006,23 @@ static void Timeline(void) {
     /* Both audio lanes stay available even while empty. */
     gTimelineAudioTracks = 2;
 
-    /* Track rows keep one fixed, readable height at every timeline size.
-       A shorter timeline scrolls vertically; it never compresses the rows. */
+    /* Video rows expand/collapse with independent visibility factors. Their
+       fractional heights also feed the scroll range, so the scroll area follows
+       the animated layout instead of jumping ahead of it. */
     TimelineRebuildVisibleVideoTracks();
     TimelineExpandVideoTracksForDrag();
-    int laneCount = gTimelineVideoTracks + gTimelineAudioTracks;
+    TimelineRebuildVisibleVideoTracks();
+    TimelineUpdateTrackVisibility();
     gTimelineLaneHeight = fmaxf(TIMELINE_LANE_MIN, fminf(TIMELINE_LANE_MAX, gTimelineLaneHeight));
     float trackViewportHeight = fmaxf(1.f, gTimeH - 90.5f);
-    gTimelineVerticalMax = fmaxf(0.f, laneCount * (gTimelineLaneHeight + 2.25f) - trackViewportHeight);
+    float laneContentHeight = 0.f;
+    for (int i = 0; i < gTimelineVideoTracks; i++) {
+        int track = gTimelineVideoTrackIds[i];
+        float vis = gTimelineTrackVis[track];
+        laneContentHeight += (gTimelineLaneHeight + 2.25f) * vis;
+    }
+    laneContentHeight += gTimelineAudioTracks * (gTimelineLaneHeight + 2.25f);
+    gTimelineVerticalMax = fmaxf(0.f, laneContentHeight - trackViewportHeight);
     if (gShiftDown && !gCtrlDown && gWheelDelta != 0.f && inTimelineBody)
         gTimelineVerticalScrollT -= gWheelDelta * fmaxf(48.f, gTimelineLaneHeight * 1.25f);
     gTimelineVerticalScrollT = fmaxf(0.f, fminf(gTimelineVerticalMax, gTimelineVerticalScrollT));
@@ -968,8 +1134,10 @@ static void Timeline(void) {
                 }
                 CLAY(CLAY_ID("TrackViewport"), {.layout = {COLM, .sizing = {GROW, GROW}},
                     .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gTimelineVerticalScroll}}}) {
-                    for (int i = 0; i < gTimelineVideoTracks; i++)
-                        TimelineTrackRow(gTimelineVideoTrackIds[i], gTimelineLaneHeight);
+                    for (int i = 0; i < gTimelineVideoTracks; i++) {
+                        int track = gTimelineVideoTrackIds[i];
+                        TimelineTrackRow(track, fmaxf(0.1f, gTimelineLaneHeight * gTimelineTrackVis[track]));
+                    }
                     for (int track = 0; track < gTimelineAudioTracks; track++)
                         TimelineTrackRow(4 + track, gTimelineLaneHeight);
                 }
