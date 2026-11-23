@@ -25,29 +25,13 @@ static void TimelineAddVisibleVideoTrack(int track) {
 }
 
 static void TimelineRebuildVisibleVideoTracks(void) {
+    /* Keep all four video lanes mounted in the timeline, even when empty.
+       Editors conventionally expose V1–V4 as a stable stack; collapsing
+       unused lanes made a clip on V4 look as though V2 and V3 did not exist
+       and caused the visible row layout to change as clips were moved. */
     gTimelineVideoTracks = 0;
-    /* Show every video lane that contains a clip, including non-contiguous
-       lanes (e.g. V1 and V4). Only unused lanes collapse; V1 is permanent. */
-    bool used[4] = {true, false, false, false};
-    for (int i = 0; i < gTimelineClipCount; i++) {
-        int track = gTimelineClips[i].track;
-        if (track >= 0 && track < 4) used[track] = true;
-    }
     for (int track = 3; track >= 0; track--)
-        if (used[track]) TimelineAddVisibleVideoTrack(track);
-
-    /* Keep the source lane mounted for the entire drag gesture. When the
-       preview follows the pointer into another lane, rebuilding from the
-       moved clip alone would otherwise collapse the source row mid-drag.
-       That makes row coordinates jump under the cursor and causes the clip
-       to appear stuck on (or snap back to) the original lane. */
-    if (gClipDragIndex >= 0 && TimelineTrackIsVideo(gClipDragTrack))
-        TimelineAddVisibleVideoTrack(gClipDragTrack);
-
-    /* Keep a temporarily revealed destination lane visible until release. */
-    if ((gMediaDragIndex >= 0 || gClipDragIndex >= 0) &&
-        gTimelinePendingVideoTrack >= 1 && gTimelinePendingVideoTrack < 4)
-        TimelineAddVisibleVideoTrack(gTimelinePendingVideoTrack);
+        TimelineAddVisibleVideoTrack(track);
 }
 
 static int TimelineTrackUnderPointer(void) {
@@ -164,7 +148,7 @@ static int TimelineKeyframeHit(int clipIndex, Clay_BoundingBox bounds, Vector2 m
         if (time < clip->start - .001f || time > clip->start + clip->duration + .001f) continue;
         float x = bounds.x + (time - clip->start) / fmaxf(.001f, clip->duration) * bounds.width;
         float y = bounds.y + 14.f;
-        if (fabsf(mouse.x - x) <= 12.f && fabsf(mouse.y - y) <= 14.f) return k;
+        if (fabsf(mouse.x - x) <= 13.f && fabsf(mouse.y - y) <= 15.f) return k;
     }
     return -1;
 }

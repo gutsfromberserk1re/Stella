@@ -780,7 +780,7 @@ static uint64_t PlutoRequestPreview(void) {
 static void PlutoRequestExport(void) {
     if (!gBackend.submit) { strcpy(gBackendMessage, "Rust backend DLL is unavailable"); return; }
     OPENFILENAMEW dialog = {0};
-    wchar_t path[32768] = L"stella-export.mp4";
+    wchar_t path[32768] = L"stella-exported.mp4";
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = GetWindowHandle();
     dialog.lpstrFile = path;

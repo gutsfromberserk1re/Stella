@@ -236,6 +236,10 @@ impl LayerUniforms {
             "fade" => { contrast *= 1.0 - 0.16 * preset_intensity; brightness += 0.08 * preset_intensity; saturation *= 1.0 - 0.2 * preset_intensity; }
             "cinema" => { contrast *= 1.0 + 0.15 * preset_intensity; saturation *= 1.0 - 0.15 * preset_intensity; }
             "retro" => { grain_levels += 12.0 * preset_intensity; }
+            "teal_orange" => { saturation *= 1.0 + 0.12 * preset_intensity; contrast *= 1.0 + 0.05 * preset_intensity; }
+            "sepia" => { saturation *= 1.0 - 0.62 * preset_intensity; }
+            "bleach" => { contrast *= 1.0 + 0.30 * preset_intensity; saturation *= 1.0 - 0.55 * preset_intensity; }
+            "pastel" => { brightness += 0.045 * preset_intensity; contrast *= 1.0 - 0.12 * preset_intensity; saturation *= 1.0 - 0.10 * preset_intensity; }
             _ => {}
         }
         u.light = [brightness as f32, contrast as f32, saturation as f32, vibrance as f32];
@@ -278,6 +282,13 @@ impl LayerUniforms {
             "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * preset_intensity; balance[band + 2] -= 0.10 * preset_intensity; },
             "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * preset_intensity; balance[band + 2] += 0.12 * preset_intensity; },
             "retro" => for band in [0usize, 3, 6] { balance[band] += 0.15 * preset_intensity; balance[band + 2] -= 0.12 * preset_intensity; },
+            "teal_orange" => {
+                balance[0] -= 0.08 * preset_intensity; balance[1] += 0.025 * preset_intensity; balance[2] += 0.15 * preset_intensity;
+                balance[3] += 0.025 * preset_intensity; balance[4] += 0.02 * preset_intensity;
+                balance[6] += 0.14 * preset_intensity; balance[7] += 0.055 * preset_intensity; balance[8] -= 0.075 * preset_intensity;
+            }
+            "sepia" => for band in [0usize, 3, 6] { balance[band] += 0.18 * preset_intensity; balance[band + 1] += 0.065 * preset_intensity; balance[band + 2] -= 0.14 * preset_intensity; },
+            "bleach" => { balance[6] += 0.035 * preset_intensity; balance[8] -= 0.025 * preset_intensity; },
             _ => {}
         }
         for value in &mut balance { *value = value.clamp(-1.0, 1.0); }
@@ -451,6 +462,28 @@ mod tests {
         assert!((u.geo1[1] + 0.1).abs() < 1e-6);
         assert!((u.crop[0] - 0.1).abs() < 1e-6);
         assert!((u.crop[3] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expanded_filter_looks_reach_the_live_preview_uniforms() {
+        let cases = [
+            ("teal_orange", [0.0_f32, 1.05, 1.12, 0.0]),
+            ("sepia", [0.0_f32, 1.0, 0.38, 0.0]),
+            ("bleach", [0.0_f32, 1.30, 0.45, 0.0]),
+            ("pastel", [0.045_f32, 0.88, 0.90, 0.0]),
+        ];
+        for (preset, expected) in cases {
+            let props = json!({"effects": {"preset": {"id": preset, "intensity": 100.0}}});
+            let uniforms = LayerUniforms::from_props(&props, 0.0);
+            for channel in 0..4 {
+                assert!((uniforms.light[channel] - expected[channel]).abs() < 1e-5,
+                        "unexpected {preset} preview channel {channel}: {:?}", uniforms.light);
+            }
+        }
+        let teal_orange = LayerUniforms::from_props(
+            &json!({"effects": {"preset": {"id": "teal_orange", "intensity": 100.0}}}), 0.0);
+        assert!((teal_orange.bal_s[2] - 0.15).abs() < 1e-5);
+        assert!((teal_orange.bal_h[0] - 0.14).abs() < 1e-5);
     }
 
     #[test]

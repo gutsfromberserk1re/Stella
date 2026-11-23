@@ -102,6 +102,32 @@ pub enum TimelineError {
     NoFreeTrack,
 }
 
+/// Keyframe `time` values are absolute timeline timestamps. Keep them attached
+/// to their clip whenever a timeline operation changes that clip's start.
+fn shift_clip_keyframes(clip: &mut Clip, delta: f64) {
+    if !delta.is_finite() || delta.abs() <= EPSILON {
+        return;
+    }
+    let Some(keyframes) = clip
+        .extra
+        .get_mut("keyframes")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for keyframe in keyframes {
+        let Some(time) = keyframe
+            .get("time")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        if time.is_finite() {
+            keyframe["time"] = serde_json::json!(time + delta);
+        }
+    }
+}
+
 impl Timeline {
     pub fn new(clips: Vec<Clip>) -> Result<Self, TimelineError> {
         let mut timeline = Self {
@@ -125,7 +151,9 @@ impl Timeline {
             return Err(TimelineError::DuplicateId(clip.id));
         }
         if clip.track.is_video() && self.snapping {
+            let previous_start = clip.start;
             clip.start = self.snap_start(&clip.id, clip.start.max(0.0), clip.duration, 0.0, 0.25, None);
+            shift_clip_keyframes(&mut clip, clip.start - previous_start);
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
@@ -201,7 +229,10 @@ impl Timeline {
 
         let lane_members: HashSet<_> = same_kind.iter().map(|clip| clip.id.as_str()).collect();
         for mut member in members.iter().cloned() {
+            let old_member_start = member.start;
             member.start = (member.start + delta).max(0.0);
+            let member_delta = member.start - old_member_start;
+            shift_clip_keyframes(&mut member, member_delta);
             if lane_members.contains(member.id.as_str()) {
                 let member_rank = member.track.lanes().iter().position(|track| *track == member.track).unwrap_or(0) as i32;
                 if let Some(track) = member.track.lanes().get((member_rank + track_shift) as usize) { member.track = *track; }
@@ -214,7 +245,9 @@ impl Timeline {
             if let Some(linked_id) = member.linked_clip_id.as_deref() {
                 if moved_ids.insert(linked_id.to_owned()) {
                     if let Some(mut linked) = self.clips.iter().find(|clip| clip.id == linked_id).cloned() {
+                        let old_linked_start = linked.start;
                         linked.start = (linked.start + delta).max(0.0);
+                        shift_clip_keyframes(&mut linked, linked.start - old_linked_start);
                         self.replace(linked);
                     }
                 }
@@ -270,13 +303,17 @@ impl Timeline {
         }) {
             return Err(TimelineError::InvalidRange);
         }
+        let previous_start = clip.start;
         clip.start = next_start;
+        shift_clip_keyframes(&mut clip, clip.start - previous_start);
         clip.duration = next_end - next_start;
         clip.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
         self.replace(clip.clone());
         if let Some(linked_id) = linked_id {
             if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
+                let previous_linked_start = linked.start;
                 linked.start = next_start;
+                shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
                 linked.duration = next_end - next_start;
                 linked.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
                 if let Some(duration) = source_duration { linked.extra.insert("sourceDuration".into(), serde_json::json!(duration)); }
@@ -437,7 +474,20 @@ impl Timeline {
             .cloned().collect();
         followers.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
         for mut clip in followers {
+            let previous_start = clip.start;
             clip.start = (clip.start - duration).max(start);
+            let delta = clip.start - previous_start;
+            shift_clip_keyframes(&mut clip, delta);
+            if delta.abs() > EPSILON {
+                if let Some(linked_id) = clip.linked_clip_id.as_deref() {
+                    if let Some(mut linked) = self.clips.iter().find(|item| item.id == linked_id).cloned() {
+                        let previous_linked_start = linked.start;
+                        linked.start = (linked.start + delta).max(0.0);
+                        shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
+                        self.replace(linked);
+                    }
+                }
+            }
             self.replace(clip);
         }
     }
@@ -462,7 +512,20 @@ impl Timeline {
         followers.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
         let mut cursor = anchor.end();
         for mut clip in followers {
+            let previous_start = clip.start;
             if clip.start < cursor - EPSILON { clip.start = cursor; }
+            let delta = clip.start - previous_start;
+            shift_clip_keyframes(&mut clip, delta);
+            if delta.abs() > EPSILON {
+                if let Some(linked_id) = clip.linked_clip_id.as_deref() {
+                    if let Some(mut linked) = self.clips.iter().find(|item| item.id == linked_id).cloned() {
+                        let previous_linked_start = linked.start;
+                        linked.start = (linked.start + delta).max(0.0);
+                        shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
+                        self.replace(linked);
+                    }
+                }
+            }
             cursor = clip.end();
             self.replace(clip);
         }
@@ -561,6 +624,50 @@ mod tests {
     }
 
     #[test]
+    fn moving_clip_keeps_absolute_keyframes_attached_to_the_clip() {
+        let mut clip = video_clip("animated", 2.0, 4.0);
+        clip.extra.insert("keyframes".into(), serde_json::json!([
+            {"time": 2.25, "values": {"x": 0.0}},
+            {"time": 4.0, "values": {"x": 100.0}}
+        ]));
+        let mut timeline = Timeline::default();
+        timeline.clips.push(clip);
+        timeline.snapping = false;
+
+        timeline.move_clip("animated", 7.0, TrackId::V1, 0.0, 0.0).unwrap();
+        let moved = timeline.clips.iter().find(|clip| clip.id == "animated").unwrap();
+        let frames = moved.extra["keyframes"].as_array().unwrap();
+        assert!((moved.start - 7.0).abs() < 1e-9);
+        assert!((frames[0]["time"].as_f64().unwrap() - 7.25).abs() < 1e-9);
+        assert!((frames[1]["time"].as_f64().unwrap() - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn moving_video_shifts_linked_audio_keyframes_by_the_same_amount() {
+        let mut video = video_clip("video", 2.0, 4.0);
+        video.linked_clip_id = Some("audio".into());
+        let mut audio = Clip {
+            id: "audio".into(), track: TrackId::A1, start: 2.0, duration: 4.0,
+            label: "video Audio".into(), linked_clip_id: Some("video".into()), extra: HashMap::new(),
+        };
+        audio.extra.insert("keyframes".into(), serde_json::json!([
+            {"time": 2.5, "values": {"volume": 0.0}},
+            {"time": 5.5, "values": {"volume": 100.0}}
+        ]));
+        let mut timeline = Timeline::default();
+        timeline.clips.extend([video, audio]);
+        timeline.snapping = false;
+
+        timeline.move_clip("video", 7.0, TrackId::V1, 0.0, 0.0).unwrap();
+        let video = timeline.clips.iter().find(|clip| clip.id == "video").unwrap();
+        let audio = timeline.clips.iter().find(|clip| clip.id == "audio").unwrap();
+        assert!((video.start - 7.0).abs() < 1e-9);
+        assert!((audio.start - 7.0).abs() < 1e-9);
+        assert!((audio.extra["keyframes"][0]["time"].as_f64().unwrap() - 7.5).abs() < 1e-9);
+        assert!((audio.extra["keyframes"][1]["time"].as_f64().unwrap() - 10.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn add_clip_does_not_force_storyline_alignment_when_snapping_is_disabled() {
         let mut timeline = Timeline::default();
         timeline.clips.push(video_clip("one", 0.0, 2.0));
@@ -582,13 +689,54 @@ mod tests {
     }
 
     #[test]
-    fn moving_with_magnet_on_closes_the_vacated_lane_gap() {
+    fn moving_with_magnet_on_closes_the_vacated_lane_gap_and_moves_follower_keyframes() {
         let mut timeline = Timeline::default();
         timeline.clips.push(video_clip("one", 0.0, 2.0));
-        timeline.clips.push(video_clip("two", 2.0, 3.0));
+        let mut follower = video_clip("two", 2.0, 3.0);
+        follower.extra.insert("keyframes".into(), serde_json::json!([
+            {"time": 2.25, "values": {"x": 0.0}},
+            {"time": 4.0, "values": {"x": 100.0}}
+        ]));
+        timeline.clips.push(follower);
         timeline.snapping = true;
         timeline.move_clip("one", 6.25, TrackId::V1, 0.0, 0.0).unwrap();
         let follower = timeline.clips.iter().find(|clip| clip.id == "two").unwrap();
         assert!((follower.start - 0.0).abs() < 1e-9, "magnetic moves should close the vacated gap");
+        let frames = follower.extra["keyframes"].as_array().unwrap();
+        assert!((frames[0]["time"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+        assert!((frames[1]["time"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ripple_pushes_follower_keyframes_with_their_clip() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("anchor", 0.0, 2.0));
+        let mut follower = video_clip("follower", 1.0, 2.0);
+        follower.extra.insert("keyframes".into(), serde_json::json!([
+            {"time": 1.25, "values": {"x": 0.0}}
+        ]));
+        timeline.clips.push(follower);
+        timeline.ripple_lane_after("anchor").unwrap();
+        let follower = timeline.clips.iter().find(|clip| clip.id == "follower").unwrap();
+        assert!((follower.start - 2.0).abs() < 1e-9);
+        assert!((follower.extra["keyframes"][0]["time"].as_f64().unwrap() - 2.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn left_trim_moves_keyframes_with_the_clip_start() {
+        let mut clip = video_clip("trimmed", 2.0, 4.0);
+        clip.extra.insert("keyframes".into(), serde_json::json!([
+            {"time": 2.5, "values": {"x": 0.0}},
+            {"time": 5.0, "values": {"x": 100.0}}
+        ]));
+        let mut timeline = Timeline::default();
+        timeline.clips.push(clip);
+        timeline.snapping = false;
+        timeline.trim_clip("trimmed", 3.0, 6.0, None).unwrap();
+        let trimmed = timeline.clips.iter().find(|clip| clip.id == "trimmed").unwrap();
+        assert!((trimmed.start - 3.0).abs() < 1e-9);
+        let frames = trimmed.extra["keyframes"].as_array().unwrap();
+        assert!((frames[0]["time"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+        assert!((frames[1]["time"].as_f64().unwrap() - 6.0).abs() < 1e-9);
     }
 }

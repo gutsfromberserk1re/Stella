@@ -120,6 +120,13 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * intensity; balance[band + 2] -= 0.10 * intensity; },
         "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * intensity; balance[band + 2] += 0.12 * intensity; },
         "retro" => for band in [0usize, 3, 6] { balance[band] += 0.15 * intensity; balance[band + 2] -= 0.12 * intensity; },
+        "teal_orange" => {
+            balance[0] -= 0.08 * intensity; balance[1] += 0.025 * intensity; balance[2] += 0.15 * intensity;
+            balance[3] += 0.025 * intensity; balance[4] += 0.02 * intensity;
+            balance[6] += 0.14 * intensity; balance[7] += 0.055 * intensity; balance[8] -= 0.075 * intensity;
+        }
+        "sepia" => for band in [0usize, 3, 6] { balance[band] += 0.18 * intensity; balance[band + 1] += 0.065 * intensity; balance[band + 2] -= 0.14 * intensity; },
+        "bleach" => { balance[6] += 0.035 * intensity; balance[8] -= 0.025 * intensity; },
         _ => {}
     }
     if balance.iter().any(|value| value.abs() > 0.001) {
@@ -142,6 +149,10 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         "fade" => filters.push(format!("eq=contrast={:.3}:brightness={:.3}:saturation={:.3}", 1.0 - 0.16 * intensity, 0.08 * intensity, 1.0 - 0.2 * intensity)),
         "cinema" => filters.push(format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.15 * intensity, 1.0 - 0.15 * intensity)),
         "retro" => filters.push(format!("noise=alls={:.2}:allf=t+u", 12.0 * intensity)),
+        "teal_orange" => filters.push(format!("eq=saturation={:.3}:contrast={:.3}", 1.0 + 0.12 * intensity, 1.0 + 0.05 * intensity)),
+        "sepia" => filters.push(format!("eq=saturation={:.3}", 1.0 - 0.62 * intensity)),
+        "bleach" => filters.push(format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.30 * intensity, 1.0 - 0.55 * intensity)),
+        "pastel" => filters.push(format!("eq=brightness={:.3}:contrast={:.3}:saturation={:.3}", 0.045 * intensity, 1.0 - 0.12 * intensity, 1.0 - 0.10 * intensity)),
         _ => {}
     }
     if enabled(effects, "blur") {
@@ -410,6 +421,24 @@ mod tests {
         let crop_at = graph.find("crop=iw*0.850000").unwrap();
         let pad_at = graph.find("pad=1920:1080").unwrap();
         assert!(scale_at < crop_at && crop_at < pad_at, "crop must be applied to fitted source before the transparent canvas pad");
+    }
+
+    #[test]
+    fn expanded_filter_looks_generate_real_export_filters() {
+        let cases = [
+            ("teal_orange", "eq=saturation=1.120:contrast=1.050"),
+            ("sepia", "eq=saturation=0.380"),
+            ("bleach", "eq=contrast=1.300:saturation=0.450"),
+            ("pastel", "eq=brightness=0.045:contrast=0.880:saturation=0.900"),
+        ];
+        for (preset, expected) in cases {
+            let clip = json!({
+                "start": 0.0,
+                "props": {"effects": {"preset": {"id": preset, "intensity": 100.0}}}
+            });
+            let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+            assert!(graph.contains(expected), "missing {preset} export filter in {graph}");
+        }
     }
 
     #[test]

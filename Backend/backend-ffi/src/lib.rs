@@ -537,7 +537,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let media_hash = media_content_hash(path)?;
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
-    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v6.png"));
+    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v7.png"));
     let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v3.bmp"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-1080p-g30-v4.mp4"))
@@ -551,7 +551,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             media_command(&ffmpeg)
                 .args(["-v", "error", "-i"])
                 .arg(path)
-                .args(["-filter_complex", "showwavespic=s=1024x256:colors=white:scale=sqrt", "-frames:v", "1", "-y"])
+                .args(["-filter_complex", "showwavespic=s=1024x128:colors=white:scale=sqrt:draw=full:filter=peak", "-frames:v", "1", "-y"])
                 .arg(&waveform)
                 .status()
                 .is_ok_and(|status| status.success())
@@ -979,6 +979,35 @@ fn ffmpeg_error(output: std::process::Output) -> String {
     else { detail.chars().take(320).collect() }
 }
 
+fn resolved_export_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if path.exists() {
+        return path.canonicalize().map_err(|error| format!("Invalid export path: {error}"));
+    }
+    let file_name = path.file_name().ok_or("Export path must include a file name")?;
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let parent = parent.canonicalize().map_err(|error| format!("Export folder is unavailable: {error}"))?;
+    Ok(parent.join(file_name))
+}
+
+fn same_filesystem_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    { left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()) }
+    #[cfg(not(windows))]
+    { left == right }
+}
+
+fn ensure_export_does_not_overwrite_input(output: &str, inputs: &[RenderInput]) -> Result<(), String> {
+    let output_path = resolved_export_path(std::path::Path::new(output))?;
+    for input in inputs {
+        let input_path = std::path::Path::new(&input.path).canonicalize()
+            .map_err(|error| format!("Could not resolve source media path: {error}"))?;
+        if same_filesystem_path(&output_path, &input_path) {
+            return Err(format!("Choose a different export file. The selected output is the same file as source media: {}", input.path));
+        }
+    }
+    Ok(())
+}
+
 fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
     let output_path = request["path"].as_str().ok_or("Export path is required")?;
@@ -986,6 +1015,7 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     let height = request["height"].as_u64().unwrap_or(1080).clamp(180, 2160) as u32;
     let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
     let (graph, inputs, duration, has_audio) = export_filter_graph(&timeline, width, height, fps)?;
+    ensure_export_does_not_overwrite_input(output_path, &inputs)?;
     let script = filter_script(id, &graph)?;
     let ffmpeg = multimedia_binary("ffmpeg");
     let mut command = media_command(&ffmpeg);
@@ -1891,6 +1921,23 @@ mod tests {
             linked_clip_id: None,
             extra: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn export_rejects_output_that_is_the_same_as_source_media() {
+        let directory = std::env::temp_dir().join(format!("pluto-export-path-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.mp4");
+        std::fs::write(&source, b"source").unwrap();
+        let inputs = vec![RenderInput { path: source.to_string_lossy().into_owned(), image: false, seek: 0.0 }];
+
+        let same_path = source.to_string_lossy().into_owned();
+        let error = ensure_export_does_not_overwrite_input(&same_path, &inputs).unwrap_err();
+        assert!(error.contains("same file as source media"));
+
+        let different_path = directory.join("export.mp4").to_string_lossy().into_owned();
+        assert!(ensure_export_does_not_overwrite_input(&different_path, &inputs).is_ok());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
