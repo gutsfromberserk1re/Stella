@@ -680,9 +680,12 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         float x = r.x + r.width * .5f;
         float top = r.y + 9.f, bottom = r.y + r.height - 9.f;
         if (bottom < top) bottom = top;
-        DrawLineEx((Vector2){x, top}, (Vector2){x, bottom}, 3.5f, (Color){45, 47, 54, 255});
         float y = bottom - (bottom - top) * fmaxf(0.f, fminf(1.f, cu->v));
         float hover = fmaxf(0.f, fminf(1.f, cu->f));
+        /* rounded track + progress fill from the bottom up to the knob */
+        FillRR((Rectangle){x - 2.f, top - 2.f, 4.f, bottom - top + 4.f}, 2.f, (Color){45, 47, 54, 255});
+        if (bottom - y > .5f)
+            FillRR((Rectangle){x - 2.f, y, 4.f, bottom - y + 2.f}, 2.f, (Color){150, 152, 160, 255});
         DrawCircleV((Vector2){x, y + 1.f}, 7.f + hover * .4f, (Color){0, 0, 0, 95});
         DrawCircleV((Vector2){x, y}, 6.f + hover * .4f, (Color){220, 222, 228, 255});
         DrawCircleV((Vector2){x, y}, 3.f, (Color){244, 245, 248, 255});

@@ -417,7 +417,7 @@ static void TimelineClipLane(int track) {
                 float w = fmaxf(46.f, media->duration * pps);
                 float left = fmaxf(targetBox.x, x), right = fminf(targetBox.x + targetBox.width, x + w);
                 if (right > left) {
-                    float h = fminf(48.f, targetBox.height - 6.f);
+                    float h = fmaxf(30.f, targetBox.height - 8.f);
                     gMediaDropPreview = (Rectangle){left, targetBox.y + (targetBox.height - h) * .5f, right - left, h};
                     gMediaDropPreviewClip = -1;
                     gMediaDropPreviewMedia = gMediaDragIndex;
@@ -570,7 +570,7 @@ static void TimelineClipLane(int track) {
                     float w = fmaxf(46.f, gTimelineClips[i].duration * pps);
                     float left = fmaxf(targetBox.x, x), right = fminf(targetBox.x + targetBox.width, x + w);
                     if (right > left) {
-                        float h = fminf(48.f, targetBox.height - 6.f);
+                        float h = fmaxf(30.f, targetBox.height - 8.f);
                         gMediaDropPreview = (Rectangle){left, targetBox.y + (targetBox.height - h) * .5f, right - left, h};
                         gMediaDropPreviewClip = i;
                         gMediaDropPreviewMedia = gTimelineClips[i].mediaIndex;
@@ -615,7 +615,7 @@ static void TimelineClipLane(int track) {
                 if ((leftDistance >= -1.f && leftDistance <= 9.f) ||
                     (rightDistance >= -1.f && rightDistance <= 9.f)) gResize = 1;
             }
-            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fminf(48.f, lane.height - 6.f))}, .padding = {8, 5, 5, 0}, .childGap = 6, .childAlignment = {.y = CLAY_ALIGN_Y_TOP}},
+            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fmaxf(30.f, lane.height - 8.f))}, .padding = {8, 5, 5, 0}, .childGap = 6, .childAlignment = {.y = CLAY_ALIGN_Y_TOP}},
                           .clip = {.horizontal = true, .vertical = true},
                           .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, b.hover,
                                                      (i << 1) | (clipSelected ? 1 : 0))}}) {
@@ -887,10 +887,10 @@ static void Timeline(void) {
             Bs mb = Interact(mid);
             if (mb.clicked) PlutoTimelineSnap(!gTimelineSnap);
             CLAY(mid, {.layout = {.sizing = {FIX(36), FIX(36)}, .childAlignment = AL_C},
-                       .backgroundColor = gTimelineSnap ? BtnBg(RGB(27, 29, 34), RGB(36, 38, 44), mb) : BtnBg(RGB(30, 31, 36), RGB(42, 44, 50), mb),
+                       .backgroundColor = gTimelineSnap ? BtnBg(RGB(38, 40, 47), RGB(46, 48, 56), mb) : BtnBg(RGB(30, 31, 36), RGB(42, 44, 50), mb),
                        .cornerRadius = CLAY_CORNER_RADIUS(10),
-                       .border = {.color = gTimelineSnap ? RGB(44, 47, 55) : RGB(48, 50, 58), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                Icon(I_MAGNET, 17, gTimelineSnap ? RGB(157, 163, 176) : C_ICON);
+                       .border = {.color = gTimelineSnap ? RGB(96, 100, 112) : RGB(48, 50, 58), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                Icon(I_MAGNET, 17, gTimelineSnap ? C_TEXT : C_ICON);
             }
         }
         CLAY(CLAY_ID("TimeBody"), {.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, GROW}}}) {

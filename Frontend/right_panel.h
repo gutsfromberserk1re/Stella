@@ -394,6 +394,8 @@ static void CommitValueEdit(float *v) {
     gEditValueId = 0;
 }
 
+static double gCaretT;   /* last edit activity: the caret stays solid while typing, then blinks */
+
 static bool ValueFieldLogicEx(Clay_ElementId id, float *v, float dragSensitivity, bool allowNegative) {
     float original = *v;
     bool committed = false;
@@ -401,14 +403,25 @@ static bool ValueFieldLogicEx(Clay_ElementId id, float *v, float dragSensitivity
     bool over = Clay_PointerOver(id);
     if (dragSensitivity >= 0.f && (over || gValueDragId == id.id)) gScrubCursor = true;
     if (gEditValueId == id.id) {
+        bool typed = false;
         if (IsKeyPressed(KEY_ENTER)) { CommitValueEdit(v); committed = true; valueChanged = fabsf(*v - original) > 0.001f; }
-        else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
+        else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) { gEditValueText[--gEditValueLen] = 0; typed = true; }
         int ch;
         while ((ch = GetCharPressed()) != 0) {
             if (((ch >= '0' && ch <= '9') || ch == '.' || (allowNegative && ch == '-' && gEditValueLen == 0)) &&
                 gEditValueLen < (int)sizeof(gEditValueText) - 1) {
                 gEditValueText[gEditValueLen++] = (char)ch;
                 gEditValueText[gEditValueLen] = 0;
+                typed = true;
+            }
+        }
+        if (typed) {
+            gCaretT = GetTime();
+            /* Live update: the value follows every keystroke instead of waiting for Enter / click-away. */
+            if (gEditValueLen > 0) {
+                *v = strtof(gEditValueText, NULL);
+                committed = true;
+                valueChanged = fabsf(*v - original) > 0.001f;
             }
         }
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over) { CommitValueEdit(v); committed = true; valueChanged = fabsf(*v - original) > 0.001f; }
@@ -431,6 +444,7 @@ static bool ValueFieldLogicEx(Clay_ElementId id, float *v, float dragSensitivity
                     gEditValueId = id.id;
                     gEditValueLen = 0;
                     gEditValueText[0] = 0;
+                    gCaretT = GetTime();
                 }
                 gLastValueClickId = id.id;
                 gLastValueClickTime = now;
@@ -446,6 +460,15 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
     return ValueFieldLogicEx(id, v, dragSensitivity, true);
 }
 
+/* Edit-mode text: the typed digits followed by a blinking caret bar. */
+static void EditCaretText(float size, Clay_Color color) {
+    if (gEditValueLen > 0) Tx(gEditValueText, size, color, 0);
+    bool on = fmod(GetTime() - gCaretT, 1.0) < .55;
+    CLAY_AUTO_ID({.layout = {.sizing = {FIX(2), FIX(roundf(size * 1.15f))}},
+                  .backgroundColor = on ? color : (Clay_Color){0, 0, 0, 0},
+                  .cornerRadius = CLAY_CORNER_RADIUS(1)}) {}
+}
+
 /* Value pills share one visual component; callers choose whether mouse scrubbing is enabled. */
 static bool ValBoxInternal(Clay_ElementId id, float *value, const char *unit,
                            float w, float h, float fs, float ufs, float pad,
@@ -459,7 +482,7 @@ static bool ValBoxInternal(Clay_ElementId id, float *value, const char *unit,
               .cornerRadius = CLAY_CORNER_RADIUS(12),
               .border = {.color = Mix(C_VALBOX, RGB(65, 67, 75), over ? .45f : 0.f),
                          .width = CLAY_BORDER_OUTSIDE(over ? 1 : 0)}}) {
-        if (gEditValueId == id.id) Tx(Fmt("%s|", gEditValueText), fs + 2.f, C_TEXT, 0);
+        if (gEditValueId == id.id) EditCaretText(fs + 2.f, C_TEXT);
         else Tx(decimals > 0 ? Fmt("%.*f", decimals, *value) : Fmt("%.0f", *value), fs + 2.f, C_TEXT, 0);
         if (unit) Tx(unit, ufs + 1.f, C_ICON, 0);
     }
@@ -538,7 +561,8 @@ static void NumField(int n, float *v, const char *unit) {
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
             HSPACE
-            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
+            if (gEditValueId == scrubId.id) EditCaretText(22, C_TEXT);
+            else Tx(Fmt("%d", (int)roundf(*v)), 22, C_TEXT, 0);
             Tx(unit, 17, C_ICON, 0);
         }
         GAPX(3)
@@ -602,7 +626,8 @@ static void MiniField(int n, const char *lab) {
         Tx(lab, 12, RGB(112, 124, 156), 1);
         CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
             HSPACE
-            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : (n < 4 ? Fmt("%.1f", gMini[n]) : Fmt("%.0f", gMini[n])), 18, C_TEXT, 0);
+            if (gEditValueId == scrubId.id) EditCaretText(18, C_TEXT);
+            else Tx(n < 4 ? Fmt("%.1f", gMini[n]) : Fmt("%.0f", gMini[n]), 18, C_TEXT, 0);
             Tx(n < 4 ? "%" : "px", 13, C_ICON, 0);
         }
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}, .padding = {2, 0, 0, 0}}}) {
@@ -1147,7 +1172,7 @@ static void FxParam(int i, int p, const char *label) {
             Tx(label, 13.5f, C_MUTED, 0);
             HSPACE
             float displayValue = isAngle ? roundf((*v - .5f) * 360.f) : roundf(*v * 100.f);
-            if (ValBoxEditable(CLAY_IDI("FxValue", i * 2 + p), &displayValue,
+            if (ValBoxTyped(CLAY_IDI("FxValue", i * 2 + p), &displayValue,
                                isAngle ? "\xC2\xB0" : NULL, 72, 22, 13.f, 11.f, 10,
                                isAngle ? -180.f : 0.f, isAngle ? 180.f : 100.f, 0)) {
                 *v = isAngle ? .5f + displayValue / 360.f : displayValue / 100.f;
@@ -1174,7 +1199,8 @@ static void FxParam(int i, int p, const char *label) {
 
 static void FxBody(int i) {
     CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 12, 12, 12}, .childGap = 9},
-                                 .backgroundColor = C_RCARD}) {
+                                 .backgroundColor = C_RCARD,
+                                 .cornerRadius = {0.f, 0.f, 18.f, 18.f}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
             Clay_ElementId swid = CLAY_IDI("FxSw", i);
@@ -1288,7 +1314,8 @@ static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon,
                                           connected ? 0 : verticalInset, connected ? 0 : verticalInset}}}) {
         CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
                   .backgroundColor = Mix(Mix(base, RGB(33, 34, 38), openAnim), hoverBase, b.hover * 0.55f),
-                  .cornerRadius = connected ? CLAY_CORNER_RADIUS(0) : CLAY_CORNER_RADIUS(18),
+                  .cornerRadius = connected ? (Clay_CornerRadius){18.f, 18.f, 18.f * (1.f - openAnim), 18.f * (1.f - openAnim)}
+                                            : CLAY_CORNER_RADIUS(18),
                   .border = {.color = connected ? RGBA(0, 0, 0, 0) :
                                   Mix(C_RCARDB, RGB(62, 64, 72), b.hover * 0.48f),
                              .width = CLAY_BORDER_OUTSIDE(connected ? 0 : 1)}}) {
@@ -1372,7 +1399,11 @@ static void EffectsView(void) {
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
 
-    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT},
+    /* Lock the tab to the inspector's real width (tab bar width minus InspContent's 13+13 padding).
+       Without this a long unwrapped line in an open card widens the whole column. */
+    float effectsInnerW = Clay_GetElementData(CLAY_ID("InspTabs")).boundingBox.width - 26.f;
+    Clay_SizingAxis effectsW = effectsInnerW > 40.f ? (Clay_SizingAxis)FIX(effectsInnerW) : (Clay_SizingAxis)GROW;
+    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {effectsW, FIT},
                                          .padding = {0, 12, 0, 0}, .childGap = 10},
                                   .clip = {.horizontal = true}}) {
         /* Transitions: a measured-height wrapper animates the content just
@@ -1399,11 +1430,11 @@ static void EffectsView(void) {
                                              .clip = {.horizontal = true}}) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
                     if (next < 0) {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}, .clip = {.horizontal = true}}) {
                             TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
                         }
                     } else {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}, .clip = {.horizontal = true}}) {
                             TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
                         }
                         const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
@@ -1879,7 +1910,8 @@ static void TextPosField(int n, const char *lab, float *norm, float lo, float hi
                   .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
             CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
                 HSPACE
-                Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%d", (int)roundf(pct)), 22, C_TEXT, 0);
+                if (gEditValueId == scrubId.id) EditCaretText(22, C_TEXT);
+                else Tx(Fmt("%d", (int)roundf(pct)), 22, C_TEXT, 0);
                 Tx("%", 17, C_ICON, 0);
             }
             GAPX(3)
@@ -1962,23 +1994,11 @@ static void TextView(void) {
                     gTextPosX = .5f; gTextPosY = .78f;
                 }
             }
-            if (gRightW <= RIGHT_MIN + 28.f) {
-                /* The narrow inspector stacks the position picker and fields
-                   so the percentage controls never extend beyond the panel. */
-                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-                    TextPosGrid();
-                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
-                        TextPosField(0, "X", &gTextPosX, .03f, .97f);
-                        TextPosField(1, "Y", &gTextPosY, .04f, .96f);
-                    }
-                }
-            } else {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
-                    TextPosGrid();
-                    CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-                        TextPosField(0, "X", &gTextPosX, .03f, .97f);
-                        TextPosField(1, "Y", &gTextPosY, .04f, .96f);
-                    }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
+                TextPosGrid();
+                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
+                    TextPosField(0, "X", &gTextPosX, .03f, .97f);
+                    TextPosField(1, "Y", &gTextPosY, .04f, .96f);
                 }
             }
         }
