@@ -560,6 +560,44 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         };
         generated.then(|| waveform.to_string_lossy().into_owned())
     } else { None };
+    // Raylib streams cached audio proxies so MP4/MOV audio never needs to be
+    // decoded by FFmpeg during playback. OGG is preferred; MP3 is the fallback
+    // for bundled FFmpeg builds that omit libvorbis.
+    let audio_playback = cache_dir.join(format!("{media_hash:016x}-playback-v2.ogg"));
+    let audio_playback_path = if has_audio {
+        let ogg_ready = if audio_playback.metadata().is_ok_and(|meta| meta.len() > 256) {
+            true
+        } else {
+            let _ = std::fs::remove_file(&audio_playback);
+            media_command(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-i"])
+                .arg(path)
+                .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar", "48000", "-c:a", "libvorbis", "-q:a", "4", "-y"])
+                .arg(&audio_playback)
+                .status()
+                .is_ok_and(|status| status.success())
+                && audio_playback.metadata().is_ok_and(|meta| meta.len() > 256)
+        };
+        if ogg_ready {
+            Some(audio_playback.to_string_lossy().into_owned())
+        } else {
+            let mp3 = cache_dir.join(format!("{media_hash:016x}-playback-v2.mp3"));
+            let mp3_ready = if mp3.metadata().is_ok_and(|meta| meta.len() > 256) {
+                true
+            } else {
+                let _ = std::fs::remove_file(&mp3);
+                media_command(&ffmpeg)
+                    .args(["-hide_banner", "-loglevel", "error", "-i"])
+                    .arg(path)
+                    .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar", "48000", "-c:a", "libmp3lame", "-q:a", "3", "-y"])
+                    .arg(&mp3)
+                    .status()
+                    .is_ok_and(|status| status.success())
+                    && mp3.metadata().is_ok_and(|meta| meta.len() > 256)
+            };
+            mp3_ready.then(|| mp3.to_string_lossy().into_owned())
+        }
+    } else { None };
     let thumbnail_path = if kind == "audio" {
         None
     } else {
@@ -611,6 +649,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
         "path": path.to_string_lossy(), "name": name, "duration": duration,
         "kind": kind, "hasAudio": has_audio,
         "proxyPath": proxy.to_string_lossy(),
+        "audioPlaybackPath": audio_playback_path,
         "filmstripPath": Value::Null, "waveformPath": waveform_path, "thumbnailPath": thumbnail_path
     }))
 }
@@ -747,6 +786,15 @@ fn transition_between(left: &Clip, right: &Clip) -> Option<(String, f64)> {
     (duration > 0.0).then_some((kind, duration))
 }
 
+fn transition_preroll_source_time(source_offset: f64, duration: f64, elapsed: f64) -> f64 {
+    let duration = duration.max(0.0);
+    let source_offset = source_offset.max(0.0);
+    let available_preroll = source_offset.min(duration);
+    let missing_preroll = duration - available_preroll;
+    let source_start = source_offset - available_preroll;
+    source_start + (elapsed.max(0.0) - missing_preroll).max(0.0)
+}
+
 fn timeline_transition_start_at(timeline: &Timeline, at: f64) -> Option<f64> {
     let mut clips: Vec<_> = timeline.clips.iter()
         .filter(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"))
@@ -848,13 +896,19 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let right = video_clips[i + 1];
         let transition_start = right.start - duration;
         let left_source = left.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0) + left.duration - duration;
-        let right_source = right.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
+        let requested_right_source = right.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+        let available_preroll = requested_right_source.min(*duration);
+        let missing_preroll = (*duration - available_preroll).max(0.0);
+        let right_source = requested_right_source - available_preroll;
         let mut left_value = serde_json::to_value(left).map_err(|e| e.to_string())?;
         let mut right_value = serde_json::to_value(right).map_err(|e| e.to_string())?;
         left_value["sourceOffset"] = json!(left_source);
         right_value["sourceOffset"] = json!(right_source);
         let (left_filters, left_x, left_y) = filters::video_filters(&left_value, width, height, 0.0, *duration, None, None);
-        let (right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
+        let (mut right_filters, right_x, right_y) = filters::video_filters(&right_value, width, height, 0.0, *duration, None, None);
+        if missing_preroll > 1.0 / fps.max(1) as f64 {
+            right_filters.push_str(&format!(",tpad=start_mode=clone:start_duration={missing_preroll:.5}"));
+        }
         let left_raw = format!("tx{i}a_raw");
         let right_raw = format!("tx{i}b_raw");
         let left_full = format!("tx{i}a");
@@ -1005,9 +1059,9 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
 }
 
 impl PreviewEngine {
-    /// Fast path for video playback and transform keyframes: reuse in-process
-    /// FFmpeg decoders, then evaluate keyframes into Stella's WGPU layer uniforms.
-    /// Still images and active transitions retain the FFmpeg graph fallback.
+    /// Fast path for video playback, transform keyframes and transitions: reuse
+    /// in-process FFmpeg decoders, then evaluate every active layer in WGPU.
+    /// Still images and unsupported media retain the FFmpeg graph fallback.
     fn render_native(
         &mut self,
         timeline: &Timeline,
@@ -1021,8 +1075,30 @@ impl PreviewEngine {
         decode_ms: &mut f64,
         ring_depth: &mut usize,
     ) -> Result<Option<(u32, u32, f64)>, String> {
-        if timeline_transition_start_at(timeline, frame_at).is_some() {
-            return note_fallback(1);
+        // During an edit transition the incoming clip becomes a second GPU
+        // layer before its timeline cut. The shader applies its transition mask;
+        // the outgoing clip remains underneath, so no expensive FFmpeg graph is
+        // started merely because the playhead is inside a transition.
+        let mut ordered_video: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
+            clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+        }).collect();
+        ordered_video.sort_by(|a, b| {
+            let rank = |track: TrackId| match track {
+                TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
+                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5,
+            };
+            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
+        });
+        let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
+        for pair in ordered_video.windows(2) {
+            let (kind, duration) = match transition_between(pair[0], pair[1]) {
+                Some(value) => value,
+                None => continue,
+            };
+            let transition_start = pair[1].start - duration;
+            if frame_at + 1e-7 >= transition_start && frame_at < pair[1].start - 1e-7 {
+                incoming_transitions.insert(pair[1].id.clone(), (kind, duration));
+            }
         }
 
         let mut active: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
@@ -1031,6 +1107,11 @@ impl PreviewEngine {
                 && frame_at + 1e-7 >= clip.start
                 && frame_at < clip.end() - 1e-7
         }).collect();
+        for clip in &ordered_video {
+            if incoming_transitions.contains_key(&clip.id) && !active.iter().any(|current| current.id == clip.id) {
+                active.push(*clip);
+            }
+        }
 
         // A gap is a valid native frame and should not start an FFmpeg process.
         if active.is_empty() {
@@ -1039,14 +1120,14 @@ impl PreviewEngine {
             return Ok(Some((width, height, frame_at)));
         }
 
-        // Keep the renderer's layer order identical to the timeline's track order.
-        active.sort_by_key(|clip| match clip.track {
-            TrackId::V1 => 0,
-            TrackId::V2 => 1,
-            TrackId::V3 => 2,
-            TrackId::V4 => 3,
-            TrackId::A1 => 4,
-            TrackId::A2 => 5,
+        // Keep compositing order stable for every layer. Within one track, the
+        // incoming clip must sit above the outgoing clip during its transition.
+        active.sort_by(|a, b| {
+            let rank = |track: TrackId| match track {
+                TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
+                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5,
+            };
+            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
         });
 
         // Video keyframes are evaluated into the same WGPU uniforms as static
@@ -1069,7 +1150,11 @@ impl PreviewEngine {
                 return note_fallback(4);
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
-            let source_time = (source_offset + (frame_at - clip.start)).max(0.0);
+            let source_time = if let Some((_, duration)) = incoming_transitions.get(&clip.id) {
+                transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+            } else {
+                (source_offset + (frame_at - clip.start)).max(0.0)
+            };
             let remaining = (clip.end() - frame_at).max(0.0);
             if source.is_empty() {
                 eprintln!("Stella native preview fallback for '{}': empty source path", original);
@@ -1114,7 +1199,12 @@ impl PreviewEngine {
                 pixels: frame.rgba.as_slice(),
                 width: frame.width,
                 height: frame.height,
-                uniforms: LayerUniforms::from_props_with_keyframes(props, frame_at, keyframes),
+                uniforms: {
+                    let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
+                        (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
+                    });
+                    LayerUniforms::from_props_with_keyframes_and_transition(props, frame_at, keyframes, transition)
+                },
             }
         }).collect();
 
@@ -1883,6 +1973,20 @@ mod tests {
         assert_eq!(frames[1]["values"]["opacity"].as_f64(), Some(35.0));
         assert_eq!(frames[1]["values"]["scaleW"].as_f64(), Some(150.0));
         assert_eq!(frames[2]["values"]["x"].as_f64(), Some(30.0));
+    }
+
+    #[test]
+    fn transition_preroll_holds_first_frame_when_source_has_no_handle() {
+        assert!((transition_preroll_source_time(0.0, 0.8, 0.0) - 0.0).abs() < 1e-9);
+        assert!((transition_preroll_source_time(0.0, 0.8, 0.4) - 0.0).abs() < 1e-9);
+        assert!((transition_preroll_source_time(0.0, 0.8, 0.8) - 0.0).abs() < 1e-9);
+        assert!((transition_preroll_source_time(0.0, 0.8, 1.2) - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_preroll_consumes_available_source_handle_without_cut_jump() {
+        assert!((transition_preroll_source_time(1.5, 0.8, 0.0) - 0.7).abs() < 1e-9);
+        assert!((transition_preroll_source_time(1.5, 0.8, 0.8) - 1.5).abs() < 1e-9);
     }
 
     #[test]

@@ -124,11 +124,8 @@ impl Timeline {
         if self.clips.iter().any(|current| current.id == clip.id) {
             return Err(TimelineError::DuplicateId(clip.id));
         }
-        if clip.track.is_video() {
-            clip.start = self.magnetic_start(&clip.id, clip.start.max(0.0), None);
-            if self.snapping {
-                clip.start = self.snap_start(&clip.id, clip.start, clip.duration, 0.0, 0.25, None);
-            }
+        if clip.track.is_video() && self.snapping {
+            clip.start = self.snap_start(&clip.id, clip.start.max(0.0), clip.duration, 0.0, 0.25, None);
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
@@ -171,9 +168,9 @@ impl Timeline {
         }).cloned().collect();
         if members.is_empty() { members.push(original.clone()); }
         let mut start = desired_start.max(0.0);
-        if original.track.is_video() {
-            start = self.magnetic_start(id, start, group_id.as_deref());
-        }
+        // Proximity snapping is the only positioning snap. Storyline gap-closing
+        // remains a separate edit operation below, so disabling the magnet truly
+        // allows free placement instead of pulling clips to the previous edge.
         if self.snapping && original.track.is_video() {
             start = self.snap_start(id, start, original.duration, playhead, snap_threshold, group_id.as_deref());
         }
@@ -190,7 +187,9 @@ impl Timeline {
         let max_lane = lanes.len().saturating_sub(1) as i32;
         let track_shift = requested_track_shift.clamp(-min_rank, max_lane - max_rank);
 
-        if original.track.is_video() {
+        if original.track.is_video() && self.snapping {
+            // Gap-closing is part of magnetic placement. With the magnet off,
+            // preserve the vacated space so clips can be positioned freely.
             let mut vacated: Vec<_> = members.iter().filter(|clip| clip.track.is_video()).cloned().collect();
             vacated.sort_by(|a, b| a.track.lanes().iter().position(|t| *t == a.track).cmp(&b.track.lanes().iter().position(|t| *t == b.track)).then_with(|| a.start.total_cmp(&b.start)));
             for clip in &vacated {
@@ -427,19 +426,6 @@ impl Timeline {
         best.map_or(start, |(_, value)| value.max(0.0))
     }
 
-    /// The video storyline is always magnetic: place a clip at the latest
-    /// video edge to its left. This remains active when proximity snapping is
-    /// disabled in the UI.
-    fn magnetic_start(&self, id: &str, desired_start: f64, exclude_group: Option<&str>) -> f64 {
-        self.clips.iter()
-            .filter(|clip| clip.id != id && clip.track.is_video()
-                && exclude_group.map_or(true, |group| clip.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group))
-                && clip.end() <= desired_start + EPSILON)
-            .map(Clip::end)
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0)
-    }
-
     /// Close the vacated section of a video lane when moving a clip away.
     /// Followers shift left by the removed duration, preserving their order.
     fn close_lane_gap(&mut self, moving_id: &str, track: TrackId, start: f64, end: f64, group_id: Option<&str>) {
@@ -550,5 +536,59 @@ impl Timeline {
             .iter()
             .map(Clip::end)
             .fold(MIN_TIMELINE_SECONDS, f64::max);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video_clip(id: &str, start: f64, duration: f64) -> Clip {
+        Clip {
+            id: id.to_owned(), track: TrackId::V1, start, duration,
+            label: id.to_owned(), linked_clip_id: None, extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn move_clip_is_free_when_proximity_snapping_is_disabled() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("one", 0.0, 2.0));
+        timeline.snapping = false;
+        let moved = timeline.move_clip("one", 5.37, TrackId::V1, 0.0, 0.25).unwrap();
+        assert!((moved.start - 5.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn add_clip_does_not_force_storyline_alignment_when_snapping_is_disabled() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("one", 0.0, 2.0));
+        timeline.snapping = false;
+        timeline.add_clip(video_clip("two", 5.37, 1.0)).unwrap();
+        let added = timeline.clips.iter().find(|clip| clip.id == "two").unwrap();
+        assert!((added.start - 5.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn moving_with_magnet_off_does_not_ripple_following_clips() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("one", 0.0, 2.0));
+        timeline.clips.push(video_clip("two", 2.0, 3.0));
+        timeline.snapping = false;
+        timeline.move_clip("one", 6.25, TrackId::V1, 0.0, 0.25).unwrap();
+        let follower = timeline.clips.iter().find(|clip| clip.id == "two").unwrap();
+        assert!((follower.start - 2.0).abs() < 1e-9, "magnet-off moves must preserve the lane gap");
+    }
+
+    #[test]
+    fn moving_with_magnet_on_closes_the_vacated_lane_gap() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("one", 0.0, 2.0));
+        timeline.clips.push(video_clip("two", 2.0, 3.0));
+        timeline.snapping = true;
+        timeline.move_clip("one", 6.25, TrackId::V1, 0.0, 0.0).unwrap();
+        let follower = timeline.clips.iter().find(|clip| clip.id == "two").unwrap();
+        assert!((follower.start - 0.0).abs() < 1e-9, "magnetic moves should close the vacated gap");
     }
 }

@@ -132,8 +132,19 @@ impl LayerUniforms {
     /// uniforms. Keyframe times are absolute timeline seconds and values use
     /// x, y, scaleW, scaleH, rotation (degrees), and opacity (percent).
     pub fn from_props_with_keyframes(props: &Value, time: f64, keyframes: &Value) -> Self {
+        Self::from_props_with_keyframes_and_transition(props, time, keyframes, None)
+    }
+
+    /// Resolves keyframes and applies an incoming transition in the same GPU
+    /// uniform update. This keeps transition playback on the native compositor.
+    pub fn from_props_with_keyframes_and_transition(
+        props: &Value,
+        time: f64,
+        keyframes: &Value,
+        transition_in: Option<(&str, f32)>,
+    ) -> Self {
         let resolved = resolve_keyframed_props(props, keyframes, time);
-        Self::from_props(&resolved, time)
+        Self::from_props_with_transition(&resolved, time, transition_in)
     }
 
     /// Maps the active incoming transition along with the clip's visual properties.
@@ -461,6 +472,24 @@ mod tests {
         let after = LayerUniforms::from_props_with_keyframes(&props, 4.0, &keyframes);
         assert_eq!(before.geo0[0], 1.0);
         assert!((after.geo0[0] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn crop_uniforms_clamp_negative_and_overwide_edges() {
+        let props = json!({"transform": {"crop": {"left": -800.0, "right": 5000.0, "top": -30.0, "bottom": 5000.0}}});
+        let uniforms = LayerUniforms::from_props(&props, 0.0);
+        assert_eq!(uniforms.crop, [0.0, 0.45, 0.0, 0.45]);
+    }
+
+    #[test]
+    fn keyframed_incoming_transition_is_mapped_to_native_uniforms() {
+        let props = json!({"transform": {"opacity": 80.0}});
+        let keyframes = json!([{"time": 0.0, "values": {"opacity": 60.0}}]);
+        let u = LayerUniforms::from_props_with_keyframes_and_transition(
+            &props, 0.0, &keyframes, Some(("wipeleft", 0.35))
+        );
+        assert!((u.opacity() - 0.60).abs() < 1e-5);
+        assert_eq!(u.transition, [-1.0, 0.0, 0.35, 2.0]);
     }
 
     #[test]

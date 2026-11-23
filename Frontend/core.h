@@ -147,6 +147,9 @@ static char gMediaHoverName[260];
 static Rectangle gMediaHoverRect;
 static Rectangle gMediaDropPreview;
 static bool gMediaDropPreviewVisible;
+/* -1 = newly imported media, >=0 = existing timeline clip ghost. */
+static int gMediaDropPreviewClip = -1;
+static int gMediaDropPreviewMedia = -1;
 static int   gTimelineTool;
 static float gTimelineZoom = 1.f, gTimelinePan, gPlayhead;
 static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineGrid;
@@ -249,7 +252,7 @@ static bool gScrubCursor;
 #define MAX_IMPORTED_MEDIA 64
 typedef struct {
     char path[1024], name[260], kind[16];
-    char waveformPath[1024], thumbnailPath[1024];
+    char waveformPath[1024], thumbnailPath[1024], audioPath[1024];
     Texture2D waveform, thumbnail;
     float duration;
     bool hasAudio;
@@ -270,11 +273,12 @@ enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
        KF_SCALE_H = 1u << 3, KF_ROTATION = 1u << 4, KF_OPACITY = 1u << 5 };
 
 typedef struct {
-    char id[64], label[260], path[1024], groupId[64], linkedId[64], kind[16];
+    char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
     int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
-    bool hasAudio;
+    float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
+    bool hasAudio, audioFadeIn, audioFadeOut;
     TimelineKeyframeUi keyframes[32];
     int keyframeCount;
 } TimelineClipUi;

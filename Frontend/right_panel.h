@@ -97,7 +97,13 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         "props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
         "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"
     };
-    for (int i = 0; i < 8; i++) gMini[i] = PlutoReadNumber(clipBegin, clipEnd, miniPaths[i], 0.f);
+    for (int i = 0; i < 8; i++) {
+        float stored = PlutoReadNumber(clipBegin, clipEnd, miniPaths[i], 0.f);
+        /* Crop is displayed as a percentage of the 1920x1080 reference canvas;
+           the renderer and project format continue storing reference pixels. */
+        gMini[i] = i < 4 ? stored * 100.f / ((i == 0 || i == 3) ? 1080.f : 1920.f) : stored;
+        if (i < 4) gMini[i] = fmaxf(0.f, fminf(45.f, gMini[i]));
+    }
 
     gHsl = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.colors.hsl.selected", 0.f));
     if (gHsl < 0 || gHsl > 8) gHsl = 0;
@@ -304,7 +310,7 @@ static void CommitValueEdit(float *v) {
     gEditValueId = 0;
 }
 
-static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) {
+static bool ValueFieldLogicEx(Clay_ElementId id, float *v, float dragSensitivity, bool allowNegative) {
     float original = *v;
     bool committed = false;
     bool valueChanged = false;
@@ -315,7 +321,8 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
         else if (IsKeyPressed(KEY_BACKSPACE) && gEditValueLen > 0) gEditValueText[--gEditValueLen] = 0;
         int ch;
         while ((ch = GetCharPressed()) != 0) {
-            if (((ch >= '0' && ch <= '9') || ch == '.' || ch == '-') && gEditValueLen < (int)sizeof(gEditValueText) - 1) {
+            if (((ch >= '0' && ch <= '9') || ch == '.' || (allowNegative && ch == '-' && gEditValueLen == 0)) &&
+                gEditValueLen < (int)sizeof(gEditValueText) - 1) {
                 gEditValueText[gEditValueLen++] = (char)ch;
                 gEditValueText[gEditValueLen] = 0;
             }
@@ -349,6 +356,10 @@ static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) 
         }
     }
     return committed && valueChanged;
+}
+
+static bool ValueFieldLogic(Clay_ElementId id, float *v, float dragSensitivity) {
+    return ValueFieldLogicEx(id, v, dragSensitivity, true);
 }
 
 /* Value pills share one visual component; callers choose whether mouse scrubbing is enabled. */
@@ -411,7 +422,7 @@ static void NumField(int n, float *v, const char *unit) {
     Clay_ElementId scrubId = CLAY_IDI("NumScrub", n);
     Bs b = Interact(id);
     float before = gValueDragId == scrubId.id ? gValueDragStart : *v;
-    bool changed = ValueFieldLogic(scrubId, v, .2f);
+    bool changed = ValueFieldLogic(scrubId, v, .65f);
     int linkedGroup = n < 2 ? 0 : 1;
     bool linkedDrag = gLink[linkedGroup] && gValueDragId == scrubId.id && gValueDragging;
     if (linkedDrag) {
@@ -460,16 +471,19 @@ static void MiniField(int n, const char *lab) {
     Clay_ElementId id = CLAY_IDI("MiniF", n);
     Clay_ElementId scrubId = CLAY_IDI("MiniScrub", n);
     Bs b = Interact(id);
-    bool changed = ValueFieldLogic(scrubId, &gMini[n], .2f);
+    bool changed = ValueFieldLogicEx(scrubId, &gMini[n], 1.55f, n >= 4);
     static const char *paths[8] = {"props.transform.crop.top", "props.transform.crop.left", "props.transform.crop.right", "props.transform.crop.bottom",
                                    "props.transform.distort.tl", "props.transform.distort.tr", "props.transform.distort.bl", "props.transform.distort.br"};
+    if (n >= 0 && n < 4) gMini[n] = fmaxf(0.f, fminf(45.f, gMini[n]));
+    else if (n >= 4 && n < 8) gMini[n] = fmaxf(-2000.f, fminf(2000.f, gMini[n]));
+    float storeValue = n < 4 ? gMini[n] * ((n == 0 || n == 3) ? 1080.f : 1920.f) / 100.f : gMini[n];
     if (gValueDragging && gValueDragId == scrubId.id && n >= 0 && n < 8) {
         if (n < 4 && gLink[2]) {
             int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
             gMini[other] = gMini[n];
             char updates[384];
             snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
-                     paths[n], gMini[n], paths[other], gMini[other]);
+                     paths[n], storeValue, paths[other], (other < 4 ? gMini[other] * ((other == 0 || other == 3) ? 1080.f : 1920.f) / 100.f : gMini[other]));
             PlutoTimelineSetPropertiesLiveJson(updates);
         } else if (n >= 4 && gLink[3]) {
             char updates[768] = "["; size_t used = 1;
@@ -479,14 +493,14 @@ static void MiniField(int n, const char *lab) {
                 if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
             }
             if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesLiveJson(updates); }
-        } else PlutoTimelineSetPropertyLive(paths[n], gMini[n]);
+        } else PlutoTimelineSetPropertyLive(paths[n], storeValue);
     }
     if (changed && n >= 0 && n < 8) {
         if (n < 4 && gLink[2]) {
             int other = (n == 0) ? 3 : (n == 3) ? 0 : (n == 1) ? 2 : 1;
             gMini[other] = gMini[n];
             char updates[384];
-            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]", paths[n], gMini[n], paths[other], gMini[other]);
+            snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]", paths[n], storeValue, paths[other], (other < 4 ? gMini[other] * ((other == 0 || other == 3) ? 1080.f : 1920.f) / 100.f : gMini[other]));
             PlutoTimelineSetPropertiesJson(updates);
         } else if (n >= 4 && gLink[3]) {
             char updates[768] = "["; size_t used = 1;
@@ -496,16 +510,16 @@ static void MiniField(int n, const char *lab) {
                 if (written > 0 && (size_t)written < sizeof(updates) - used) used += (size_t)written;
             }
             if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
-        } else PlutoTimelineSetProperty(paths[n], gMini[n]);
+        } else PlutoTimelineSetProperty(paths[n], storeValue);
     }
-    CLAY(id, {.layout = {.sizing = {FIX(112), FIX(34)}, .padding = {10, 6, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
+    CLAY(id, {.layout = {.sizing = {FIX(104), FIX(32)}, .padding = {8, 5, 0, 0}, .childGap = 4, .childAlignment = AL_Y},
               .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), b.hover * 0.45f), .cornerRadius = CLAY_CORNER_RADIUS(10),
               .border = {.color = Mix(C_RFIELD, RGB(76, 79, 88), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
         Tx(lab, 12, RGB(112, 124, 156), 1);
         CLAY(scrubId, {.layout = {.sizing = {GROW, GROW}, .childGap = 4, .childAlignment = AL_Y}}) {
             HSPACE
-            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : Fmt("%.0f", gMini[n]), 18, C_TEXT, 0);
-            Tx("px", 13, C_ICON, 0);
+            Tx(gEditValueId == scrubId.id ? Fmt("%s|", gEditValueText) : (n < 4 ? Fmt("%.1f", gMini[n]) : Fmt("%.0f", gMini[n])), 18, C_TEXT, 0);
+            Tx(n < 4 ? "%" : "px", 13, C_ICON, 0);
         }
         CLAY_AUTO_ID({.layout = {COLM, .sizing = {FIT, FIT}, .padding = {2, 0, 0, 0}}}) {
             Icon(I_CHEV_UP, 10, C_ICON);
@@ -583,7 +597,7 @@ static void CropBody(void) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
             MiniField(1, "L");
             HSPACE
-            if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 30, 20)) {
+            if (LinkBtn(CLAY_ID("LinkCrop"), gLink[2], 38, 29)) {
                 gLink[2] = !gLink[2]; PlutoTimelineSetBoolProperty("props.transform.crop.linked", gLink[2]);
             }
             HSPACE
@@ -597,7 +611,7 @@ static void DistortBody(void) {
     CLAY(CLAY_ID("DistBody"), {.layout = {COLM, .sizing = {GROW, FIX(DIST_H)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10}, RCARD}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) { MiniField(4, "TL"); HSPACE MiniField(5, "TR"); }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-            if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 30, 20)) {
+            if (LinkBtn(CLAY_ID("LinkDist"), gLink[3], 38, 29)) {
                 gLink[3] = !gLink[3]; PlutoTimelineSetBoolProperty("props.transform.distort.linked", gLink[3]);
             }
         }
@@ -1073,7 +1087,7 @@ static void FxParam(int i, int p, const char *label) {
 }
 
 static void FxBody(int i) {
-    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 12, 14}, .childGap = 10},
+    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 8, 8, 8}, .childGap = 8},
                                  .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
                                  .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
@@ -1191,7 +1205,7 @@ static void EffectsView(void) {
     /* All expanded cards contribute their natural height to InspContent.
        InspBody is the only scroll/clip viewport; nested fixed-height wrappers
        made expanded transition content clip the effects section underneath. */
-    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
+    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 8, 10, 8}, .childGap = 8}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
         if (b.clicked) gTransOpen = !gTransOpen;
@@ -1214,7 +1228,7 @@ static void EffectsView(void) {
                     const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
                     const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
                     for (int row = 0; row < 3; row++) {
-                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 12}}) {
+                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5}}) {
                             for (int col = 0; col < 2; col++) {
                                 int i = row * 2 + col;
                                 Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
@@ -1225,7 +1239,7 @@ static void EffectsView(void) {
                                           .backgroundColor = BtnBg(selected ? C_SEL : C_CARD, RGB(43, 45, 52), cb),
                                           .cornerRadius = CLAY_CORNER_RADIUS(10),
                                           .border = {.color = Mix(C_CARDB, RGB(80, 83, 91), selected ? .72f : cb.hover * .38f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                                    Tx(names[i], 14, selected ? C_TEXT : C_MUTED, 0);
+                                    TxWrap(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
                                 }
                             }
                         }
@@ -1253,7 +1267,7 @@ static void EffectsView(void) {
         }
     }
 
-    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
+    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 8, 10, 8}, .childGap = 8}, RCARD}) {
         Clay_ElementId fid = CLAY_ID("FiltersHdr");
         Bs b = Interact(fid);
         if (b.clicked) gFiltOpen = !gFiltOpen;
@@ -1280,10 +1294,13 @@ static void EffectsView(void) {
                         PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
                     }
                 }
-                CLAY(CLAY_ID("FltRows"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
-                    for (int row = 0; row < 2; row++) {
+                CLAY(CLAY_ID("FltRows"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
+                    for (int row = 0; row < 3; row++) {
                         CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
-                            for (int c = 0; c < 4; c++) FilterThumb(row * 4 + c);
+                            for (int c = 0; c < 3; c++) {
+                                int preset = row * 3 + c;
+                                if (preset < 8) FilterThumb(preset);
+                            }
                         }
                     }
                 }
@@ -1291,7 +1308,7 @@ static void EffectsView(void) {
         }
     }
 
-    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
+    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 8, 10, 8}, .childGap = 8}, RCARD}) {
         Clay_ElementId vid = CLAY_ID("VfxHdr");
         Bs vb = Interact(vid);
         if (vb.clicked) gVfxOpen = !gVfxOpen;
@@ -1717,7 +1734,7 @@ static void RightPanel(void) {
         }
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
                                    .clip = {.horizontal = true, .vertical = true, .childOffset = {gTabDir * (1.f - gTabE) * TAB_SLIDE_PX, -gScroll}}}) {
-            CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}}) {
+            CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}, .clip = {.horizontal = true}}) {
                 if (gTimelineSelected < 0 && gRightTab != 3) {
                     CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {
                         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {

@@ -769,15 +769,25 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
         if (audioOnly) {
-            /* Detached audio: deep-blue to cyan gradient with a restrained grid. */
-            GradRR(r, 6, (Color){12, 35, 67, 255}, (Color){13, 111, 139, 255});
-            Color grid = (Color){177, 230, 241, 22};
-            for (float gx = r.x + 10.f; gx < r.x + r.width - 6.f; gx += 10.f)
-                DrawLineEx((Vector2){gx, r.y + 5.f}, (Vector2){gx, r.y + r.height - 5.f}, 1.f, grid);
-            for (float gy = r.y + 10.f; gy < r.y + r.height - 6.f; gy += 10.f)
-                DrawLineEx((Vector2){r.x + 6.f, gy}, (Vector2){r.x + r.width - 6.f, gy}, 1.f, grid);
+            /* Keep the saturated blue/cyan hue, but lower its luminance slightly.
+               The texture stays clean: no grid lines behind the waveform. */
+            GradRR(r, 6, (Color){7, 21, 43, 255}, (Color){8, 69, 94, 255});
         } else {
-            GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+            bool drewThumb = false;
+            if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
+                Texture2D thumb = gImported[clip->mediaIndex].thumbnail;
+                if (thumb.id && r.width >= 42.f && r.height >= 24.f) {
+                    float tileW = fmaxf(48.f, r.height * ((float)thumb.width / fmaxf(1.f, (float)thumb.height)));
+                    for (float tx = r.x; tx < r.x + r.width; tx += tileW) {
+                        Rectangle dest = {tx, r.y, tileW + .5f, r.height};
+                        DrawTexturePro(thumb, (Rectangle){0, 0, (float)thumb.width, (float)thumb.height}, dest,
+                                       (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 210});
+                    }
+                    FillRR(r, 6, (Color){8, 12, 20, 104});
+                    drewThumb = true;
+                }
+            }
+            if (!drewThumb) GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
         }
         Texture2D wave = {0};
         if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
@@ -785,6 +795,19 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             wave = media->waveform;
         }
         bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
+        if (clip && hasAudio && r.width > 12.f) {
+            float pps = TimelinePps();
+            if (clip->audioFadeIn) {
+                float fw = fminf(r.width * .5f, fmaxf(0.f, clip->audioFadeInDuration) * pps);
+                if (fw > 1.f) DrawTriangle((Vector2){r.x, r.y}, (Vector2){r.x, r.y + r.height},
+                                           (Vector2){r.x + fw, r.y + r.height * .5f}, (Color){5, 7, 11, 76});
+            }
+            if (clip->audioFadeOut) {
+                float fw = fminf(r.width * .5f, fmaxf(0.f, clip->audioFadeOutDuration) * pps);
+                if (fw > 1.f) DrawTriangle((Vector2){r.x + r.width, r.y}, (Vector2){r.x + r.width, r.y + r.height},
+                                           (Vector2){r.x + r.width - fw, r.y + r.height * .5f}, (Color){5, 7, 11, 76});
+            }
+        }
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
@@ -794,8 +817,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                            (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 204});
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
-        bool selected = (cu->i & 1) != 0;
-        StrokeRR(r, 6, selected ? 2.f : 1.f, selected ? (Color){245, 245, 250, 255} : (Color){113, 116, 124, 255});
+        /* No selection perimeter: the clip body and trim grips provide the affordance. */
         if (clip && !audioOnly && r.width >= 18.f) {
             Color grip = (Color){210, 207, 222, 205};
             DrawLineEx((Vector2){r.x + 3.5f, r.y + 8.f}, (Vector2){r.x + 3.5f, r.y + r.height - 8.f}, 1.6f, grip);
@@ -960,7 +982,21 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
     }
     if (gScisN > 0) { gScisN = 0; EndScissorMode(); }
     if (gMediaDropPreviewVisible && gMediaDropPreview.width > 0.f) {
-        DrawDottedRect(gMediaDropPreview, 4.f, 4.f, 2.f, (Color){190, 150, 232, 235});
+        Rectangle ghost = gMediaDropPreview;
+        bool audioGhost = gMediaDropPreviewClip >= 0
+            ? (gMediaDropPreviewClip < gTimelineClipCount && gTimelineClips[gMediaDropPreviewClip].track >= 4)
+            : (gMediaDropPreviewMedia >= 0 && gMediaDropPreviewMedia < gImportedCount && strcmp(gImported[gMediaDropPreviewMedia].kind, "audio") == 0);
+        int mediaIndex = gMediaDropPreviewClip >= 0 && gMediaDropPreviewClip < gTimelineClipCount
+            ? gTimelineClips[gMediaDropPreviewClip].mediaIndex : gMediaDropPreviewMedia;
+        if (audioGhost) GradRR(ghost, 6, (Color){7, 21, 43, 142}, (Color){8, 69, 94, 142});
+        else if (mediaIndex >= 0 && mediaIndex < gImportedCount && gImported[mediaIndex].thumbnail.id) {
+            Texture2D thumb = gImported[mediaIndex].thumbnail;
+            DrawTexturePro(thumb, (Rectangle){0, 0, (float)thumb.width, (float)thumb.height}, ghost,
+                           (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 118});
+            FillRR(ghost, 6, (Color){14, 18, 28, 105});
+        } else GradRR(ghost, 6, (Color){92, 112, 166, 128}, (Color){53, 82, 139, 128});
+        FillRR(ghost, 6, (Color){255, 255, 255, 24});
+        StrokeRR(ghost, 6, 1.f, (Color){220, 226, 244, 130});
     }
     if (gPH) {
         Color red = {240, 62, 72, 255};
@@ -974,24 +1010,21 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         bool hover = CheckCollisionPointRec(GetMousePosition(), r);
         if (button->applied) {
             Rectangle span = button->durationRect;
-            if (span.width > 1.f) {
-                FillRR(span, 2.5f, (Color){70, 157, 224, 68});
-                DrawLineEx((Vector2){span.x, span.y + .5f},
-                           (Vector2){span.x + span.width, span.y + .5f}, 1.4f,
-                           (Color){111, 191, 248, 220});
-                DrawLineEx((Vector2){span.x, span.y - 1.f},
-                           (Vector2){span.x, span.y + span.height + 1.f}, 1.2f,
-                           (Color){111, 191, 248, 230});
-                DrawLineEx((Vector2){span.x + span.width, span.y - 1.f},
-                           (Vector2){span.x + span.width, span.y + span.height + 1.f}, 1.2f,
-                           (Color){111, 191, 248, 230});
+            if (span.width > 2.f && span.height > 2.f) {
+                float mid = span.x + span.width * .5f;
+                float cy = span.y + span.height * .5f;
+                Color cone = hover ? (Color){100, 174, 235, 78} : (Color){94, 160, 220, 54};
+                /* Two translucent cones widen across both clips and meet at
+                   their join: the visible width is the actual transition duration. */
+                DrawTriangle((Vector2){span.x, span.y}, (Vector2){span.x, span.y + span.height},
+                             (Vector2){mid, cy}, cone);
+                DrawTriangle((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y},
+                             (Vector2){span.x + span.width, span.y + span.height}, cone);
+                DrawLineEx((Vector2){span.x, span.y}, (Vector2){mid, cy}, 1.f, (Color){146, 196, 242, 92});
+                DrawLineEx((Vector2){span.x, span.y + span.height}, (Vector2){mid, cy}, 1.f, (Color){146, 196, 242, 92});
+                DrawLineEx((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y}, 1.f, (Color){146, 196, 242, 92});
+                DrawLineEx((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y + span.height}, 1.f, (Color){146, 196, 242, 92});
             }
-            DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
-                        (Color){245, 246, 249, 255});
-            if (hover) DrawCircleLines((int)(r.x + r.width * .5f), (int)(r.y + r.height * .5f),
-                                       r.width * .5f, (Color){112, 190, 245, 255});
-            DrawIcon(I_BOWTIE, (Rectangle){r.x + 5.f, r.y + 5.f, r.width - 10.f, r.height - 10.f},
-                     (Color){35, 37, 42, 255}, 0.f);
         } else if (hover) {
             DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,
                         (Color){43, 45, 51, 255});

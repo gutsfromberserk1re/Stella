@@ -146,6 +146,149 @@ static void TimelineHistoryAction(bool redo) {
     }
 }
 
+/* Native multi-clip audio clock. Media inspection creates one cached OGG
+   playback proxy per source, so MP4/MOV and detached audio clips all use the
+   same Raylib streaming path. Streams are reused across play/pause/scrub. */
+#define STELLA_AUDIO_VOICES 12
+#if defined(_WIN32)
+#define STELLA_AUDIO_PATH_COPY(dst, src) strncpy((dst), (src), sizeof(dst) - 1)
+#else
+#define STELLA_AUDIO_PATH_COPY(dst, src) strncpy((dst), (src), sizeof(dst) - 1)
+#endif
+typedef struct {
+    char clipId[64];
+    char path[1024];
+    Music music;
+    bool loaded;
+    bool failed;
+    bool wasActive;
+} StellaAudioVoice;
+static StellaAudioVoice gAudioVoices[STELLA_AUDIO_VOICES];
+static bool gAudioReady;
+
+static void AudioVoiceRelease(StellaAudioVoice *voice) {
+    if (!voice) return;
+    if (voice->loaded) {
+        if (IsMusicStreamPlaying(voice->music)) StopMusicStream(voice->music);
+        UnloadMusicStream(voice->music);
+    }
+    memset(voice, 0, sizeof(*voice));
+}
+
+static StellaAudioVoice *AudioVoiceForClip(const TimelineClipUi *clip) {
+    const char *path = clip->audioPath[0] ? clip->audioPath :
+        ((clip->track >= 4 || clip->hasAudio) ? clip->path : "");
+    if ((!path || !*path || !FileExists(path)) && clip->path[0] && FileExists(clip->path))
+        path = clip->path;
+    if (!path || !*path || !FileExists(path)) return NULL;
+    StellaAudioVoice *freeVoice = NULL;
+    for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
+        StellaAudioVoice *voice = &gAudioVoices[i];
+        if ((voice->loaded || voice->failed) && strcmp(voice->clipId, clip->id) == 0) {
+            if (strcmp(voice->path, path) == 0) {
+                if (voice->failed) { voice->wasActive = true; return NULL; }
+                return voice;
+            }
+            AudioVoiceRelease(voice);
+            freeVoice = voice;
+            break;
+        }
+        if (!voice->loaded && !voice->failed && !freeVoice) freeVoice = voice;
+    }
+    if (!freeVoice) {
+        /* Reclaim an inactive cached stream before giving up on a new voice. */
+        for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
+            StellaAudioVoice *voice = &gAudioVoices[i];
+            if (!voice->wasActive) { AudioVoiceRelease(voice); freeVoice = voice; break; }
+        }
+    }
+    if (!freeVoice) return NULL;
+    STELLA_AUDIO_PATH_COPY(freeVoice->clipId, clip->id);
+    STELLA_AUDIO_PATH_COPY(freeVoice->path, path);
+    freeVoice->music = LoadMusicStream(path);
+    if (!freeVoice->music.stream.buffer && clip->path[0] && strcmp(path, clip->path) != 0 && FileExists(clip->path)) {
+        /* A stale or unavailable proxy should not permanently silence a source
+           that Raylib can decode directly (WAV/MP3/OGG/WebM audio, etc.). */
+        if (freeVoice->music.stream.buffer) UnloadMusicStream(freeVoice->music);
+        memset(&freeVoice->music, 0, sizeof(freeVoice->music));
+        path = clip->path;
+        STELLA_AUDIO_PATH_COPY(freeVoice->path, path);
+        freeVoice->music = LoadMusicStream(path);
+    }
+    if (!freeVoice->music.stream.buffer) {
+        freeVoice->failed = true;
+        freeVoice->wasActive = true;
+        snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio stream could not be opened: %.160s", path);
+        return NULL;
+    }
+    freeVoice->loaded = true;
+    freeVoice->wasActive = false;
+    SetMusicVolume(freeVoice->music, 0.f);
+    return freeVoice;
+}
+
+static void AudioPlaybackTick(bool playing) {
+    if (!gAudioReady || !IsAudioDeviceReady()) return;
+    bool active[STELLA_AUDIO_VOICES] = {false};
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        TimelineClipUi *clip = &gTimelineClips[i];
+        if (!(clip->track >= 4 || clip->hasAudio) || clip->duration <= 0.f ||
+            gPlayhead < clip->start - .0005f || gPlayhead >= clip->start + clip->duration - .0005f) continue;
+        StellaAudioVoice *voice = AudioVoiceForClip(clip);
+        if (!voice || !voice->loaded) continue;
+        int slot = (int)(voice - gAudioVoices);
+        if (slot < 0 || slot >= STELLA_AUDIO_VOICES) continue;
+        active[slot] = true;
+        voice->wasActive = true;
+
+        float sourceTime = fmaxf(0.f, clip->sourceOffset + gPlayhead - clip->start);
+        float fade = 1.f;
+        if (clip->audioFadeIn && clip->audioFadeInDuration > .001f)
+            fade = fminf(fade, fmaxf(0.f, (gPlayhead - clip->start) / clip->audioFadeInDuration));
+        float remaining = clip->start + clip->duration - gPlayhead;
+        if (clip->audioFadeOut && clip->audioFadeOutDuration > .001f)
+            fade = fminf(fade, fmaxf(0.f, remaining / clip->audioFadeOutDuration));
+        float volume = fmaxf(0.f, fminf(1.f, clip->audioVolume / 100.f)) * fade;
+        float pan = fmaxf(-1.f, fminf(1.f, clip->audioPan / 100.f));
+        SetMusicVolume(voice->music, volume);
+        SetMusicPan(voice->music, pan);
+
+        bool streamPlaying = IsMusicStreamPlaying(voice->music);
+        if (playing) {
+            if (!streamPlaying) {
+                SeekMusicStream(voice->music, sourceTime);
+                PlayMusicStream(voice->music);
+            }
+            /* Raylib's streaming music buffers must be pumped on the same frame
+               that PlayMusicStream starts, then once per UI frame thereafter. */
+            UpdateMusicStream(voice->music);
+            float actual = GetMusicTimePlayed(voice->music);
+            if (fabsf(actual - sourceTime) > .22f) SeekMusicStream(voice->music, sourceTime);
+        } else {
+            if (streamPlaying) PauseMusicStream(voice->music);
+            float actual = GetMusicTimePlayed(voice->music);
+            if (fabsf(actual - sourceTime) > .04f) SeekMusicStream(voice->music, sourceTime);
+        }
+    }
+    for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
+        StellaAudioVoice *voice = &gAudioVoices[i];
+        if (!voice->loaded && !voice->failed) continue;
+        bool clipStillExists = false;
+        for (int clipIndex = 0; clipIndex < gTimelineClipCount; clipIndex++) {
+            if (strcmp(gTimelineClips[clipIndex].id, voice->clipId) == 0) { clipStillExists = true; break; }
+        }
+        if (!clipStillExists) { AudioVoiceRelease(voice); continue; }
+        if (voice->loaded && !active[i] && IsMusicStreamPlaying(voice->music)) PauseMusicStream(voice->music);
+        voice->wasActive = active[i] || voice->failed;
+    }
+}
+
+static void AudioPlaybackShutdown(void) {
+    for (int i = 0; i < STELLA_AUDIO_VOICES; i++) AudioVoiceRelease(&gAudioVoices[i]);
+    if (gAudioReady && IsAudioDeviceReady()) CloseAudioDevice();
+    gAudioReady = false;
+}
+
 /* ------------------------------------------------------------------ */
 /* UI: top bar                                                         */
 /* ------------------------------------------------------------------ */
@@ -295,6 +438,10 @@ int main(void) {
 #endif
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
+    InitAudioDevice();
+    gAudioReady = IsAudioDeviceReady();
+    if (gAudioReady) SetMasterVolume(.92f);
+    else snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio device unavailable; check Windows output device");
     Vector2 dpiScale = GetWindowScaleDPI();
     gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));
     LoadUiIcons();
@@ -449,6 +596,7 @@ int main(void) {
                 gPreviewDirty = true;
             }
         } else playbackRemainder = 0.f;
+        AudioPlaybackTick(gTimelinePlaying);
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         gShiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -503,6 +651,7 @@ int main(void) {
                        gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :
                        gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
     }
+    AudioPlaybackShutdown();
     PlutoUnloadMedia();
     UnloadUiIcons();
     CloseWindow();

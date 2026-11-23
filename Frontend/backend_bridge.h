@@ -322,11 +322,21 @@ static bool PlutoSyncTimeline(const char *json) {
             clip->sourceOffset = PlutoReadNumber(begin, end, "sourceOffset", 0.f);
             clip->sourceDuration = PlutoReadNumber(begin, end, "sourceDuration", 0.f);
             clip->transitionDuration = PlutoReadNumber(begin, end, "props.transitionOut.duration", 1.f);
+            clip->audioVolume = PlutoReadNumber(begin, end, "props.audio.volume", 100.f);
+            clip->audioPan = PlutoReadNumber(begin, end, "props.audio.pan", 0.f);
+            clip->audioFadeInDuration = PlutoReadNumber(begin, end, "props.audio.fadeInDuration", 1.f);
+            clip->audioFadeOutDuration = PlutoReadNumber(begin, end, "props.audio.fadeOutDuration", 1.f);
+            PlutoJsonBoolPath(begin, end, "props.audio.fadeIn", &clip->audioFadeIn);
+            PlutoJsonBoolPath(begin, end, "props.audio.fadeOut", &clip->audioFadeOut);
             clip->track = PlutoTrackIndex(track);
             const char *hasAudio = strstr(begin, "\"hasAudio\":true");
             clip->hasAudio = hasAudio && hasAudio < end;
             for (int media = 0; media < gImportedCount; media++)
-                if (clip->path[0] && strcmp(clip->path, gImported[media].path) == 0) { clip->mediaIndex = media; break; }
+                if (clip->path[0] && strcmp(clip->path, gImported[media].path) == 0) {
+                    clip->mediaIndex = media;
+                    strncpy(clip->audioPath, gImported[media].audioPath, sizeof(clip->audioPath) - 1);
+                    break;
+                }
             clip->start = (float)start;
             clip->duration = (float)duration;
             const char *ka = strstr(begin, "\"keyframes\":[");
@@ -718,6 +728,7 @@ static void PlutoPollBackend(void) {
                 strncpy(asset->kind, kind, sizeof(asset->kind) - 1);
                 asset->duration = (float)duration;
                 asset->hasAudio = strstr(event, "\"hasAudio\":true") != NULL;
+                PlutoJsonString(event, "audioPlaybackPath", asset->audioPath, sizeof(asset->audioPath));
                 if (PlutoJsonString(event, "waveformPath", asset->waveformPath, sizeof(asset->waveformPath))) {
                     asset->waveform = LoadTexture(asset->waveformPath);
                     if (asset->waveform.id) SetTextureFilter(asset->waveform, TEXTURE_FILTER_BILINEAR);
