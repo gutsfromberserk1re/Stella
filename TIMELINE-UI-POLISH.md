@@ -17,3 +17,9 @@ This update refines the native timeline UI without adding upscalers, AI image pr
 ## Build and verification
 
 Build with the repository's existing Windows workflow. The current environment does not include the Raylib/Clay headers or the Rust toolchain, so a native compile and Cargo test run could not be performed here.
+## Follow-up correction: vertical drag stability and playhead span
+
+- Keep a clip's original video lane mounted until its drag is released. Previously, previewing a move onto another lane could collapse the source lane immediately, shifting row geometry while the pointer was still held.
+- Reveal the next higher video lane in sequence while dragging above the current top lane, so V3 appears above V2 and V4 above V3; continuing upward can reveal more than one empty lane.
+- Extend the playhead from the ruler through the visible track viewport. The earlier ruler custom-draw call passed a zero extension, leaving only the small red ruler marker visible.
+- Track IDs and project serialization remain unchanged; only the active drag's temporary lane visibility is affected.

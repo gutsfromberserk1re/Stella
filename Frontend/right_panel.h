@@ -143,6 +143,26 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     gTransitionDuration = PlutoReadNumber(clipBegin, clipEnd, "props.transitionOut.duration", 1.f);
     PlutoJsonStringPath(clipBegin, clipEnd, "props.transitionOut.type", gTransitionType, sizeof(gTransitionType));
 
+    gTextTitleSelected = false;
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.isTitle", &gTextTitleSelected);
+    if (gTextTitleSelected) {
+        PlutoJsonStringPath(clipBegin, clipEnd, "props.text.content", gTextContent, sizeof(gTextContent));
+        gTextFontSize = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.fontSize", 96.f));
+        gTextFontSize = (int)Clampf((float)gTextFontSize, 24.f, 180.f);
+        gTextColorIndex = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.color", 0.f));
+        if (gTextColorIndex < 0 || gTextColorIndex > 7) gTextColorIndex = 0;
+        gTextAlign = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.align", 1.f));
+        if (gTextAlign < 0 || gTextAlign > 2) gTextAlign = 1;
+        gTextPosX = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.x", .5f), .03f, .97f);
+        gTextPosY = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.y", .78f), .04f, .96f);
+        gTextDuration = Clampf(PlutoReadNumber(clipBegin, clipEnd, "dur", gTextDuration), .5f, 30.f);
+        gTextBold = true; gTextOutline = false; gTextShadow = true; gTextBackground = false;
+        PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.bold", &gTextBold);
+        PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.outline", &gTextOutline);
+        PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.shadow", &gTextShadow);
+        PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.background", &gTextBackground);
+    }
+
     for (int i = 0; i < 4; i++) {
         float value = PlutoReadNumber(clipBegin, clipEnd, audioPaths[i], i == 0 ? 100.f : 0.f);
         float normalized = i == 0 ? value / 200.f : value / (i == 1 ? 200.f : 24.f) + .5f;
@@ -509,9 +529,9 @@ static void FieldCard(int n, const char *title, int icon, const char *l1, const 
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(22), FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { Tx(l1, 19, C_ICON, 0); }
             NumField(n * 2, a, unit);
         }
-        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
+        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .padding = {29, 0, 0, 0}, .childAlignment = AL_C}}) {
             HSPACE
-            if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 28, 24)) {
+            if (LinkBtn(CLAY_IDI("Link", n), gLink[link], 34, 32)) {
                 gLink[link] = !gLink[link];
                 PlutoTimelineSetBoolProperty(link == 0 ? "props.transform.position.linked" : "props.transform.scale.linked", gLink[link]);
             }
@@ -615,6 +635,12 @@ static void NavSection(void) {
 static void TransformView(void) {
     static float sentRotation;
     static float sentOpacity = 1.f;
+    static int previousSelected = -2;
+    if (previousSelected != gTimelineSelected) {
+        sentRotation = gRotT;
+        sentOpacity = gSlT[0];
+        previousSelected = gTimelineSelected;
+    }
     CLAY(CLAY_ID("TfCol"), {.layout = {COLM, .sizing = {GROW, GROW}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10}}) {
             FieldCard(0, "Position", I_POS, "X", "Y", &gNum[0], &gNum[1], 0.f, "px", 0);
@@ -704,20 +730,29 @@ static void TransformView(void) {
 static void WheelItem(int i, const char *label) {
     static Vector2 sent[3];
     static bool sentInit;
+    static bool wasDragging[3];
+    static int previousSelected = -2;
     CLAY(CLAY_IDI("WheelCol", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
         Clay_ElementId wid = CLAY_IDI("Wheel", i);
         Bs b = Interact(wid);
         WheelLogic(i, wid);
-        if (!sentInit) { for (int j = 0; j < 3; j++) sent[j] = gWhT[j]; sentInit = true; }
-        if (!gWhDrag[i] && (fabsf(gWhT[i].x - sent[i].x) + fabsf(gWhT[i].y - sent[i].y) > .004f)) {
+        if (!sentInit || previousSelected != gTimelineSelected) {
+            for (int j = 0; j < 3; j++) { sent[j] = gWhT[j]; wasDragging[j] = false; }
+            sentInit = true;
+            previousSelected = gTimelineSelected;
+        }
+        if ((gWhDrag[i] || wasDragging[i]) &&
+            (fabsf(gWhT[i].x - sent[i].x) + fabsf(gWhT[i].y - sent[i].y) > .0015f)) {
             static const char *grade[3] = {"shadows", "tint", "highlights"};
             float hue, amount; WheelInfo(gWhT[i], &hue, &amount);
             char updates[256];
             snprintf(updates, sizeof(updates), "[{\"path\":\"props.colors.grading.%s.hue\",\"value\":%.4f},{\"path\":\"props.colors.grading.%s.amount\",\"value\":%.4f}]",
                      grade[i], hue, grade[i], amount * 100.f);
-            PlutoTimelineSetPropertiesJson(updates);
+            if (gWhDrag[i]) PlutoTimelineSetPropertiesLiveJson(updates);
+            else PlutoTimelineSetPropertiesJson(updates);
             sent[i] = gWhT[i];
         }
+        wasDragging[i] = gWhDrag[i];
         float hue, len; WheelInfo(gWh[i], &hue, &len);
         bool col = len > 0.02f;
         Color dc = ColorFromHSV(hue, fminf(1.f, .3f + .7f * len), 1.f);
@@ -816,7 +851,12 @@ static void SliderSpec(int idx, int s, int *mode, Clay_Color *a, Clay_Color *b, 
 static void SliderRow(int idx, int s) {
     static float sent[NSL];
     static bool sentInit;
-    if (!sentInit) { memcpy(sent, gSlT, sizeof(sent)); sentInit = true; }
+    static int previousSelected = -2;
+    if (!sentInit || previousSelected != gTimelineSelected) {
+        memcpy(sent, gSlT, sizeof(sent));
+        sentInit = true;
+        previousSelected = gTimelineSelected;
+    }
     int gi = idx * 8 + s, mode; Clay_Color a, b, c;
     SliderSpec(idx, s, &mode, &a, &b, &c);
     bool uni = (idx == 4 && s == 0);
@@ -840,10 +880,12 @@ static void SliderRow(int idx, int s) {
         Clay_ElementId sid = CLAY_IDI("Slid", gi);
         Bs bs = Interact(sid);
         SliderLogic(sid, gi, 8.5f);
-        if (!gSlDrag[gi] && fabsf(gSlT[gi] - sent[gi]) > .002f && idx > 0 && idx < 5) {
+        if (fabsf(gSlT[gi] - sent[gi]) > .0015f && idx > 0 && idx < 5) {
             char path[128];
             ColorSliderProperty(idx, s, path, sizeof(path));
-            PlutoTimelineSetProperty(path, ColorSliderBackendValue(idx, s, gSlT[gi]));
+            double value = ColorSliderBackendValue(idx, s, gSlT[gi]);
+            if (gSlDrag[gi]) PlutoTimelineSetPropertyLive(path, value);
+            else PlutoTimelineSetProperty(path, value);
             sent[gi] = gSlT[gi];
         }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(14)}},
@@ -1005,11 +1047,11 @@ static void FxParam(int i, int p, const char *label) {
         }
         Clay_ElementId sid = CLAY_IDI("FxSl", i * 2 + p);
         Bs bs = Interact(sid);
-        bool wasDragging = gFxSlDrag[i][p];
         FxSliderLogic(sid, v, &gFxSlDrag[i][p], 7.f);
-        if (wasDragging && !gFxSlDrag[i][p] && fabsf(*v - gFxSent[i][p]) > .002f) {
+        if (fabsf(*v - gFxSent[i][p]) > .0015f) {
             double value = (p == 1 && kFx[i].angle) ? (*v - .5f) * 360.0 : *v * 100.0;
-            PlutoTimelineSetProperty(gFxProp[i][p], value);
+            if (gFxSlDrag[i][p]) PlutoTimelineSetPropertyLive(gFxProp[i][p], value);
+            else PlutoTimelineSetProperty(gFxProp[i][p], value);
             gFxSent[i][p] = *v;
         }
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
@@ -1019,7 +1061,7 @@ static void FxParam(int i, int p, const char *label) {
 }
 
 static void FxBody(int i) {
-    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIX(FX_BODY_H)}, .padding = {14, 14, 12, 14}, .childGap = 10},
+    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 12, 14}, .childGap = 10},
                                  .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
                                  .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
@@ -1131,12 +1173,13 @@ static void CommitTransition(void) {
 }
 
 static void EffectsView(void) {
-    /* ---- Transitions ---- */
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
-    float o = EaseIO(AnimLin(CLAY_ID("TransAnim").id, gTransOpen ? 1.f : 0.f, 0.2f));
-    float dh = roundf(o * (next >= 0 ? TRANS_DESC_H : TRANS_EMPTY_H));
-    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
+
+    /* All expanded cards contribute their natural height to InspContent.
+       InspBody is the only scroll/clip viewport; nested fixed-height wrappers
+       made expanded transition content clip the effects section underneath. */
+    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
         Clay_ElementId hid = CLAY_ID("TransHdr");
         Bs b = Interact(hid);
         if (b.clicked) gTransOpen = !gTransOpen;
@@ -1146,9 +1189,8 @@ static void EffectsView(void) {
             HSPACE
             Icon(gTransOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (dh >= 1.f) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIX(dh)}, .childGap = 8}, .clip = {.vertical = true}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
+        if (gTransOpen) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
                         TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
@@ -1199,11 +1241,7 @@ static void EffectsView(void) {
         }
     }
 
-    /* ---- Filters (collapsible; presets inside) ---- */
-    float fo = EaseIO(AnimLin(CLAY_ID("FiltAnim").id, gFiltOpen ? 1.f : 0.f, 0.2f));
-    bool fOpenFull = fo >= 0.999f;
-    float fh = roundf(fo * FILT_BODY_H);
-    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
+    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
         Clay_ElementId fid = CLAY_ID("FiltersHdr");
         Bs b = Interact(fid);
         if (b.clicked) gFiltOpen = !gFiltOpen;
@@ -1213,9 +1251,8 @@ static void EffectsView(void) {
             HSPACE
             Icon(gFiltOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, b.hover));
         }
-        if (fOpenFull || fh >= 1.f) {
-            CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, fOpenFull ? FIT : FIX(fh)}}, .clip = {.vertical = !fOpenFull}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+        if (gFiltOpen) {
+            CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
                     Tx("Filter presets", 13, C_MUTED, 0);
                     HSPACE
@@ -1228,10 +1265,9 @@ static void EffectsView(void) {
                     }
                     if (rb.clicked) {
                         gFilter = 0;
-                PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
+                        PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
                     }
                 }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("FltRows"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
                     for (int row = 0; row < 2; row++) {
                         CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
@@ -1243,18 +1279,7 @@ static void EffectsView(void) {
         }
     }
 
-    /* ---- Video Effects ---- */
-    float ov = EaseIO(AnimLin(CLAY_ID("VfxAnim").id, gVfxOpen ? 1.f : 0.f, 0.2f));
-    float oi[4], hb[4], sum = 0.f;
-    for (int i = 0; i < 4; i++) {
-        oi[i] = Spring(CLAY_IDI("FxAnim", i).id, gFxOpen == i ? 1.f : 0.f, 680.f, 32.f);
-        if (oi[i] < 0.f) oi[i] = 0.f;
-        if (oi[i] > 1.04f) oi[i] = 1.04f;
-        hb[i] = roundf(oi[i] * (FX_BODY_H + 12.5f));
-        if (hb[i] >= 1.f) sum += hb[i] + 2.25f; /* wrapper's FIX padding */
-    }
-    float lh = roundf(ov * (12.25f + (4.f + EXTRA_FX_COUNT) * (FX_ITEM_H + 2.25f) + 13.f * 8.f + sum));
-    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}}, RCARD}) {
+    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 10}, RCARD}) {
         Clay_ElementId vid = CLAY_ID("VfxHdr");
         Bs vb = Interact(vid);
         if (vb.clicked) gVfxOpen = !gVfxOpen;
@@ -1264,42 +1289,359 @@ static void EffectsView(void) {
             HSPACE
             Icon(gVfxOpen ? I_CHEV_DN : I_CHEV_R, 14, Mix(C_MUTED, C_TEXT, vb.hover));
         }
-        if (lh >= 1.f) {
-            CLAY(CLAY_ID("VfxWrap"), {.layout = {COLM, .sizing = {GROW, FIX(lh)}}, .clip = {.vertical = true}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
-                CLAY(CLAY_ID("VfxList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
-                    for (int i = 0; i < 4; i++) {
-                        CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
-                            if (FxHeader(i, oi[i])) gFxOpen = (gFxOpen == i) ? -1 : i;
-                            if (hb[i] >= 1.f) {
-                                CLAY(CLAY_IDI("FxWrap", i), {.layout = {COLM, .sizing = {GROW, FIX(hb[i])}}, .clip = {.vertical = true}}) {
-                                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(8)}}}) {}
-                                    FxBody(i);
-                                }
-                            }
-                        }
+        if (gVfxOpen) {
+            CLAY(CLAY_ID("VfxList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+                for (int i = 0; i < 4; i++) {
+                    CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+                        if (FxHeader(i, gFxOpen == i ? 1.f : 0.f)) gFxOpen = (gFxOpen == i) ? -1 : i;
+                        if (gFxOpen == i) FxBody(i);
                     }
-                    for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
                 }
+                for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
             }
         }
     }
 }
 
-/* ---------------- text tab ---------------- */
-static void TextView(void) {
-    CLAY(CLAY_ID("SubCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = CLAY_PADDING_ALL(12), .childGap = 8}, RCARD}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
-            Icon(I_FILM, 20, C_ICON);
-            Tx("Subtitles", 16, C_TEXT, 1);
+/* ---------------- integrated title editor ---------------- */
+static const Color gStellaTextColors[8] = {
+    {248, 248, 250, 255}, {255, 214, 92, 255}, {74, 210, 238, 255}, {255, 126, 154, 255},
+    {255, 154, 78, 255}, {126, 224, 156, 255}, {120, 160, 255, 255}, {234, 234, 242, 255}
+};
+
+static void PlutoTextAppendCodepoint(int cp) {
+    size_t used = strlen(gTextContent);
+    if ((cp < 32 && cp != '\n') || cp > 0x10ffff || used + 5 >= sizeof(gTextContent)) return;
+    if (cp < 0x80) gTextContent[used++] = (char)cp;
+    else if (cp < 0x800) {
+        gTextContent[used++] = (char)(0xc0 | (cp >> 6));
+        gTextContent[used++] = (char)(0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+        gTextContent[used++] = (char)(0xe0 | (cp >> 12));
+        gTextContent[used++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        gTextContent[used++] = (char)(0x80 | (cp & 0x3f));
+    } else {
+        gTextContent[used++] = (char)(0xf0 | (cp >> 18));
+        gTextContent[used++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        gTextContent[used++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        gTextContent[used++] = (char)(0x80 | (cp & 0x3f));
+    }
+    gTextContent[used] = 0;
+}
+
+static void PlutoTextBackspace(void) {
+    size_t n = strlen(gTextContent);
+    if (!n) return;
+    n--;
+    while (n > 0 && (((unsigned char)gTextContent[n] & 0xc0u) == 0x80u)) n--;
+    gTextContent[n] = 0;
+}
+
+static int PlutoTextBuildLines(Font font, int fontSize, char lines[16][STELLA_TEXT_MAX]) {
+    char source[STELLA_TEXT_MAX];
+    strncpy(source, gTextContent, sizeof(source) - 1);
+    source[sizeof(source) - 1] = 0;
+    int count = 0;
+    char *lineStart = source;
+    while (lineStart && count < 16) {
+        char *newline = strchr(lineStart, '\n');
+        if (newline) *newline = 0;
+        char current[STELLA_TEXT_MAX] = {0};
+        char *word = lineStart;
+        while (*word && count < 16) {
+            while (*word == ' ' || *word == '\t' || *word == '\r') word++;
+            if (!*word) break;
+            char *wordEnd = word;
+            while (*wordEnd && *wordEnd != ' ' && *wordEnd != '\t' && *wordEnd != '\r') wordEnd++;
+            char saved = *wordEnd;
+            *wordEnd = 0;
+            char candidate[STELLA_TEXT_MAX];
+            snprintf(candidate, sizeof(candidate), "%s%s%s", current, current[0] ? " " : "", word);
+            float width = MeasureTextEx(font, candidate, (float)fontSize, 0.f).x;
+            if (current[0] && width > 1640.f) {
+                strncpy(lines[count++], current, STELLA_TEXT_MAX - 1);
+                lines[count - 1][STELLA_TEXT_MAX - 1] = 0;
+                strncpy(current, word, sizeof(current) - 1);
+                current[sizeof(current) - 1] = 0;
+            } else {
+                strncpy(current, candidate, sizeof(current) - 1);
+                current[sizeof(current) - 1] = 0;
+            }
+            *wordEnd = saved;
+            word = wordEnd;
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {2, 0, 2, 0}}}) { Tx("Caption", 13, C_MUTED, 0); }
-        Clay_ElementId id = CLAY_ID("SubField");
-        Bs b = Interact(id);
-        CLAY(id, {.layout = {.sizing = {GROW, FIX(40)}, .padding = {12, 12, 0, 0}, .childAlignment = AL_Y},
-                  .backgroundColor = Mix(RGB(28, 29, 33), RGB(36, 37, 43), b.hover), .cornerRadius = CLAY_CORNER_RADIUS(10),
-                  .border = {.color = Mix(RGB(28, 29, 33), RGB(60, 62, 70), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-            Tx("Type a subtitle...", 14, RGB(112, 115, 124), 0);
+        if (count < 16) {
+            strncpy(lines[count], current, STELLA_TEXT_MAX - 1);
+            lines[count][STELLA_TEXT_MAX - 1] = 0;
+            count++;
+        }
+        lineStart = newline ? newline + 1 : NULL;
+    }
+    return count > 0 ? count : 1;
+}
+
+static bool PlutoTextOutputPath(char *path, size_t capacity) {
+#ifdef _WIN32
+    char root[MAX_PATH] = {0}, parent[MAX_PATH] = {0}, folder[MAX_PATH] = {0};
+    DWORD length = GetEnvironmentVariableA("LOCALAPPDATA", root, (DWORD)sizeof(root));
+    if (!length || length >= sizeof(root)) {
+        DWORD tempLength = GetTempPathA((DWORD)sizeof(root), root);
+        if (!tempLength || tempLength >= sizeof(root)) return false;
+        size_t rootLength = strlen(root);
+        while (rootLength > 0 && (root[rootLength - 1] == '\\' || root[rootLength - 1] == '/'))
+            root[--rootLength] = 0;
+    }
+    if (snprintf(parent, sizeof(parent), "%s\\Stella", root) >= (int)sizeof(parent) ||
+        snprintf(folder, sizeof(folder), "%s\\Titles", parent) >= (int)sizeof(folder)) return false;
+    CreateDirectoryA(parent, NULL);
+    CreateDirectoryA(folder, NULL);
+    /* GetTempFileNameA supplies a name unique across app restarts, so a new
+       title can never overwrite a PNG still referenced by an older project. */
+    char temporary[MAX_PATH];
+    if (!GetTempFileNameA(folder, "stl", 0, temporary)) return false;
+    DeleteFileA(temporary); /* ExportImage creates the final PNG. */
+    char *extension = strrchr(temporary, '.');
+    if (!extension) return false;
+    strcpy(extension, ".png");
+    int n = snprintf(path, capacity, "%s", temporary);
+    return n > 0 && (size_t)n < capacity;
+#else
+    unsigned long long serial = (unsigned long long)gClipSerial++;
+    int n = snprintf(path, capacity, "Stella-title-%llu.png", serial);
+    return n > 0 && (size_t)n < capacity;
+#endif
+}
+
+static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity) {
+    if (!gTextContent[0]) return false;
+    if (!PlutoTextOutputPath(outPath, pathCapacity)) return false;
+    const int width = 1920, height = 1080;
+    int fontSize = (int)Clampf((float)gTextFontSize, 24.f, 180.f);
+    Font font = FontPx(gTextBold ? 2 : 0, fontSize);
+    char lines[16][STELLA_TEXT_MAX] = {{0}};
+    int lineCount = PlutoTextBuildLines(font, fontSize, lines);
+    float lineHeight = (float)fontSize * 1.18f;
+    float blockHeight = lineCount * lineHeight;
+    float anchorX = Clampf(gTextPosX, .03f, .97f) * (float)width;
+    float anchorY = Clampf(gTextPosY, .04f, .96f) * (float)height;
+    float y = Clampf(anchorY - blockHeight * .5f, 8.f, (float)height - blockHeight - 8.f);
+    float maxWidth = 0.f;
+    for (int i = 0; i < lineCount; i++) {
+        float w = MeasureTextEx(font, lines[i], (float)fontSize, 0.f).x;
+        if (w > maxWidth) maxWidth = w;
+    }
+    float x = anchorX - (gTextAlign == 0 ? 0.f : gTextAlign == 1 ? maxWidth * .5f : maxWidth);
+    x = Clampf(x, 8.f, (float)width - maxWidth - 8.f);
+
+    Image image = GenImageColor(width, height, (Color){0, 0, 0, 0});
+    if (!image.data) return false;
+    if (gTextBackground) {
+        Rectangle plate = {x - 36.f, y - 20.f, maxWidth + 72.f, blockHeight + 40.f};
+        if (plate.x < 0.f) plate.x = 0.f;
+        if (plate.y < 0.f) plate.y = 0.f;
+        if (plate.x + plate.width > width) plate.width = width - plate.x;
+        if (plate.y + plate.height > height) plate.height = height - plate.y;
+        ImageDrawRectangleRec(&image, plate, (Color){8, 9, 12, 178});
+    }
+    Color ink = gStellaTextColors[gTextColorIndex < 0 || gTextColorIndex > 7 ? 0 : gTextColorIndex];
+    for (int i = 0; i < lineCount; i++) {
+        float textWidth = MeasureTextEx(font, lines[i], (float)fontSize, 0.f).x;
+        float drawX = gTextAlign == 0 ? x : gTextAlign == 1 ? anchorX - textWidth * .5f : anchorX - textWidth;
+        drawX = Clampf(drawX, 8.f, (float)width - textWidth - 8.f);
+        Vector2 position = {drawX, y + (float)i * lineHeight};
+        if (gTextShadow) {
+            Vector2 shadow = {position.x + 5.f, position.y + 7.f};
+            ImageDrawTextEx(&image, font, lines[i], shadow, (float)fontSize, 0.f, (Color){0, 0, 0, 190});
+        }
+        if (gTextOutline) {
+            static const int offsets[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
+            for (int k = 0; k < 8; k++) {
+                Vector2 edge = {position.x + (float)offsets[k][0], position.y + (float)offsets[k][1]};
+                ImageDrawTextEx(&image, font, lines[i], edge, (float)fontSize, 0.f, (Color){0, 0, 0, 230});
+            }
+        }
+        ImageDrawTextEx(&image, font, lines[i], position, (float)fontSize, 0.f, ink);
+    }
+    bool okay = ExportImage(image, outPath);
+    UnloadImage(image);
+    return okay;
+}
+
+static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
+    char escaped[STELLA_TEXT_MAX * 6 + 16];
+    PlutoJsonEscape(gTextContent, escaped, sizeof(escaped));
+    int n = snprintf(out, capacity,
+        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"color\":%d,\"align\":%d,\"bold\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"x\":%.5f,\"y\":%.5f}",
+        escaped, gTextFontSize, gTextColorIndex, gTextAlign,
+        gTextBold ? "true" : "false", gTextOutline ? "true" : "false",
+        gTextShadow ? "true" : "false", gTextBackground ? "true" : "false",
+        (double)gTextPosX, (double)gTextPosY);
+    return n > 0 && (size_t)n < capacity;
+}
+
+static bool PlutoTextApply(bool forceNew) {
+    if (!gTextContent[0]) {
+        strcpy(gBackendMessage, "Enter some text first");
+        return false;
+    }
+    char path[1024], props[4096];
+    if (!PlutoTextBuildPropsJson(props, sizeof(props)) || !PlutoTextWriteImage(path, sizeof(path))) {
+        strcpy(gBackendMessage, "Could not create the title image");
+        return false;
+    }
+    bool update = !forceNew && gTextTitleSelected && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount;
+    bool okay;
+    if (update) okay = PlutoTimelineUpdateTitleClip(gTimelineClips[gTimelineSelected].id, path, props);
+    else okay = PlutoTimelineAddTitleClip(path, props, gPlayhead, gTextDuration);
+    if (okay) {
+        gTextInputFocused = false;
+        gRightTab = 3;
+        strcpy(gBackendMessage, update ? "Title updated" : "Title added to the timeline");
+    }
+    return okay;
+}
+
+static void PlutoTextPlaceAt(float xNormalized, float yNormalized) {
+    gTextPosX = Clampf(xNormalized, .03f, .97f);
+    gTextPosY = Clampf(yNormalized, .04f, .96f);
+    if (!gTextContent[0]) strcpy(gTextContent, "Text");
+    gTextInputFocused = false;
+    PlutoTextApply(true);
+}
+
+static void TextColorButton(int i) {
+    Clay_ElementId id = CLAY_IDI("TextColor", i);
+    Bs b = Interact(id);
+    if (b.clicked) gTextColorIndex = i;
+    Clay_Color color = {gStellaTextColors[i].r, gStellaTextColors[i].g, gStellaTextColors[i].b, 255};
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_C},
+              .backgroundColor = color, .cornerRadius = CLAY_CORNER_RADIUS(9),
+              .border = {.color = Mix(gTextColorIndex == i ? C_TEXT : RGB(52, 54, 61), RGB(255, 255, 255), gTextColorIndex == i ? .9f : b.hover * .25f),
+                         .width = CLAY_BORDER_OUTSIDE(gTextColorIndex == i ? 2 : 1)}}) {
+        if (gTextColorIndex == i)
+            CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = RGB(22, 23, 26), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+    }
+}
+
+static bool TextActionButton(const char *idName, const char *label, bool primary) {
+    Clay_ElementId id = CLAY_SID(idName);
+    Bs b = Interact(id);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(42)}, .padding = {14, 12, 0, 0}, .childAlignment = AL_C},
+              .backgroundColor = primary ? Mix(RGB(60, 111, 224), RGB(83, 132, 245), b.hover) : BtnBg(C_RFIELD, RGB(48, 50, 58), b),
+              .cornerRadius = CLAY_CORNER_RADIUS(11),
+              .border = {.color = Mix(primary ? RGB(81, 127, 237) : C_RCARDB, C_TEXT, b.hover * .25f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Tx(label, 15, C_TEXT, 1);
+    }
+    return b.clicked;
+}
+
+static void TextStyleToggle(const char *idName, const char *label, bool *value) {
+    Clay_ElementId id = CLAY_SID(idName);
+    Bs b = Interact(id);
+    if (b.clicked) *value = !*value;
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {10, 8, 0, 0}, .childAlignment = AL_Y},
+              .backgroundColor = *value ? RGB(48, 58, 78) : BtnBg(C_RFIELD, RGB(48, 50, 58), b),
+              .cornerRadius = CLAY_CORNER_RADIUS(9),
+              .border = {.color = Mix(*value ? RGB(86, 125, 207) : C_RCARDB, C_TEXT, b.hover * .2f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Tx(label, 13.5f, *value ? C_TEXT : C_DIM, 0);
+    }
+}
+
+static void TextView(void) {
+    CLAY(CLAY_ID("TextEditorCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 14, 14}, .childGap = 12}, RCARD}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
+            Icon(I_TEXT, 21, C_ICON);
+            Tx("Text", 18, C_TEXT, 1);
+            HSPACE
+            Tx(gTextTitleSelected ? "TITLE SELECTED" : "TITLE EDITOR", 11, C_MUTED, 1);
+        }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 5}}) {
+            Tx("Content", 14, C_DIM, 1);
+            Clay_ElementId field = CLAY_ID("TextContentField");
+            bool over = Clay_PointerOver(field);
+            Bs fb = Interact(field);
+            if (fb.clicked) gTextInputFocused = true;
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over && gTextInputFocused) gTextInputFocused = false;
+            if (gTextInputFocused) {
+                if (IsKeyPressed(KEY_ESCAPE)) gTextInputFocused = false;
+                if (IsKeyPressed(KEY_BACKSPACE)) PlutoTextBackspace();
+                if (IsKeyPressed(KEY_ENTER)) PlutoTextAppendCodepoint('\n');
+                int cp;
+                while ((cp = GetCharPressed()) != 0) PlutoTextAppendCodepoint(cp);
+            }
+            CLAY(field, {.layout = {COLM, .sizing = {GROW, FIX(116)}, .padding = {12, 12, 10, 10}, .childGap = 4},
+                         .backgroundColor = gTextInputFocused ? RGB(34, 38, 49) : C_RFIELD,
+                         .cornerRadius = CLAY_CORNER_RADIUS(11),
+                         .border = {.color = gTextInputFocused ? RGB(76, 113, 190) : C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 15, gTextContent[0] ? C_TEXT : C_MUTED, 0);
+            }
+            Tx("Enter creates a new line. Click the preview with the Text tool to place it.", 12.5f, C_MUTED, 0);
+        }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
+                Tx("Font size", 14, C_DIM, 1);
+                HSPACE
+                float sizeValue = (float)gTextFontSize;
+                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 28, 14, 11, 8, 24.f, 180.f, 0))
+                    gTextFontSize = (int)roundf(sizeValue);
+            }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
+                Tx("Color", 14, C_DIM, 1);
+                for (int row = 0; row < 2; row++) {
+                    CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
+                        for (int col = 0; col < 4; col++) TextColorButton(row * 4 + col);
+                    }
+                }
+            }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
+                Tx("Alignment", 14, C_DIM, 1);
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
+                    static const char *alignNames[3] = {"Left", "Center", "Right"};
+                    for (int i = 0; i < 3; i++) {
+                        Clay_ElementId aid = CLAY_IDI("TextAlign", i);
+                        Bs ab = Interact(aid);
+                        if (ab.clicked) gTextAlign = i;
+                        CLAY(aid, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
+                                   .backgroundColor = gTextAlign == i ? RGB(48, 58, 78) : BtnBg(C_RFIELD, RGB(48, 50, 58), ab),
+                                   .cornerRadius = CLAY_CORNER_RADIUS(9),
+                                   .border = {.color = Mix(gTextAlign == i ? RGB(86, 125, 207) : C_RCARDB, C_TEXT, ab.hover * .2f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                            Tx(alignNames[i], 13, gTextAlign == i ? C_TEXT : C_DIM, 0);
+                        }
+                    }
+                }
+            }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
+                Tx("Style", 14, C_DIM, 1);
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
+                    TextStyleToggle("TextBold", "Bold", &gTextBold);
+                    TextStyleToggle("TextOutline", "Outline", &gTextOutline);
+                }
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
+                    TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
+                    TextStyleToggle("TextBackground", "Background", &gTextBackground);
+                }
+            }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = AL_Y}}) {
+                Tx("Default clip length", 14, C_DIM, 0);
+                HSPACE
+                float durationValue = gTextDuration;
+                if (ValBoxEditable(CLAY_ID("TextDuration"), &durationValue, "s", 82, 28, 14, 11, 8, .5f, 30.f, 1))
+                    gTextDuration = durationValue;
+            }
+        }
+        if (TextActionButton("TextApply", gTextTitleSelected ? "Update selected title" : "Add title to timeline", true))
+            PlutoTextApply(false);
+        if (TextActionButton("TextNew", "Create another title", false))
+            PlutoTextApply(true);
+        if (TextActionButton("TextToolPlace", gTimelineTool == 3 ? "Text tool active  ·  click preview" : "Activate text placement tool", false)) {
+            gTimelineTool = 3;
+            gRightTab = 3;
+            gTextInputFocused = false;
+        }
+        if (gTextTitleSelected) {
+            Tx("Editing a title clip. Changes are applied with Update selected title.", 12.5f, C_MUTED, 0);
+        } else {
+            Tx("Titles are transparent overlay clips on the upper video track. Drag and trim them like video.", 12.5f, C_MUTED, 0);
         }
     }
 }
@@ -1348,7 +1690,7 @@ static void RightPanel(void) {
     static const char *tabs[4] = {"Transform", "Colors", "Effects", "Text"};
     static const int icons[4] = {I_CROP, I_PALETTE, I_SUN, I_TEXT};
     float pill = Anim(CLAY_ID("PillAnim").id, (float)gRightTab, 20.f);
-    bool fitBody = (gRightTab == 3);
+    bool fitBody = false;
     CLAY(CLAY_ID("Right"), {.layout = {COLM, .sizing = {CLAY_SIZING_FIXED(gRightW), GROW}, .childGap = 10}}) {
         /* tab bar: 54 tall = 6 pad + 42 track (4 pad + 34 pill + 4 pad) + 6 pad */
         CLAY(CLAY_ID("InspTabs"), {.layout = {.sizing = {GROW, FIX(54)}, .padding = CLAY_PADDING_ALL(6)}, RPANEL_R(18)}) {
@@ -1357,14 +1699,14 @@ static void RightPanel(void) {
                                       .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 0)}}) {
                 for (int i = 0; i < 4; i++)
                     if (TabBtn(CLAY_IDI("InspTab", i), tabs[i], gRightTab == i, 15.f, 11, true)) {
-                        if (gRightTab != i) { gTabDir = (i > gRightTab) ? 1 : -1; gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
+                        if (gRightTab != i) { gTextInputFocused = false; gTabDir = (i > gRightTab) ? 1 : -1; gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
                     }
             }
         }
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
                                    .clip = {.horizontal = true, .vertical = true, .childOffset = {gTabDir * (1.f - gTabE) * TAB_SLIDE_PX, -gScroll}}}) {
             CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}}) {
-                if (gTimelineSelected < 0) {
+                if (gTimelineSelected < 0 && gRightTab != 3) {
                     CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {
                         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
                             Icon(I_FILM, 26, C_MUTED);

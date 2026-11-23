@@ -34,7 +34,18 @@ static void TimelineRebuildVisibleVideoTracks(void) {
         if (used) TimelineAddVisibleVideoTrack(track);
     }
     TimelineAddVisibleVideoTrack(0);
-    if ((gMediaDragIndex >= 0 || gClipDragIndex >= 0) && gTimelinePendingVideoTrack >= 1 && gTimelinePendingVideoTrack < 4)
+
+    /* Keep the source lane mounted for the entire drag gesture. When the
+       preview follows the pointer into another lane, rebuilding from the
+       moved clip alone would otherwise collapse the source row mid-drag.
+       That makes row coordinates jump under the cursor and causes the clip
+       to appear stuck on (or snap back to) the original lane. */
+    if (gClipDragIndex >= 0 && TimelineTrackIsVideo(gClipDragTrack))
+        TimelineAddVisibleVideoTrack(gClipDragTrack);
+
+    /* Keep a temporarily revealed destination lane visible until release. */
+    if ((gMediaDragIndex >= 0 || gClipDragIndex >= 0) &&
+        gTimelinePendingVideoTrack >= 1 && gTimelinePendingVideoTrack < 4)
         TimelineAddVisibleVideoTrack(gTimelinePendingVideoTrack);
 }
 
@@ -507,7 +518,7 @@ static void TimelineClipLane(int track) {
             }
             float cardWidth = fmaxf(1.f, width);
             bool clipSelected = gTimelineSelected == i || gTimelineMultiSelect[i];
-            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fminf(48.f, lane.height - 6.f))}, .padding = {8, 5, 2, 0}, .childGap = 6, .childAlignment = AL_Y},
+            CLAY(clipId, {.layout = {.sizing = {CLAY_SIZING_FIXED(cardWidth), FIX(fminf(48.f, lane.height - 6.f))}, .padding = {8, 5, 5, 0}, .childGap = 6, .childAlignment = {.y = CLAY_ALIGN_Y_TOP}},
                           .clip = {.horizontal = true, .vertical = true},
                           .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, b.hover,
                                                      (i << 1) | (clipSelected ? 1 : 0))}}) {
@@ -623,15 +634,19 @@ static void Timeline(void) {
     bool draggingVideoItem = gClipDragIndex >= 0 && TimelineTrackIsVideo(gClipDragTrack);
     if (gMediaDragIndex >= 0 && gMediaDragIndex < gImportedCount)
         draggingVideoItem = draggingVideoItem || strcmp(gImported[gMediaDragIndex].kind, "audio") != 0;
-    if (draggingVideoItem && gTimelinePendingVideoTrack < 0 && gTimelineVideoTracks < 4) {
+    if (draggingVideoItem && gTimelineVideoTracks < 4) {
         Clay_BoundingBox topLane = Clay_GetElementData(CLAY_IDI("TrackLane", gTimelineVideoTrackIds[0])).boundingBox;
         if (topLane.width > 0.f && mouse.y < topLane.y + 2.f) {
-            for (int candidate = 1; candidate <= 3; candidate++) {
-                if (!TimelineVideoTrackIsVisible(candidate)) {
-                    TimelineAddVisibleVideoTrack(candidate);
-                    gTimelinePendingVideoTrack = candidate;
-                    break;
-                }
+            /* Reveal the next higher numbered video lane, not simply the
+               first missing ID. Track IDs increase upward (V1 is bottom),
+               so this keeps V3 above V2 and V4 above V3 even when lanes
+               have been collapsed. More than one lane can be revealed in
+               a single drag by continuing to move above the new top row. */
+            int candidate = gTimelineVideoTrackIds[0] + 1;
+            while (candidate < 4 && TimelineVideoTrackIsVisible(candidate)) candidate++;
+            if (candidate < 4) {
+                TimelineAddVisibleVideoTrack(candidate);
+                gTimelinePendingVideoTrack = candidate;
             }
         }
     }
@@ -730,10 +745,15 @@ static void Timeline(void) {
 
     CLAY(CLAY_ID("Timeline"), {.layout = {COLM, .sizing = {GROW, CLAY_SIZING_FIXED(gTimeH)}}, PANEL}) {
         CLAY(CLAY_ID("TlBar"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 12, 0, 0}, .childGap = 4, .childAlignment = AL_Y}}) {
-            if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) gTimelineTool = 0;
-            if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) gTimelineTool = 1;
-            if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) gTimelineTool = 2;
-            if (IconBtn(CLAY_ID("ToolText"), I_TEXT, 36, 18, C_DIM, gTimelineTool == 3, 9)) gTimelineTool = 3;
+            if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) { gTimelineTool = 0; gTextInputFocused = false; }
+            if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) { gTimelineTool = 1; gTextInputFocused = false; }
+            if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; }
+            if (IconBtn(CLAY_ID("ToolText"), I_TEXT, 36, 18, C_DIM, gTimelineTool == 3, 9)) {
+                gTimelineTool = 3;
+                gRightTab = 3;
+                gTextInputFocused = false;
+                gScroll = gScrollT = 0.f;
+            }
             GAPX(8)
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(1), FIX(20)}}, .backgroundColor = RGB(46, 48, 54)}) {}
             GAPX(8)
@@ -794,7 +814,8 @@ static void Timeline(void) {
             CLAY(CLAY_ID("RulerRow"), {.layout = {.sizing = {GROW, FIX(30)}}}) {
                 GAPX(60)
                 CLAY(CLAY_ID("Ruler"), {.layout = {.sizing = {GROW, GROW}},
-                                         .custom = {.customData = NC(K_RULER, C_CARD, C_CARD, C_CARD, 0, extra, 0)}}) {}
+                                         .custom = {.customData = NC(K_RULER, C_CARD, C_CARD, C_CARD, 0,
+                                                              fmaxf(0.f, gTimeH - 90.5f), 0)}}) {}
             }
             CLAY(CLAY_ID("TrackViewport"), {.layout = {COLM, .sizing = {GROW, GROW}},
                 .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gTimelineVerticalScroll}}}) {

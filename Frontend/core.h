@@ -169,6 +169,23 @@ static float gClipTrimOrigStart, gClipTrimOrigEnd, gClipTrimOrigOffset, gClipTri
 static bool  gTimelinePanning, gTimelineMiddlePanning;
 static float gTimelinePanMouseY, gTimelineVerticalPanOrig, gTimelineVerticalScroll, gTimelineVerticalScrollT, gTimelineVerticalMax;
 static uint64_t gClipSerial = 1;
+
+/* Native title-card editor. Titles are rasterized to transparent PNG layers
+   so the same asset is used by the WGPU preview and FFmpeg export. */
+#define STELLA_TEXT_MAX 512
+static char gTextContent[STELLA_TEXT_MAX] = "Your title";
+static int gTextFontSize = 96;
+static int gTextColorIndex = 0;
+static int gTextAlign = 1; /* 0 left, 1 center, 2 right */
+static bool gTextBold = true;
+static bool gTextOutline;
+static bool gTextShadow = true;
+static bool gTextBackground;
+static bool gTextInputFocused;
+static bool gTextTitleSelected;
+static float gTextPosX = 0.5f, gTextPosY = 0.78f;
+static float gTextDuration = 5.f;
+static void PlutoTextPlaceAt(float xNormalized, float yNormalized);
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
 #ifdef _WIN32

@@ -376,22 +376,22 @@ int main(void) {
                 gPreviewDebounce = 1.f;
             }
         }
-        if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0) gTimelinePlaying = !gTimelinePlaying;
+        if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0 && !gTextInputFocused) gTimelinePlaying = !gTimelinePlaying;
         if (IsKeyPressed(KEY_F3)) gPerfOverlay = !gPerfOverlay;
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         gShiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         bool altDown = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
-        if (gEditValueId == 0) {
+        if (gEditValueId == 0 && !gTextInputFocused) {
             if (gCtrlDown && IsKeyPressed(KEY_Z)) TimelineHistoryAction(gShiftDown);
             else if (gCtrlDown && IsKeyPressed(KEY_Y)) TimelineHistoryAction(true);
             else if (!gCtrlDown && !altDown) {
-                if (IsKeyPressed(KEY_V)) gTimelineTool = 0;      /* Select */
-                if (IsKeyPressed(KEY_H)) gTimelineTool = 1;      /* Hand */
-                if (IsKeyPressed(KEY_C)) gTimelineTool = 2;      /* Cut */
-                if (IsKeyPressed(KEY_T)) gTimelineTool = 3;      /* Text */
+                if (IsKeyPressed(KEY_V)) { gTimelineTool = 0; gTextInputFocused = false; }
+                if (IsKeyPressed(KEY_H)) { gTimelineTool = 1; gTextInputFocused = false; }
+                if (IsKeyPressed(KEY_C)) { gTimelineTool = 2; gTextInputFocused = false; }
+                if (IsKeyPressed(KEY_T)) { gTimelineTool = 3; gRightTab = 3; gTextInputFocused = false; }
             }
         }
-        if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
+        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
             (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))) {
             int splitCount = 0;
             for (int i = 0; i < gTimelineClipCount; i++) {
@@ -406,14 +406,14 @@ int main(void) {
                 gPlayhead < gTimelineClips[gTimelineSelected].start + gTimelineClips[gTimelineSelected].duration - .001f)
                 PlutoTimelineSplit(gTimelineSelected, gPlayhead);
         }
-        if (gEditValueId == 0 && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
+        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
             gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
             PlutoTimelineDelete(gTimelineSelected);
             memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
             gTimelineSelected = -1;
         }
         bool navLeft = IsKeyDown(KEY_LEFT), navRight = IsKeyDown(KEY_RIGHT);
-        bool navActive = gEditValueId == 0 && !gTimelinePlaying && (navLeft || navRight);
+        bool navActive = gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && (navLeft || navRight);
         gPreviewNavigating = navActive;
         bool navStep = false;
         if (navActive) {

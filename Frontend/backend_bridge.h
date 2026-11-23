@@ -371,6 +371,7 @@ static bool PlutoSyncTimeline(const char *json) {
     gTimelineSelected = -1;
     for (int i = 0; i < count; i++) if (selectedId[0] && strcmp(selectedId, gTimelineClips[i].id) == 0) gTimelineSelected = i;
     if (gTimelineSelected >= 0 && selectedBegin && selectedEnd) PlutoHydrateInspector(selectedBegin, selectedEnd);
+    else gTextTitleSelected = false;
     if (strstr(json, "\"snapping\":false")) gTimelineSnap = false;
     else if (strstr(json, "\"snapping\":true")) gTimelineSnap = true;
     return true;
@@ -440,6 +441,46 @@ static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) {
     for (int i = 0; i < gTimelineClipCount; i++) if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
     gPreviewDirty = true;
     return true;
+}
+
+static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, float start, float duration) {
+    if (!path || !*path || !textJson || gTimelineClipCount >= MAX_TIMELINE_CLIPS) return false;
+    char escapedPath[2048], id[64], request[8192];
+    PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
+    bool idInUse;
+    do {
+        snprintf(id, sizeof(id), "title-%llu", (unsigned long long)gClipSerial++);
+        idInUse = false;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            if (strcmp(gTimelineClips[i].id, id) == 0) { idInUse = true; break; }
+        }
+    } while (idInUse);
+    int n = snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v4\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Title\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
+        id, fmaxf(0.f, start), fmaxf(.05f, duration), escapedPath, fmaxf(.05f, duration), textJson);
+    if (n <= 0 || (size_t)n >= sizeof(request) || !PlutoTimelineCall(request)) return false;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
+    }
+    gRightTab = 3;
+    gTimelineTool = 0;
+    gTextTitleSelected = true;
+    gPreviewDirty = true;
+    return true;
+}
+
+static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson) {
+    if (!clipId || !*clipId || !path || !*path || !textJson) return false;
+    char escapedId[160], escapedPath[2048], request[8192];
+    PlutoJsonEscape(clipId, escapedId, sizeof(escapedId));
+    PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
+    int n = snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_update_title_clip\",\"id\":\"%s\",\"path\":\"%s\",\"text\":%s}",
+        escapedId, escapedPath, textJson);
+    if (n <= 0 || (size_t)n >= sizeof(request)) return false;
+    bool okay = PlutoTimelineCall(request);
+    if (okay) { gTextTitleSelected = true; gRightTab = 3; gPreviewDirty = true; }
+    return okay;
 }
 
 static bool PlutoTimelineMove(int index, float start, int track) {
@@ -893,6 +934,8 @@ static bool PlutoBackendLoad(void) { return false; }
 static bool PlutoTimelineCall(const char *request) { (void)request; return false; }
 static void PlutoTimelineSelect(int index) { (void)index; }
 static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) { (void)mediaIndex; (void)start; (void)track; return false; }
+static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, float start, float duration) { (void)path; (void)textJson; (void)start; (void)duration; return false; }
+static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson) { (void)clipId; (void)path; (void)textJson; return false; }
 static bool PlutoTimelineMove(int index, float start, int track) { (void)index; (void)start; (void)track; return false; }
 static bool PlutoTimelineDelete(int index) { (void)index; return false; }
 static bool PlutoTimelineSplit(int index, float at) { (void)index; (void)at; return false; }

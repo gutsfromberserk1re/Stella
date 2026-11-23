@@ -51,6 +51,13 @@ static void CenterPanel(void) {
             CLAY(CLAY_ID("PreviewFrame"), {.layout = {.sizing = {FIX(pw), FIX(ph)}},
                                            .custom = {.customData = NC(K_PREVIEW, C_BG, C_BG, C_BG, 0, 0, 0)}}) {}
         }
+        Clay_ElementId previewFrameId = CLAY_ID("PreviewFrame");
+        if (gTimelineTool == 3 && Clay_PointerOver(previewFrameId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Clay_BoundingBox frame = Clay_GetElementData(previewFrameId).boundingBox;
+            Vector2 pointer = GetMousePosition();
+            if (frame.width > 1.f && frame.height > 1.f)
+                PlutoTextPlaceAt((pointer.x - frame.x) / frame.width, (pointer.y - frame.y) / frame.height);
+        }
         CLAY(CLAY_ID("Transport"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 14, 0, 4}, .childAlignment = AL_Y}}) {
             CLAY(CLAY_ID("TimeL"), {.layout = {.sizing = {GROW, FIT}, .childGap = 7, .childAlignment = AL_Y}}) {
                 Tx(Timecode(gPlayhead), 15, C_TEXT, 1);

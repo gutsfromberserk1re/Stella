@@ -261,7 +261,7 @@ static bool DrawAssetIcon(int k, Rectangle r, Color tint) {
                k == I_MAGNET ? 4 : k == I_LIBRARY ? 5 : -1;
     if (slot < 0 || gToolIcons[slot].id == 0) return false;
     Texture2D tex = gToolIcons[slot];
-    if (k == I_LINK) { r.x += r.width * .19f; r.y += r.height * .19f; r.width *= .62f; r.height *= .62f; }
+    if (k == I_LINK) { r.x += r.width * .12f; r.y += r.height * .12f; r.width *= .76f; r.height *= .76f; }
     DrawTexturePro(tex, (Rectangle){0, 0, (float)tex.width, (float)tex.height}, r, (Vector2){0, 0}, 0.f, tint);
     return true;
 }
@@ -585,8 +585,17 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         bool audioOnly = clip && clip->track >= 4;
         const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
-        if (audioOnly && !clip->groupId[0]) FillRR(r, 6, (Color){63, 119, 158, 230});
-        else GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        if (audioOnly) {
+            /* Detached audio: deep-blue to cyan gradient with a restrained grid. */
+            GradRR(r, 6, (Color){12, 35, 67, 255}, (Color){13, 111, 139, 255});
+            Color grid = (Color){177, 230, 241, 22};
+            for (float gx = r.x + 10.f; gx < r.x + r.width - 6.f; gx += 10.f)
+                DrawLineEx((Vector2){gx, r.y + 5.f}, (Vector2){gx, r.y + r.height - 5.f}, 1.f, grid);
+            for (float gy = r.y + 10.f; gy < r.y + r.height - 6.f; gy += 10.f)
+                DrawLineEx((Vector2){r.x + 6.f, gy}, (Vector2){r.x + r.width - 6.f, gy}, 1.f, grid);
+        } else {
+            GradRR(r, 6, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
+        }
         Texture2D wave = {0};
         if (clip && clip->mediaIndex >= 0 && clip->mediaIndex < gImportedCount) {
             ImportedMedia *media = &gImported[clip->mediaIndex];
@@ -596,10 +605,10 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         if (wave.id && hasAudio) {
             Rectangle band = audioOnly
                 ? (Rectangle){r.x + 2.f, r.y + 2.f, fmaxf(0.f, r.width - 4.f), fmaxf(0.f, r.height - 4.f)}
-                : (Rectangle){r.x + 2.f, r.y + r.height - 10.f, fmaxf(0.f, r.width - 4.f), 8.f};
+                : (Rectangle){r.x + 2.f, r.y + r.height - 18.f, fmaxf(0.f, r.width - 4.f), 16.f};
             Rectangle waveformRect = band;
             DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, waveformRect,
-                           (Vector2){0, 0}, 0.f, WHITE);
+                           (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 204});
         }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         bool selected = (cu->i & 1) != 0;

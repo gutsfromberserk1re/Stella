@@ -539,8 +539,8 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     let media_hash = media_content_hash(path)?;
     let cache_dir = std::env::temp_dir().join("pluto-media-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
-    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v5.png"));
-    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v2.jpg"));
+    let waveform = cache_dir.join(format!("{media_hash:016x}-wave-v6.png"));
+    let thumbnail = cache_dir.join(format!("{media_hash:016x}-thumb-v3.bmp"));
     let proxy = if kind == "video" {
         cache_dir.join(format!("{media_hash:016x}-proxy-1080p-g30-v4.mp4"))
     } else { std::path::PathBuf::new() };
@@ -553,7 +553,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
             media_command(&ffmpeg)
                 .args(["-v", "error", "-i"])
                 .arg(path)
-                .args(["-filter_complex", "showwavespic=s=1024x256:colors=0x9b91b0:scale=sqrt", "-frames:v", "1", "-y"])
+                .args(["-filter_complex", "showwavespic=s=1024x256:colors=white:scale=sqrt", "-frames:v", "1", "-y"])
                 .arg(&waveform)
                 .status()
                 .is_ok_and(|status| status.success())
@@ -574,7 +574,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
                 command.args(["-ss", seek.as_str()]);
             }
             command.arg("-i").arg(path)
-                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-y"])
                 .arg(&thumbnail);
             let first_attempt = command.status().is_ok_and(|status| status.success())
                 && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
@@ -582,13 +582,27 @@ fn inspect_media(path: &str) -> Result<Value, String> {
                 true
             } else {
                 let _ = std::fs::remove_file(&thumbnail);
-                let mut fallback = media_command(&ffmpeg);
-                fallback.args(["-v", "error", "-i"]).arg(path)
-                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "8", "-y"])
+                let cli_fallback = kind == "video" && media_command(&ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(path)
+                    .args(["-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black", "-y"])
                     .arg(&thumbnail)
                     .status()
                     .is_ok_and(|status| status.success())
-                    && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
+                    && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128);
+                if cli_fallback {
+                    true
+                } else if kind != "audio" {
+                    // The lightweight package may not ship the FFmpeg CLI. Use the
+                    // in-process decoder as a bounded 320x180 fallback for visual media.
+                    let _ = std::fs::remove_file(&thumbnail);
+                    path.to_str().is_some_and(|source| {
+                        decoder::write_thumbnail(source, &thumbnail, 320, 180).is_ok()
+                            && thumbnail.metadata().is_ok_and(|meta| meta.len() > 128)
+                    })
+                } else {
+                    false
+                }
             }
         };
         generated.then(|| thumbnail.to_string_lossy().into_owned())
@@ -1296,6 +1310,27 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let clip: Clip =
                 serde_json::from_value(request["clip"].clone()).map_err(|e| e.to_string())?;
             timeline.add_clip(clip).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_update_title_clip" => {
+            let before = timeline.clone();
+            let id = request["id"].as_str().ok_or("Title clip id is required")?;
+            let path = request["path"].as_str().ok_or("Title image path is required")?;
+            let text = request["text"].clone();
+            if !text.is_object() { return Err("Title properties must be an object".into()); }
+            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
+                .ok_or_else(|| format!("Title clip {id} was not found"))?;
+            if clip.extra.get("kind").and_then(Value::as_str) != Some("image") ||
+               clip.extra.get("props").and_then(|props| props.get("text")).and_then(|value| value.get("isTitle")).and_then(Value::as_bool) != Some(true) {
+                return Err("The selected clip is not a Stella title".into());
+            }
+            clip.extra.insert("path".into(), json!(path));
+            clip.extra.insert("kind".into(), json!("image"));
+            clip.extra.insert("hasAudio".into(), json!(false));
+            let props = clip.extra.entry("props".into()).or_insert_with(|| json!({}));
+            if !props.is_object() { *props = json!({}); }
+            props["text"] = text;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
