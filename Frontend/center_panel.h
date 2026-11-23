@@ -10,6 +10,61 @@ static const char *Timecode(float seconds) {
     return Fmt("%02d:%02d:%02d:%02d", whole / 3600, (whole / 60) % 60, whole % 60, frames);
 }
 
+static float PreviewClamp(float value, float low, float high) {
+    return fmaxf(low, fminf(high, value));
+}
+
+static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
+    Clay_BoundingBox bounds = Clay_GetElementData(previewFrameId).boundingBox;
+    Rectangle frame = {bounds.x, bounds.y, bounds.width, bounds.height};
+    Vector2 mouse = GetMousePosition();
+    bool frameValid = frame.width > 1.f && frame.height > 1.f;
+
+    gTextBoxScreenRectValid = false;
+    if (gTimelineTool == 3 && gTextTitleSelected && frameValid && !gTextBoxDragging) {
+        float width = gTextBoxW * frame.width;
+        float height = gTextBoxH * frame.height;
+        gTextBoxScreenRect = (Rectangle){
+            frame.x + PreviewClamp(gTextPosX - gTextBoxW * .5f, 0.f, 1.f - gTextBoxW) * frame.width,
+            frame.y + PreviewClamp(gTextPosY - gTextBoxH * .5f, 0.f, 1.f - gTextBoxH) * frame.height,
+            width, height
+        };
+        gTextBoxScreenRectValid = true;
+    }
+
+    bool overFrame = frameValid && CheckCollisionPointRec(mouse, frame);
+    if (gTimelineTool == 3 && overFrame) gCross = true;
+    if (gTimelineTool == 3 && !gTextBoxDragging && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && overFrame) {
+        gTextBoxDragging = true;
+        gTextBoxDragStart = (Vector2){
+            PreviewClamp(mouse.x, frame.x, frame.x + frame.width),
+            PreviewClamp(mouse.y, frame.y, frame.y + frame.height)
+        };
+        gTextBoxDragRect = (Rectangle){gTextBoxDragStart.x, gTextBoxDragStart.y, 1.f, 1.f};
+        gTextBoxScreenRectValid = false;
+    }
+
+    if (gTextBoxDragging) {
+        gCross = true;
+        float endX = PreviewClamp(mouse.x, frame.x, frame.x + frame.width);
+        float endY = PreviewClamp(mouse.y, frame.y, frame.y + frame.height);
+        float left = fminf(gTextBoxDragStart.x, endX);
+        float top = fminf(gTextBoxDragStart.y, endY);
+        gTextBoxDragRect = (Rectangle){left, top,
+            fabsf(endX - gTextBoxDragStart.x), fabsf(endY - gTextBoxDragStart.y)};
+
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            Rectangle selection = gTextBoxDragRect;
+            gTextBoxDragging = false;
+            if (selection.width >= 12.f && selection.height >= 12.f && frameValid) {
+                float x = (selection.x + selection.width * .5f - frame.x) / frame.width;
+                float y = (selection.y + selection.height * .5f - frame.y) / frame.height;
+                PlutoTextCreateBox(x, y, selection.width / frame.width, selection.height / frame.height);
+            }
+        }
+    }
+}
+
 static void CenterPanel(void) {
     static const int resolutions[] = {240, 480, 720, 1080};
     Clay_BoundingBox qb = Clay_GetElementData(CLAY_ID("PreviewQuality")).boundingBox;
@@ -52,12 +107,7 @@ static void CenterPanel(void) {
                                            .custom = {.customData = NC(K_PREVIEW, C_BG, C_BG, C_BG, 0, 0, 0)}}) {}
         }
         Clay_ElementId previewFrameId = CLAY_ID("PreviewFrame");
-        if (gTimelineTool == 3 && Clay_PointerOver(previewFrameId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Clay_BoundingBox frame = Clay_GetElementData(previewFrameId).boundingBox;
-            Vector2 pointer = GetMousePosition();
-            if (frame.width > 1.f && frame.height > 1.f)
-                PlutoTextPlaceAt((pointer.x - frame.x) / frame.width, (pointer.y - frame.y) / frame.height);
-        }
+        UpdateTextToolBox(previewFrameId);
         CLAY(CLAY_ID("Transport"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 14, 0, 4}, .childAlignment = AL_Y}}) {
             CLAY(CLAY_ID("TimeL"), {.layout = {.sizing = {GROW, FIT}, .childGap = 7, .childAlignment = AL_Y}}) {
                 Tx(Timecode(gPlayhead), 15, C_TEXT, 1);

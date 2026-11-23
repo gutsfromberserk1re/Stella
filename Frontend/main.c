@@ -139,6 +139,8 @@ static void Splitter(int which) {
 static void PlutoApplyKeyframeValues(void);
 
 static void TimelineHistoryAction(bool redo) {
+    PlutoTextAutoUpdateFlush();
+    PlutoTimelineEndPropertyEdit();
     if (PlutoTimelineHistory(redo)) {
         PlutoApplyKeyframeValues();
         gPreviewDirty = true;
@@ -620,6 +622,7 @@ int main(void) {
         if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             PlutoTimelineEndPropertyEdit();
         }
+        PlutoTextAutoUpdateTick();
         if (gPreviewDirty && !gPreviewTaskId) {
             gPreviewDebounce += gDt;
             bool responsiveEdit = gTimelinePropertyEditOpen || gKeyframeDragClip >= 0 ||

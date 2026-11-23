@@ -187,20 +187,34 @@ static void DurRow(int gi, const char *label) {
 }
 
 /* Audio page content (scrolling is handled by the shared left-panel scroller). */
+static bool PlutoSelectedClipHasAudio(void) {
+    if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
+    const TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
+    return clip->track >= 4 || clip->hasAudio;
+}
+
 static void AudioView(void) {
     CLAY(CLAY_ID("LibContent"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .padding = {0, 0, 0, 12}}}) {
         CLAY(CLAY_ID("AudioHead"), {.layout = {.sizing = {GROW, FIT}, .padding = {4, 0, 0, 6}, .childGap = 10, .childAlignment = AL_Y}}) {
             Icon(I_NOTE, 22, C_DIM);
             Tx("Audio", 21.f, C_TEXT, 1);
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(0, "Volume"); }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {22, 22, 0, 0}}}) { KnobGroup(1, "Pan"); HSPACE KnobGroup(2, "Bass"); }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(3, "Treble"); }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {0, 0, 14, 4}, .childGap = 40, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-            SwitchItem(0, "Fade In"); SwitchItem(1, "Fade Out");
+        if (!PlutoSelectedClipHasAudio()) {
+            CLAY(CLAY_ID("AudioNoSource"), {.layout = {COLM, .sizing = {GROW, FIX(180)}, .childGap = 12, .childAlignment = AL_C}}) {
+                Icon(I_NOTE, 30, C_MUTED);
+                Tx("Select a media with audio", 16, C_TEXT, 1);
+                TxWrap("Audio controls are available for video clips with audio or audio clips.", 13, C_MUTED, 1);
+            }
+        } else {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(0, "Volume"); }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {22, 22, 0, 0}}}) { KnobGroup(1, "Pan"); HSPACE KnobGroup(2, "Bass"); }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(3, "Treble"); }
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {0, 0, 14, 4}, .childGap = 40, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
+                SwitchItem(0, "Fade In"); SwitchItem(1, "Fade Out");
+            }
+            DurRow(40, "Fade In Duration");
+            DurRow(41, "Fade Out Duration");
         }
-        DurRow(40, "Fade In Duration");
-        DurRow(41, "Fade Out Duration");
     }
 }
 

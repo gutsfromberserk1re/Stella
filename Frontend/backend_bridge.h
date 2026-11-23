@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+static bool gTimelinePropertyEditOpen;
+
 #ifdef _WIN32
 #include <windows.h>
 #include <commdlg.h>
@@ -415,6 +417,9 @@ static bool PlutoTimelineCallFast(const char *request) {
 
 static void PlutoTimelineSelect(int index) {
     if (index < 0 || index >= gTimelineClipCount || index == gTimelineSelected) return;
+    /* Flush and close a text edit before inspector hydration replaces its global state. */
+    PlutoTextAutoUpdateFlush();
+    PlutoTimelineEndPropertyEdit();
     gTimelineSelected = index;
     PlutoTimelineCall("{\"command\":\"timeline_get\"}");
     gPreviewDirty = true;
@@ -473,22 +478,25 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
         if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
     }
     gRightTab = 3;
-    gTimelineTool = 0;
     gTextTitleSelected = true;
     gPreviewDirty = true;
     return true;
 }
 
-static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson) {
+static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson, bool live) {
     if (!clipId || !*clipId || !path || !*path || !textJson) return false;
     char escapedId[160], escapedPath[2048], request[8192];
     PlutoJsonEscape(clipId, escapedId, sizeof(escapedId));
     PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
     int n = snprintf(request, sizeof(request),
-        "{\"command\":\"timeline_update_title_clip\",\"id\":\"%s\",\"path\":\"%s\",\"text\":%s}",
-        escapedId, escapedPath, textJson);
+        "{\"command\":\"timeline_update_title_clip\",\"id\":\"%s\",\"path\":\"%s\",\"text\":%s,\"live\":%s}",
+        escapedId, escapedPath, textJson, live ? "true" : "false");
     if (n <= 0 || (size_t)n >= sizeof(request)) return false;
-    bool okay = PlutoTimelineCall(request);
+    bool okay;
+    if (live) {
+        gTimelinePropertyEditOpen = true;
+        okay = PlutoTimelineCallFast(request);
+    } else okay = PlutoTimelineCall(request);
     if (okay) { gTextTitleSelected = true; gRightTab = 3; gPreviewDirty = true; }
     return okay;
 }
@@ -802,8 +810,6 @@ static void PlutoRequestExport(void) {
     free(utf8);
 }
 
-static bool gTimelinePropertyEditOpen;
-
 static bool PlutoTimelineSetPropertyJsonMode(const char *path, const char *valueJson, bool live) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     live = live || gTimelinePropertyEditOpen;
@@ -854,6 +860,7 @@ static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) {
 static void PlutoTimelineEndPropertyEdit(void) {
     if (!gTimelinePropertyEditOpen) return;
     gTimelinePropertyEditOpen = false;
+    gTextAutoUpdateCommitAt = 0.0;
     /* Commit one undo snapshot and refresh the local keyframe/inspector cache once. */
     gPreviewDirty = true;
     gPreviewDebounce = 1.f;
@@ -946,7 +953,7 @@ static bool PlutoTimelineCall(const char *request) { (void)request; return false
 static void PlutoTimelineSelect(int index) { (void)index; }
 static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) { (void)mediaIndex; (void)start; (void)track; return false; }
 static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, float start, float duration) { (void)path; (void)textJson; (void)start; (void)duration; return false; }
-static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson) { (void)clipId; (void)path; (void)textJson; return false; }
+static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, const char *textJson, bool live) { (void)clipId; (void)path; (void)textJson; (void)live; return false; }
 static bool PlutoTimelineMove(int index, float start, int track) { (void)index; (void)start; (void)track; return false; }
 static bool PlutoTimelineDelete(int index) { (void)index; return false; }
 static bool PlutoTimelineSplit(int index, float at) { (void)index; (void)at; return false; }
@@ -956,7 +963,7 @@ static bool PlutoTimelineSetProperty(const char *path, double value) { (void)pat
 static bool PlutoTimelineSetPropertyLive(const char *path, double value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetPropertiesJson(const char *propertiesJson) { (void)propertiesJson; return false; }
 static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) { (void)propertiesJson; return false; }
-static void PlutoTimelineEndPropertyEdit(void) {}
+static void PlutoTimelineEndPropertyEdit(void) { gTimelinePropertyEditOpen = false; gTextAutoUpdateCommitAt = 0.0; }
 static bool PlutoTimelineMoveKeyframe(int index, float from, float to, bool live) { (void)index; (void)from; (void)to; (void)live; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }

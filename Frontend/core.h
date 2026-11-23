@@ -203,8 +203,25 @@ static bool gTextBackground;
 static bool gTextInputFocused;
 static bool gTextTitleSelected;
 static float gTextPosX = 0.5f, gTextPosY = 0.78f;
+/* Text tools create a normalized rectangle on the preview. Text is rendered
+   into this rectangle only, just like a conventional text-frame tool. */
+static float gTextBoxW = 0.76f, gTextBoxH = 0.28f;
+static bool gTextAutoFit = true;
+static bool gTextBoxDragging;
+static Vector2 gTextBoxDragStart;
+static Rectangle gTextBoxDragRect;
+static Rectangle gTextBoxScreenRect;
+static bool gTextBoxScreenRectValid;
+static bool gTextAutoUpdatePending;
+static double gTextAutoUpdateChangedAt, gTextAutoUpdateCommitAt;
+static char gTextAutoUpdateClipId[64];
+static uint64_t gTextAutoObservedSignature;
+static char gTextAutoObservedClipId[64];
+static bool gTextAutoObserverInitialized;
 static float gTextDuration = 5.f;
-static void PlutoTextPlaceAt(float xNormalized, float yNormalized);
+static void PlutoTextCreateBox(float x, float y, float width, float height);
+static void PlutoTextAutoUpdateFlush(void);
+static void PlutoTimelineEndPropertyEdit(void);
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
 #ifdef _WIN32

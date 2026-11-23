@@ -1432,7 +1432,8 @@ fn dispatch(request: Value) -> Result<Value, String> {
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_update_title_clip" => {
-            let before = timeline.clone();
+            let live = request["live"].as_bool().unwrap_or(false);
+            let before = begin_history_change(backend, &timeline, live)?;
             let id = request["id"].as_str().ok_or("Title clip id is required")?;
             let path = request["path"].as_str().ok_or("Title image path is required")?;
             let text = request["text"].clone();
@@ -1449,8 +1450,9 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let props = clip.extra.entry("props".into()).or_insert_with(|| json!({}));
             if !props.is_object() { *props = json!({}); }
             props["text"] = text;
-            save_history(backend, before)?;
-            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+            commit_history_change(backend, before)?;
+            if live { Ok(json!({"changed": true})) }
+            else { serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()) }
         }
         "timeline_group_clips" => {
             let before = timeline.clone();

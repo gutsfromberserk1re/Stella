@@ -788,6 +788,20 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             DrawLineEx((Vector2){r.x, r.y + r.height / 3.f}, (Vector2){r.x + r.width, r.y + r.height / 3.f}, 1.f, grid);
             DrawLineEx((Vector2){r.x, r.y + 2.f * r.height / 3.f}, (Vector2){r.x + r.width, r.y + 2.f * r.height / 3.f}, 1.f, grid);
         }
+        if (gTimelineTool == 3) {
+            Rectangle textBox = gTextBoxDragging ? gTextBoxDragRect : gTextBoxScreenRect;
+            bool showTextBox = gTextBoxDragging || (gTextTitleSelected && gTextBoxScreenRectValid);
+            if (showTextBox && textBox.width > 1.f && textBox.height > 1.f) {
+                DrawRectangleRec(textBox, (Color){104, 157, 255, 18});
+                DrawRectangleLinesEx(textBox, 1.5f, (Color){151, 187, 255, 235});
+                Vector2 corners[4] = {
+                    {textBox.x, textBox.y}, {textBox.x + textBox.width, textBox.y},
+                    {textBox.x, textBox.y + textBox.height},
+                    {textBox.x + textBox.width, textBox.y + textBox.height}
+                };
+                for (int i = 0; i < 4; i++) DrawCircleV(corners[i], 3.5f, (Color){224, 235, 255, 255});
+            }
+        }
         DrawRectangleLinesEx(r, 1.5f, WHITE);
         Vector2 q[4] = {{r.x, r.y}, {r.x + r.width, r.y}, {r.x, r.y + r.height}, {r.x + r.width, r.y + r.height}};
         for (int i = 0; i < 4; i++) { DrawCircleV(q[i], 5.5f, WHITE); }

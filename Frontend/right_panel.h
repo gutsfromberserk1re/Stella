@@ -216,7 +216,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     if (gTextTitleSelected) {
         PlutoJsonStringPath(clipBegin, clipEnd, "props.text.content", gTextContent, sizeof(gTextContent));
         gTextFontSize = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.fontSize", 96.f));
-        gTextFontSize = (int)Clampf((float)gTextFontSize, 24.f, 180.f);
+        gTextFontSize = (int)Clampf((float)gTextFontSize, 8.f, 180.f);
         gTextColorIndex = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.color", 0.f));
         if (gTextColorIndex < 0 || gTextColorIndex > 7) gTextColorIndex = 0;
         gTextAppearance[0] = PlutoReadTextColor(clipBegin, clipEnd, "ink", gStellaTextColors[gTextColorIndex]);
@@ -229,6 +229,10 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         if (gTextAlign < 0 || gTextAlign > 2) gTextAlign = 1;
         gTextPosX = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.x", .5f), .03f, .97f);
         gTextPosY = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.y", .78f), .04f, .96f);
+        gTextBoxW = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.boxW", .82f), .001f, 1.f);
+        gTextBoxH = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.boxH", .32f), .001f, 1.f);
+        gTextAutoFit = false;
+        PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.autoFit", &gTextAutoFit);
         gTextDuration = Clampf(PlutoReadNumber(clipBegin, clipEnd, "dur", gTextDuration), .5f, 30.f);
         gTextBold = true; gTextOutline = false; gTextShadow = true; gTextBackground = false;
         PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.bold", &gTextBold);
@@ -1612,40 +1616,73 @@ static void PlutoTextBackspace(void) {
     gTextContent[n] = 0;
 }
 
-static int PlutoTextBuildLines(Font font, int fontSize, char lines[16][STELLA_TEXT_MAX]) {
+#define STELLA_TEXT_MAX_LINES 64
+
+static int PlutoTextBuildLines(Font font, int fontSize, float maxWidth,
+                               char lines[STELLA_TEXT_MAX_LINES][STELLA_TEXT_MAX]) {
     char source[STELLA_TEXT_MAX];
     strncpy(source, gTextContent, sizeof(source) - 1);
     source[sizeof(source) - 1] = 0;
     int count = 0;
     char *lineStart = source;
-    while (lineStart && count < 16) {
+    while (lineStart && count < STELLA_TEXT_MAX_LINES) {
         char *newline = strchr(lineStart, '\n');
         if (newline) *newline = 0;
         char current[STELLA_TEXT_MAX] = {0};
         char *word = lineStart;
-        while (*word && count < 16) {
+        while (*word && count < STELLA_TEXT_MAX_LINES) {
             while (*word == ' ' || *word == '\t' || *word == '\r') word++;
             if (!*word) break;
             char *wordEnd = word;
             while (*wordEnd && *wordEnd != ' ' && *wordEnd != '\t' && *wordEnd != '\r') wordEnd++;
             char saved = *wordEnd;
             *wordEnd = 0;
+
             char candidate[STELLA_TEXT_MAX];
-            snprintf(candidate, sizeof(candidate), "%s%s%s", current, current[0] ? " " : "", word);
-            float width = MeasureTextEx(font, candidate, (float)fontSize, 0.f).x;
-            if (current[0] && width > 1640.f) {
+            snprintf(candidate, sizeof(candidate), "%s%s%s", current,
+                     current[0] ? " " : "", word);
+            float candidateWidth = MeasureTextEx(font, candidate, (float)fontSize, 0.f).x;
+            if (current[0] && candidateWidth > maxWidth) {
                 strncpy(lines[count++], current, STELLA_TEXT_MAX - 1);
                 lines[count - 1][STELLA_TEXT_MAX - 1] = 0;
-                strncpy(current, word, sizeof(current) - 1);
+                current[0] = 0;
+            }
+
+            /* A single long word must wrap too; otherwise it can escape a
+               narrow text frame even after the font has reached its minimum. */
+            if (MeasureTextEx(font, word, (float)fontSize, 0.f).x > maxWidth) {
+                char fragment[STELLA_TEXT_MAX] = {0};
+                const char *cursor = word;
+                while (*cursor && count < STELLA_TEXT_MAX_LINES) {
+                    int codepointBytes = 0;
+                    GetCodepointNext(cursor, &codepointBytes);
+                    if (codepointBytes < 1 || codepointBytes > 4) codepointBytes = 1;
+                    char piece[5] = {0};
+                    memcpy(piece, cursor, (size_t)codepointBytes);
+                    char fragmentCandidate[STELLA_TEXT_MAX];
+                    snprintf(fragmentCandidate, sizeof(fragmentCandidate), "%s%s", fragment, piece);
+                    if (fragment[0] && MeasureTextEx(font, fragmentCandidate, (float)fontSize, 0.f).x > maxWidth) {
+                        strncpy(lines[count++], fragment, STELLA_TEXT_MAX - 1);
+                        lines[count - 1][STELLA_TEXT_MAX - 1] = 0;
+                        fragment[0] = 0;
+                    }
+                    strncat(fragment, piece, sizeof(fragment) - strlen(fragment) - 1);
+                    cursor += codepointBytes;
+                }
+                strncpy(current, fragment, sizeof(current) - 1);
                 current[sizeof(current) - 1] = 0;
-            } else {
+            } else if (current[0]) {
                 strncpy(current, candidate, sizeof(current) - 1);
                 current[sizeof(current) - 1] = 0;
+            } else {
+                strncpy(current, word, sizeof(current) - 1);
+                current[sizeof(current) - 1] = 0;
             }
+
             *wordEnd = saved;
             word = wordEnd;
         }
-        if (count < 16) {
+        if (count < STELLA_TEXT_MAX_LINES) {
             strncpy(lines[count], current, STELLA_TEXT_MAX - 1);
             lines[count][STELLA_TEXT_MAX - 1] = 0;
             count++;
@@ -1688,55 +1725,93 @@ static bool PlutoTextOutputPath(char *path, size_t capacity) {
 }
 
 static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity) {
-    if (!gTextContent[0]) return false;
     if (!PlutoTextOutputPath(outPath, pathCapacity)) return false;
     const int width = 1920, height = 1080;
-    int fontSize = (int)Clampf((float)gTextFontSize, 24.f, 180.f);
-    Font font = FontPx(gTextBold ? 2 : 0, fontSize);
-    char lines[16][STELLA_TEXT_MAX] = {{0}};
-    int lineCount = PlutoTextBuildLines(font, fontSize, lines);
-    float lineHeight = (float)fontSize * 1.18f;
-    float blockHeight = lineCount * lineHeight;
-    float anchorX = Clampf(gTextPosX, .03f, .97f) * (float)width;
-    float anchorY = Clampf(gTextPosY, .04f, .96f) * (float)height;
-    float y = Clampf(anchorY - blockHeight * .5f, 8.f, (float)height - blockHeight - 8.f);
-    float maxWidth = 0.f;
+    float boxW = Clampf(gTextBoxW, .001f, 1.f) * (float)width;
+    float boxH = Clampf(gTextBoxH, .001f, 1.f) * (float)height;
+    float boxX = Clampf(gTextPosX * (float)width - boxW * .5f, 0.f, (float)width - boxW);
+    float boxY = Clampf(gTextPosY * (float)height - boxH * .5f, 0.f, (float)height - boxH);
+    int layerW = (int)fmaxf(1.f, roundf(boxW));
+    int layerH = (int)fmaxf(1.f, roundf(boxH));
+    float padX = fmaxf(5.f, boxW * .055f);
+    float padY = fmaxf(4.f, boxH * .09f);
+    float availableW = fmaxf(1.f, boxW - 2.f * padX);
+    float availableH = fmaxf(1.f, boxH - 2.f * padY);
+
+    /* Keep one high-resolution atlas per style and scale it to the fitted size.
+       Loading a new atlas for every trial size quickly exhausts the UI font cache. */
+    Font font = FontPx(gTextBold ? 2 : 0, 180);
+    int fontSize = (int)Clampf((float)gTextFontSize, 8.f, 180.f);
+    char lines[STELLA_TEXT_MAX_LINES][STELLA_TEXT_MAX] = {{0}};
+    int lineCount = 1;
+    float lineHeight = 0.f, blockHeight = 0.f, maxLineWidth = 0.f;
+    if (gTextAutoFit) {
+        int low = 8, high = 180, best = 8;
+        /* Font metrics scale monotonically here, so binary search finds the
+           largest size that fits both the box width and its available height. */
+        while (low <= high) {
+            int candidateSize = low + (high - low) / 2;
+            char candidateLines[STELLA_TEXT_MAX_LINES][STELLA_TEXT_MAX] = {{0}};
+            int candidateCount = PlutoTextBuildLines(font, candidateSize, availableW, candidateLines);
+            float candidateHeight = (float)candidateSize * 1.18f * (float)candidateCount;
+            float candidateWidth = 0.f;
+            for (int i = 0; i < candidateCount; i++) {
+                float w = MeasureTextEx(font, candidateLines[i], (float)candidateSize, 0.f).x;
+                if (w > candidateWidth) candidateWidth = w;
+            }
+            if (candidateWidth <= availableW + .5f && candidateHeight <= availableH + .5f) {
+                best = candidateSize;
+                low = candidateSize + 1;
+            } else high = candidateSize - 1;
+        }
+        fontSize = best;
+    }
+    lineCount = PlutoTextBuildLines(font, fontSize, availableW, lines);
+    lineHeight = (float)fontSize * 1.18f;
+    blockHeight = lineCount * lineHeight;
+    maxLineWidth = 0.f;
     for (int i = 0; i < lineCount; i++) {
         float w = MeasureTextEx(font, lines[i], (float)fontSize, 0.f).x;
-        if (w > maxWidth) maxWidth = w;
+        if (w > maxLineWidth) maxLineWidth = w;
     }
-    float x = anchorX - (gTextAlign == 0 ? 0.f : gTextAlign == 1 ? maxWidth * .5f : maxWidth);
-    x = Clampf(x, 8.f, (float)width - maxWidth - 8.f);
+    gTextFontSize = fontSize;
 
     Image image = GenImageColor(width, height, (Color){0, 0, 0, 0});
     if (!image.data) return false;
-    if (gTextBackground) {
-        Rectangle plate = {x - 36.f, y - 20.f, maxWidth + 72.f, blockHeight + 40.f};
-        if (plate.x < 0.f) plate.x = 0.f;
-        if (plate.y < 0.f) plate.y = 0.f;
-        if (plate.x + plate.width > width) plate.width = width - plate.x;
-        if (plate.y + plate.height > height) plate.height = height - plate.y;
-        ImageDrawRectangleRec(&image, plate, gTextAppearance[3]);
+    Image textLayer = GenImageColor(layerW, layerH, (Color){0, 0, 0, 0});
+    if (!textLayer.data) { UnloadImage(image); return false; }
+
+    float firstY = fmaxf(padY, (boxH - blockHeight) * .5f);
+    if (gTextBackground && gTextContent[0]) {
+        Rectangle plate = {padX * .5f, firstY - padY * .45f,
+                           fmaxf(1.f, fminf(boxW - padX, maxLineWidth + padX)),
+                           fminf(boxH - (firstY - padY * .45f), blockHeight + padY * .9f)};
+        ImageDrawRectangleRec(&textLayer, plate, gTextAppearance[3]);
     }
-    Color ink = gTextAppearance[0];
-    for (int i = 0; i < lineCount; i++) {
+    for (int i = 0; i < lineCount && gTextContent[0]; i++) {
         float textWidth = MeasureTextEx(font, lines[i], (float)fontSize, 0.f).x;
-        float drawX = gTextAlign == 0 ? x : gTextAlign == 1 ? anchorX - textWidth * .5f : anchorX - textWidth;
-        drawX = Clampf(drawX, 8.f, (float)width - textWidth - 8.f);
-        Vector2 position = {drawX, y + (float)i * lineHeight};
+        float drawX = gTextAlign == 0 ? padX :
+                      gTextAlign == 1 ? (boxW - textWidth) * .5f : boxW - padX - textWidth;
+        drawX = Clampf(drawX, 0.f, fmaxf(0.f, boxW - textWidth));
+        Vector2 position = {drawX, firstY + (float)i * lineHeight};
         if (gTextShadow) {
-            Vector2 shadow = {position.x + 5.f, position.y + 7.f};
-            ImageDrawTextEx(&image, font, lines[i], shadow, (float)fontSize, 0.f, gTextAppearance[2]);
+            Vector2 shadow = {position.x + 3.f, position.y + 4.f};
+            ImageDrawTextEx(&textLayer, font, lines[i], shadow, (float)fontSize, 0.f, gTextAppearance[2]);
         }
         if (gTextOutline) {
             static const int offsets[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
             for (int k = 0; k < 8; k++) {
                 Vector2 edge = {position.x + (float)offsets[k][0], position.y + (float)offsets[k][1]};
-                ImageDrawTextEx(&image, font, lines[i], edge, (float)fontSize, 0.f, gTextAppearance[1]);
+                ImageDrawTextEx(&textLayer, font, lines[i], edge, (float)fontSize, 0.f, gTextAppearance[1]);
             }
         }
-        ImageDrawTextEx(&image, font, lines[i], position, (float)fontSize, 0.f, ink);
+        ImageDrawTextEx(&textLayer, font, lines[i], position, (float)fontSize, 0.f, gTextAppearance[0]);
     }
+    ImageDrawImagePro(&image, textLayer,
+                      (Rectangle){0.f, 0.f, (float)layerW, (float)layerH},
+                      (Rectangle){boxX, boxY, boxW, boxH},
+                      (Vector2){0.f, 0.f}, 0.f, WHITE);
+    UnloadImage(textLayer);
     bool okay = ExportImage(image, outPath);
     UnloadImage(image);
     return okay;
@@ -1746,7 +1821,7 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     char escaped[STELLA_TEXT_MAX * 6 + 16];
     PlutoJsonEscape(gTextContent, escaped, sizeof(escaped));
     int n = snprintf(out, capacity,
-        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"color\":%d,\"align\":%d,\"bold\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"x\":%.5f,\"y\":%.5f,"
+        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"color\":%d,\"align\":%d,\"bold\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"autoFit\":%s,\"x\":%.5f,\"y\":%.5f,\"boxW\":%.5f,\"boxH\":%.5f,"
         "\"inkR\":%u,\"inkG\":%u,\"inkB\":%u,\"inkA\":%u,"
         "\"outlineR\":%u,\"outlineG\":%u,\"outlineB\":%u,\"outlineA\":%u,"
         "\"shadowR\":%u,\"shadowG\":%u,\"shadowB\":%u,\"shadowA\":%u,"
@@ -1754,7 +1829,8 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
         escaped, gTextFontSize, gTextColorIndex, gTextAlign,
         gTextBold ? "true" : "false", gTextOutline ? "true" : "false",
         gTextShadow ? "true" : "false", gTextBackground ? "true" : "false",
-        (double)gTextPosX, (double)gTextPosY,
+        gTextAutoFit ? "true" : "false", (double)gTextPosX, (double)gTextPosY,
+        (double)gTextBoxW, (double)gTextBoxH,
         (unsigned)gTextAppearance[0].r, (unsigned)gTextAppearance[0].g,
         (unsigned)gTextAppearance[0].b, (unsigned)gTextAppearance[0].a,
         (unsigned)gTextAppearance[1].r, (unsigned)gTextAppearance[1].g,
@@ -1766,34 +1842,117 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     return n > 0 && (size_t)n < capacity;
 }
 
-static bool PlutoTextApply(bool forceNew) {
-    if (!gTextContent[0]) {
+static bool PlutoTextApply(bool forceNew, bool liveUpdate) {
+    if (forceNew && !gTextContent[0]) {
         strcpy(gBackendMessage, "Enter some text first");
         return false;
     }
     char path[1024], props[4096];
-    if (!PlutoTextBuildPropsJson(props, sizeof(props)) || !PlutoTextWriteImage(path, sizeof(path))) {
+    /* Render first: auto-fit updates gTextFontSize, which must be saved in the
+       clip properties alongside the generated image. */
+    if (!PlutoTextWriteImage(path, sizeof(path)) || !PlutoTextBuildPropsJson(props, sizeof(props))) {
         strcpy(gBackendMessage, "Could not create the title image");
         return false;
     }
-    bool update = !forceNew && gTextTitleSelected && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount;
     bool okay;
-    if (update) okay = PlutoTimelineUpdateTitleClip(gTimelineClips[gTimelineSelected].id, path, props);
-    else okay = PlutoTimelineAddTitleClip(path, props, gPlayhead, gTextDuration);
+    if (forceNew) okay = PlutoTimelineAddTitleClip(path, props, gPlayhead, gTextDuration);
+    else if (gTextTitleSelected && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount)
+        okay = PlutoTimelineUpdateTitleClip(gTimelineClips[gTimelineSelected].id, path, props, liveUpdate);
+    else return false;
     if (okay) {
-        gTextInputFocused = false;
+        if (!liveUpdate) gTextInputFocused = false;
         gRightTab = 3;
-        strcpy(gBackendMessage, update ? "Title updated" : "Title added to the timeline");
+        if (!liveUpdate) strcpy(gBackendMessage, forceNew ? "Text box added to the timeline" : "Title updated");
     }
     return okay;
 }
 
-static void PlutoTextPlaceAt(float xNormalized, float yNormalized) {
-    gTextPosX = Clampf(xNormalized, .03f, .97f);
-    gTextPosY = Clampf(yNormalized, .04f, .96f);
+static void PlutoTextCreateBox(float x, float y, float width, float height) {
+    /* Preserve edits on the previously selected title before changing the box
+       geometry for a newly dragged text frame. */
+    PlutoTextAutoUpdateFlush();
+    PlutoTimelineEndPropertyEdit();
+    width = Clampf(width, .001f, 1.f);
+    height = Clampf(height, .001f, 1.f);
+    gTextBoxW = width;
+    gTextBoxH = height;
+    gTextPosX = Clampf(x, width * .5f, 1.f - width * .5f);
+    gTextPosY = Clampf(y, height * .5f, 1.f - height * .5f);
+    gTextAutoFit = true;
+    gTextFontSize = 180;
     if (!gTextContent[0]) strcpy(gTextContent, "Text");
     gTextInputFocused = false;
-    PlutoTextApply(true);
+    PlutoTextApply(true, false);
+}
+
+static uint64_t PlutoTextStateSignature(void) {
+    uint64_t hash = 1469598103934665603ull;
+#define TEXT_HASH_BYTES(value) do { \
+    const unsigned char *bytes = (const unsigned char *)&(value); \
+    for (size_t byteIndex = 0; byteIndex < sizeof(value); byteIndex++) { hash ^= bytes[byteIndex]; hash *= 1099511628211ull; } \
+} while (0)
+    const unsigned char *textBytes = (const unsigned char *)gTextContent;
+    for (size_t byteIndex = 0; byteIndex <= strlen(gTextContent); byteIndex++) {
+        hash ^= textBytes[byteIndex]; hash *= 1099511628211ull;
+    }
+    TEXT_HASH_BYTES(gTextFontSize);
+    TEXT_HASH_BYTES(gTextColorIndex);
+    TEXT_HASH_BYTES(gTextAppearance);
+    TEXT_HASH_BYTES(gTextAlign);
+    TEXT_HASH_BYTES(gTextBold);
+    TEXT_HASH_BYTES(gTextOutline);
+    TEXT_HASH_BYTES(gTextShadow);
+    TEXT_HASH_BYTES(gTextBackground);
+    TEXT_HASH_BYTES(gTextAutoFit);
+    TEXT_HASH_BYTES(gTextPosX);
+    TEXT_HASH_BYTES(gTextPosY);
+    TEXT_HASH_BYTES(gTextBoxW);
+    TEXT_HASH_BYTES(gTextBoxH);
+#undef TEXT_HASH_BYTES
+    return hash;
+}
+
+static void PlutoTextAutoUpdateObserve(void) {
+    char currentClip[64] = {0};
+    if (gTextTitleSelected && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount)
+        strncpy(currentClip, gTimelineClips[gTimelineSelected].id, sizeof(currentClip) - 1);
+    uint64_t signature = PlutoTextStateSignature();
+    if (!gTextAutoObserverInitialized || strcmp(currentClip, gTextAutoObservedClipId) != 0) {
+        strncpy(gTextAutoObservedClipId, currentClip, sizeof(gTextAutoObservedClipId) - 1);
+        gTextAutoObservedClipId[sizeof(gTextAutoObservedClipId) - 1] = 0;
+        gTextAutoObservedSignature = signature;
+        gTextAutoObserverInitialized = true;
+        return;
+    }
+    if (currentClip[0] && signature != gTextAutoObservedSignature) {
+        gTextAutoObservedSignature = signature;
+        gTextAutoUpdatePending = true;
+        gTextAutoUpdateChangedAt = GetTime();
+        strncpy(gTextAutoUpdateClipId, currentClip, sizeof(gTextAutoUpdateClipId) - 1);
+        gTextAutoUpdateClipId[sizeof(gTextAutoUpdateClipId) - 1] = 0;
+    }
+}
+
+static void PlutoTextAutoUpdateFlush(void) {
+    if (!gTextAutoUpdatePending) return;
+    bool sameClip = gTextTitleSelected && gTimelineSelected >= 0 &&
+        gTimelineSelected < gTimelineClipCount &&
+        strcmp(gTimelineClips[gTimelineSelected].id, gTextAutoUpdateClipId) == 0;
+    gTextAutoUpdatePending = false;
+    if (sameClip && PlutoTextApply(false, true)) {
+        gTextAutoObservedSignature = PlutoTextStateSignature();
+        gTextAutoUpdateChangedAt = GetTime();
+        gTextAutoUpdateCommitAt = GetTime() + .65;
+    }
+}
+
+static void PlutoTextAutoUpdateTick(void) {
+    if (gTextAutoUpdatePending && GetTime() - gTextAutoUpdateChangedAt >= .28)
+        PlutoTextAutoUpdateFlush();
+    if (gTimelinePropertyEditOpen && gTextAutoUpdateCommitAt > 0.0 && GetTime() >= gTextAutoUpdateCommitAt) {
+        PlutoTimelineEndPropertyEdit();
+        gTextAutoUpdateCommitAt = 0.0;
+    }
 }
 
 static void TextWheelLogic(int index, Clay_ElementId id) {
@@ -1860,20 +2019,6 @@ static void TextWheelItem(int index, const char *label) {
     }
 }
 
-/* Light primary button, same family as the Import button / selected pills. */
-static bool TextActionButton(const char *idName, const char *label, bool primary) {
-    Clay_ElementId id = TextDynamicElementId(idName);
-    Bs b = Interact(id);
-    Clay_Color fill = primary ? Mix(RGB(226, 228, 234), RGB(246, 247, 250), b.hover) : BtnBg(C_RFIELD, RGB(46, 47, 54), b);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(44)}, .padding = {14, 14, 0, 0}, .childAlignment = AL_C},
-              .backgroundColor = fill, .cornerRadius = CLAY_CORNER_RADIUS(14),
-              .border = {.color = primary ? RGBA(0, 0, 0, 0) : Mix(C_RCARDB, RGB(80, 83, 92), b.hover * .7f),
-                         .width = CLAY_BORDER_OUTSIDE(primary ? 0 : 1)}}) {
-        Tx(label, 16, primary ? RGB(22, 23, 26) : C_TEXT, 1);
-    }
-    return b.clicked;
-}
-
 /* Toggle / segmented button: same field surface as the number fields. */
 static bool TextChoiceButton(Clay_ElementId id, const char *label, bool on, bool dot) {
     Bs b = Interact(id);
@@ -1890,7 +2035,16 @@ static bool TextChoiceButton(Clay_ElementId id, const char *label, bool on, bool
 }
 
 static void TextStyleToggle(const char *idName, const char *label, bool *value) {
-    if (TextChoiceButton(TextDynamicElementId(idName), label, *value, true)) *value = !*value;
+    Clay_ElementId id = TextDynamicElementId(idName);
+    Bs b = Interact(id);
+    if (b.clicked) *value = !*value;
+    float on = Anim(id.id + 0x5a31u, *value ? 1.f : 0.f, 22.f);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {5, 7, 0, 0}, .childGap = 9, .childAlignment = AL_Y}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {FIX(42), FIX(24)}},
+                      .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on,
+                                                  b.hover * .8f - b.press * 1.2f, 0)}}) {}
+        Tx(label, 14.5f, *value ? C_TEXT : C_DIM, 0);
+    }
 }
 
 /* X / Y field for the text position. Stored 0..1 across the frame, shown as 0..100 %.
@@ -1980,8 +2134,8 @@ static void TextView(void) {
                                     .width = CLAY_BORDER_OUTSIDE(1)}}) {
                 TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 16, gTextContent[0] ? C_TEXT : C_MUTED, 0);
             }
-            if (TextActionButton("TextApply", gTextTitleSelected ? "Update selected title" : "Add title to timeline", true))
-                PlutoTextApply(false);
+            if (!gTextTitleSelected)
+                TxWrap("Choose the Text tool, then drag on the preview to create a text box.", 13, C_MUTED, 0);
         }
 
         /* ---- Position (where the title sits in the frame) ---- */
@@ -2009,20 +2163,25 @@ static void TextView(void) {
                 Tx("Font size", 18, C_TEXT, 0);
                 HSPACE
                 float sizeValue = (float)gTextFontSize;
-                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 27, 16, 13, 8, 24.f, 180.f, 0))
+                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 27, 16, 13, 8, 8.f, 180.f, 0)) {
                     gTextFontSize = (int)roundf(sizeValue);
+                    gTextAutoFit = false;
+                }
             }
             {
                 static bool sizeDrag;
                 Clay_ElementId sid = CLAY_ID("TextSizeSlider");
                 Bs sb = Interact(sid);
-                float t = ((float)gTextFontSize - 24.f) / 156.f;
+                float t = ((float)gTextFontSize - 8.f) / 172.f;
                 float before = t;
                 FxSliderLogic(sid, &t, &sizeDrag, 7.f);
-                if (fabsf(t - before) > .0001f) gTextFontSize = (int)roundf(24.f + t * 156.f);
+                if (fabsf(t - before) > .0001f) {
+                    gTextFontSize = (int)roundf(8.f + t * 172.f);
+                    gTextAutoFit = false;
+                }
                 CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
                            .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD,
-                                                       ((float)gTextFontSize - 24.f) / 156.f,
+                                                       ((float)gTextFontSize - 8.f) / 172.f,
                                                        (sb.hover + (sizeDrag ? 1.f : 0.f)) * 1.5f, 0)}}) {}
             }
             Tx("Alignment", 16, C_DIM, 0);
@@ -2054,6 +2213,7 @@ static void TextView(void) {
                 TextStyleToggle("TextBackground", "Background", &gTextBackground);
             }
         }
+        PlutoTextAutoUpdateObserve();
     }
 }
 
@@ -2128,7 +2288,14 @@ static void RightPanel(void) {
                                       .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 0)}}) {
                 for (int i = 0; i < 4; i++)
                     if (TabBtn(CLAY_IDI("InspTab", i), tabs[i], gRightTab == i, 15.f, 11, true)) {
-                        if (gRightTab != i) { gTextInputFocused = false; gTabDir = (i > gRightTab) ? 1 : -1; gRightTab = i; gScroll = gScrollT = 0.f; gFollow = false; gTabT = 0.f; gTabE = 0.f; }
+                        if (gRightTab != i) {
+                            PlutoTextAutoUpdateFlush();
+                            PlutoTimelineEndPropertyEdit();
+                            gTextInputFocused = false;
+                            gTabDir = (i > gRightTab) ? 1 : -1;
+                            gRightTab = i; gScroll = gScrollT = 0.f;
+                            gFollow = false; gTabT = 0.f; gTabE = 0.f;
+                        }
                     }
             }
         }
