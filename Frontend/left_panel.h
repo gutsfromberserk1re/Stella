@@ -34,7 +34,7 @@ static void MediaView(void) {
         (mediaBox.width - 18.f - 9.f * (columns - 1)) / columns));
     int mediaCount = gImportedCount;
     int rows = (mediaCount + columns - 1) / columns;
-    CLAY(CLAY_ID("MediaCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9}}) {
+    CLAY(CLAY_ID("LibContent"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9, .padding = {0, 0, 0, 12}}}) {
         Clay_ElementId sid = CLAY_ID("Search");
         Bs sb = Interact(sid);
         CLAY(sid, {.layout = {.sizing = {GROW, FIX(40)}, .padding = {14, 12, 0, 0}, .childGap = 10, .childAlignment = AL_Y},
@@ -186,51 +186,77 @@ static void DurRow(int gi, const char *label) {
     }
 }
 
-/* The whole Audio page (title included) scrolls, like the reference. */
+/* Audio page content (scrolling is handled by the shared left-panel scroller). */
 static void AudioView(void) {
-    /* scrolling (uses last frame's measured sizes) */
-    Clay_BoundingBox vb = Clay_GetElementData(CLAY_ID("AudioScroll")).boundingBox;
-    Clay_BoundingBox cb = Clay_GetElementData(CLAY_ID("AudioContent")).boundingBox;
+    CLAY(CLAY_ID("LibContent"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .padding = {0, 0, 0, 12}}}) {
+        CLAY(CLAY_ID("AudioHead"), {.layout = {.sizing = {GROW, FIT}, .padding = {4, 0, 0, 6}, .childGap = 10, .childAlignment = AL_Y}}) {
+            Icon(I_NOTE, 22, C_DIM);
+            Tx("Audio", 21.f, C_TEXT, 1);
+        }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(0, "Volume"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {22, 22, 0, 0}}}) { KnobGroup(1, "Pan"); HSPACE KnobGroup(2, "Bass"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(3, "Treble"); }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {0, 0, 14, 4}, .childGap = 40, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
+            SwitchItem(0, "Fade In"); SwitchItem(1, "Fade Out");
+        }
+        DurRow(40, "Fade In Duration");
+        DurRow(41, "Fade Out Duration");
+    }
+}
+
+#define LTAB_SLIDE_SECS 0.20f
+#define LTAB_SLIDE_PX   36.f
+static int gLTabDir = 1;
+static float gLSbV = 0.f, gLSbF = 1.f;   /* scrollbar position / visible fraction for this frame */
+
+/* Shared scroller for both left tabs: wheel + smooth follow + draggable scrollbar. Uses last frame's sizes. */
+static void LeftScrollUpdate(void) {
+    Clay_BoundingBox vb = Clay_GetElementData(CLAY_ID("LibScroll")).boundingBox;
+    Clay_BoundingBox cb = Clay_GetElementData(CLAY_ID("LibContent")).boundingBox;
+    Clay_BoundingBox bar = Clay_GetElementData(CLAY_ID("LibBar")).boundingBox;
+    Clay_BoundingBox body = Clay_GetElementData(CLAY_ID("LibBody")).boundingBox;
+    Vector2 m = GetMousePosition();
+    gLTabT = fminf(1.f, gLTabT + fminf(gDt, 1.f / 30.f) / LTAB_SLIDE_SECS);
+    { float u = 1.f - gLTabT; gLTabE = 1.f - u * u * u * u; }
     float maxS = fmaxf(0.f, cb.height - vb.height);
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     float wh = gWheelDelta;
-    Vector2 mp = GetMousePosition();
-    if (wh != 0.f && vb.width > 0.f && mp.x >= vb.x && mp.x <= vb.x + vb.width + 12 && mp.y >= vb.y && mp.y <= vb.y + vb.height)
-        gAudT -= wh * 50.f;
+    if (wh != 0.f && !(ctrl && gLeftTab == 0) && body.width > 0.f &&
+        m.x >= body.x && m.x <= body.x + body.width && m.y >= body.y && m.y <= body.y + body.height)
+        gAudT -= wh * 60.f;
+
+    static bool drag = false; static float grab = 0.f;
+    float track = bar.height;
+    float thumb = (maxS > 1.f && cb.height > 1.f) ? fmaxf(30.f, track * vb.height / cb.height) : track;
+    if (maxS > 1.f && bar.height > 0.f) {
+        Rectangle hit = {bar.x - 14.f, bar.y, bar.width + 20.f, bar.height};
+        float thumbY = bar.y + (track - thumb) * (gAudS / maxS);
+        if (CheckCollisionPointRec(m, hit)) gHand = true;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(m, hit)) {
+            drag = true;
+            grab = (m.y >= thumbY && m.y <= thumbY + thumb) ? m.y - thumbY : thumb * .5f;
+        }
+        if (drag) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                float f = (m.y - grab - bar.y) / fmaxf(1.f, track - thumb);
+                f = f < 0.f ? 0.f : f > 1.f ? 1.f : f;
+                gAudT = gAudS = f * maxS;
+            } else drag = false;
+        }
+    } else drag = false;
     if (gAudT > maxS) gAudT = maxS;
     if (gAudT < 0.f) gAudT = 0.f;
-    gAudS += (gAudT - gAudS) * (1.f - expf(-20.f * gDt));
+    if (!drag) gAudS += (gAudT - gAudS) * (1.f - expf(-20.f * gDt));
     if (fabsf(gAudT - gAudS) < 0.3f) gAudS = gAudT;
     if (gAudS > maxS) gAudS = maxS;
-    float sv = maxS > 1.f ? gAudS / maxS : 0.f;
-    float sf = maxS > 1.f && cb.height > 1.f ? vb.height / cb.height : 1.f;
-
-    CLAY(CLAY_ID("AudioBody"), {.layout = {.sizing = {GROW, GROW}, .childGap = 6}}) {
-        CLAY(CLAY_ID("AudioScroll"), {.layout = {.sizing = {GROW, GROW}},
-                                      .clip = {.vertical = true, .childOffset = {0, -gAudS}}}) {
-            CLAY(CLAY_ID("AudioContent"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .padding = {0, 0, 0, 12}}}) {
-                CLAY(CLAY_ID("AudioHead"), {.layout = {.sizing = {GROW, FIT}, .padding = {4, 0, 0, 6}, .childGap = 10, .childAlignment = AL_Y}}) {
-                    Icon(I_NOTE, 22, C_DIM);
-                    Tx("Audio", 21.f, C_TEXT, 1);
-                }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(0, "Volume"); }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {22, 22, 0, 0}}}) { KnobGroup(1, "Pan"); HSPACE KnobGroup(2, "Bass"); }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) { KnobGroup(3, "Treble"); }
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {0, 0, 14, 4}, .childGap = 40, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-                    SwitchItem(0, "Fade In"); SwitchItem(1, "Fade Out");
-                }
-                DurRow(40, "Fade In Duration");
-                DurRow(41, "Fade Out Duration");
-            }
-        }
-        CLAY(CLAY_ID("AudioBar"), {.layout = {.sizing = {CLAY_SIZING_FIXED(3), GROW}},
-                                   .custom = {.customData = NC(K_SCROLLBAR, C_CARD, C_CARD, C_CARD, sv, sf, 0)}}) {}
-    }
+    gLSbV = maxS > 1.f ? gAudS / maxS : 0.f;
+    gLSbF = maxS > 1.f && cb.height > 1.f ? vb.height / cb.height : 1.f;
 }
 
 static void LeftPanel(void) {
     /* Keep the panel geometry fixed while switching media/audio content. */
-    gLTabT = gLTabE = 1.f;
     gLFadeA = 0.f;
+    LeftScrollUpdate();
     float pill = Anim(CLAY_ID("LibPillAnim").id, (float)gLeftTab, 20.f);
 
     CLAY(CLAY_ID("Library"), {.layout = {COLM, .sizing = {CLAY_SIZING_FIXED(gLeftW), GROW}, .padding = {13, 13, 12, 12}, .childGap = 12}, PANEL}) {
@@ -254,14 +280,18 @@ static void LeftPanel(void) {
                                   .custom = {.customData = NC(K_PILL, C_CARD, C_CARD, C_CARD, pill, 0, 2)}}) {
             for (int i = 0; i < 2; i++) {
                 if (TabBtn(CLAY_IDI("LibTab", i), i == 0 ? "Media" : "Audio", gLeftTab == i, 16.5f, 10, true) && gLeftTab != i) {
-                    gLeftTab = i;
+                    gLTabDir = i > gLeftTab ? 1 : -1; gLeftTab = i; gLTabT = gLTabE = 0.f; gAudT = gAudS = 0.f;
                 }
             }
         }
-        /* Keep this slot fixed-size so Audio's taller scroll content cannot resize the preview. */
-        CLAY(CLAY_ID("LibBody"), {.layout = {COLM, .sizing = {GROW, GROW},
-                                             .padding = {0, 0, 0, 0}}}) {
-            if (gLeftTab == 0) MediaView(); else AudioView();
+        CLAY(CLAY_ID("LibBody"), {.layout = {.sizing = {GROW, GROW}, .childGap = 6}}) {
+            CLAY(CLAY_ID("LibScroll"), {.layout = {COLM, .sizing = {GROW, GROW}},
+                                        .clip = {.horizontal = true, .vertical = true,
+                                                 .childOffset = {gLTabDir * (1.f - gLTabE) * LTAB_SLIDE_PX, -gAudS}}}) {
+                if (gLeftTab == 0) MediaView(); else AudioView();
+            }
+            CLAY(CLAY_ID("LibBar"), {.layout = {.sizing = {CLAY_SIZING_FIXED(3), GROW}},
+                                     .custom = {.customData = NC(K_SCROLLBAR, C_CARD, C_CARD, C_CARD, gLSbV, gLSbF, 0)}}) {}
         }
     }
 }

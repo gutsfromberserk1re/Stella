@@ -2063,17 +2063,35 @@ static void UpdateInspScroll(void) {
         gFollow = false;
     }
     if (gFollow) gScrollT = maxS;
+    /* draggable scrollbar: wide invisible hit area around the thin thumb; click the track to jump */
+    static bool sbDrag = false; static float sbGrab = 0.f;
+    float sbTop = bb.y + 10.f, sbTrack = bb.height - 20.f;
+    float sbThumb = (maxS > 1.f && cb.height > 1.f) ? fmaxf(36.f, sbTrack * bb.height / cb.height) : sbTrack;
+    if (maxS > 1.f && bb.width > 0.f) {
+        Rectangle hit = {bb.x + bb.width - 20.f, bb.y, 20.f, bb.height};
+        float thumbY = sbTop + (sbTrack - sbThumb) * (gScroll / maxS);
+        if (CheckCollisionPointRec(m, hit)) gHand = true;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(m, hit)) {
+            sbDrag = true;
+            sbGrab = (m.y >= thumbY && m.y <= thumbY + sbThumb) ? m.y - thumbY : sbThumb * .5f;
+        }
+        if (sbDrag) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                float f = (m.y - sbGrab - sbTop) / fmaxf(1.f, sbTrack - sbThumb);
+                f = f < 0.f ? 0.f : f > 1.f ? 1.f : f;
+                gScrollT = gScroll = f * maxS; gFollow = false;
+            } else sbDrag = false;
+        }
+    } else sbDrag = false;
     if (gScrollT > maxS) gScrollT = maxS;
     if (gScrollT < 0.f) gScrollT = 0.f;
-    gScroll += (gScrollT - gScroll) * (1.f - expf(-20.f * gDt));
+    if (!sbDrag) gScroll += (gScrollT - gScroll) * (1.f - expf(-20.f * gDt));
     if (fabsf(gScrollT - gScroll) < 0.3f) gScroll = gScrollT;
     if (gScroll > maxS) gScroll = maxS;
     gSB = (maxS > 1.f && bb.width > 0.f);
     if (gSB) {
-        float top = bb.y + 10.f, track = bb.height - 20.f;
-        float thumb = fmaxf(36.f, track * bb.height / cb.height);
         float frac = gScroll / maxS;
-        gSBR = (Rectangle){bb.x + bb.width - 9.f, top + (track - thumb) * frac, 4.f, thumb};
+        gSBR = (Rectangle){bb.x + bb.width - 9.f, sbTop + (sbTrack - sbThumb) * frac, sbDrag ? 5.f : 4.f, sbThumb};
     }
 }
 

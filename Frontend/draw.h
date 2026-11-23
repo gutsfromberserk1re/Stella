@@ -28,7 +28,21 @@ static void FillRR(Rectangle r, float rad, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
     float m = fminf(r.width, r.height);
     if (rad <= 0.5f) { DrawRectangleRec(r, c); return; }
-    DrawRectangleRounded(r, fminf(1.f, rad * 2.f / m), 48, c);
+    rad = fminf(rad, m * .5f);
+    /* DrawRectangleRounded fans overlapping/degenerate triangles on tiny, fully-round shapes (dots, pills),
+       which backface-cull into dark specks. Build the shape from non-overlapping pieces instead. */
+    if (r.width - 2.f * rad < .5f && r.height - 2.f * rad < .5f) {      /* a perfect circle */
+        DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, rad, c);
+        return;
+    }
+    int seg = rad < 6.f ? 24 : 48;
+    DrawRectangleRec((Rectangle){r.x + rad, r.y, r.width - 2.f * rad, r.height}, c);
+    DrawRectangleRec((Rectangle){r.x, r.y + rad, rad, r.height - 2.f * rad}, c);
+    DrawRectangleRec((Rectangle){r.x + r.width - rad, r.y + rad, rad, r.height - 2.f * rad}, c);
+    DrawCircleSector((Vector2){r.x + rad, r.y + rad},                      rad, 180, 270, seg / 4, c);
+    DrawCircleSector((Vector2){r.x + r.width - rad, r.y + rad},            rad, 270, 360, seg / 4, c);
+    DrawCircleSector((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad, 0, 90, seg / 4, c);
+    DrawCircleSector((Vector2){r.x + rad, r.y + r.height - rad},           rad, 90, 180, seg / 4, c);
 }
 static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
