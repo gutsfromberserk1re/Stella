@@ -238,7 +238,7 @@ static float gRot, gRotT; static bool gRotDrag;       /* degrees -180..180 */
 static float gSl[NSL], gSlT[NSL]; static bool gSlDrag[NSL]; /* slider 0..1 (0 = opacity, 40/41 = fades) */
 static Vector2 gWh[3], gWhT[3]; static bool gWhDrag[3], gWhResetPending[3]; /* wheel puck, unit disk */
 static int   gHsl = 0;                                /* selected HSL chip */
-static bool  gTransOpen = true;                       /* effects: transitions card */
+static bool  gTransOpen = false;                      /* effects: transitions card (collapsed on launch) */
 static int   gFilter = 0;                             /* effects: selected preset */
 static int   gFilterCategory = 0;
 static float gFilterIntensity = 1.f, gFilterIntensitySent = 1.f;

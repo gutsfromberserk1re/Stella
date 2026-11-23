@@ -1089,8 +1089,8 @@ static const char *gFxProp[4][2] = {
 static const char *gFxToggle[4] = {"props.effects.chromatic.enabled", "props.effects.glow.enabled", "props.effects.glitch.enabled", "props.effects.pixelate.enabled"};
 static bool  gFxOn[4];
 static bool  gFxSlDrag[4][2];
-static int   gFxOpen = 0;
-static bool  gVfxOpen = true, gFiltOpen = false;
+static int   gFxOpen = -1;
+static bool  gVfxOpen = false, gFiltOpen = false;
 
 static void FxSliderLogic(Clay_ElementId id, float *v, bool *drag, float kr) {
     if (Clay_PointerOver(id) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gDragId = id.id;
@@ -1187,7 +1187,7 @@ static void FxBody(int i) {
     }
 }
 
-static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified);
+static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool prominent, bool connected);
 
 static void ExtraFxRow(int i) {
     Clay_ElementId id = CLAY_IDI("FxExtra", i);
@@ -1235,24 +1235,33 @@ static void ExtraFxRow(int i) {
 /* Effect rows use the same 48px accordion card as the Colors panel. */
 static bool FxHeader(int i, float open) {
     Clay_ElementId id = CLAY_IDI("FxHdr", i);
-    return EffectsSectionHeader(id, kFx[i].name, I_SPARKLE, open > 0.5f, gFxOn[i]);
+    return EffectsSectionHeader(id, kFx[i].name, I_SPARKLE, open > 0.5f, gFxOn[i], false, false);
 }
 
 #define TRANS_DESC_H 252.f
 #define TRANS_EMPTY_H 46.f
-static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified) {
+static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool prominent, bool connected) {
     Bs b = Interact(id);
     float openAnim = EaseIO(AnimLin(id.id, open ? 1.f : 0.f, 0.2f));
     bool down = Clay_PointerOver(id) && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     float squash = Clampf(Spring(id.id + 7u, down ? 1.f : 0.f, 700.f, 26.f), 0.f, 1.2f);
     int inset = (int)roundf(squash * 4.f);
     int verticalInset = (int)roundf(squash * 1.5f);
-    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}}) {
+    /* Top-level Effects groups need a clearer surface than the nested effect
+       rows. A connected header delegates its outline to the enclosing card,
+       so the Transitions header and its controls read as one accordion. */
+    Clay_Color base = prominent ? RGB(30, 31, 35) : C_RCARD;
+    Clay_Color hoverBase = prominent ? RGB(42, 44, 50) : RGB(40, 41, 47);
+    Clay_Color borderBase = prominent ? RGB(58, 61, 69) : C_RCARDB;
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {connected ? 0 : inset, connected ? 0 : inset,
+                                                                       connected ? 0 : verticalInset, connected ? 0 : verticalInset}}}) {
         CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
-                  .backgroundColor = Mix(Mix(C_RCARD, RGB(33, 34, 38), openAnim), Mix(RGB(36, 37, 43), RGB(40, 41, 47), openAnim), b.hover),
-                  .cornerRadius = CLAY_CORNER_RADIUS(18),
-                  .border = {.color = Mix(Mix(C_RCARDB, RGB(62, 64, 72), openAnim), RGB(84, 87, 96), b.hover * 0.7f),
-                             .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                  .backgroundColor = Mix(Mix(base, prominent ? RGB(36, 38, 43) : RGB(33, 34, 38), openAnim), hoverBase, b.hover),
+                  .cornerRadius = connected ? CLAY_CORNER_RADIUS(0) : CLAY_CORNER_RADIUS(18),
+                  .border = {.color = connected ? RGBA(0, 0, 0, 0) :
+                                  Mix(Mix(borderBase, prominent ? RGB(78, 82, 92) : RGB(62, 64, 72), openAnim),
+                                      prominent ? RGB(104, 109, 120) : RGB(84, 87, 96), b.hover * 0.7f),
+                             .width = CLAY_BORDER_OUTSIDE(connected ? 0 : prominent ? 2 : 1)}}) {
             Icon(icon, 22, C_ICON);
             Tx(title, 18, C_TEXT, 0);
             HSPACE
@@ -1260,9 +1269,11 @@ static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon,
                 CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = C_TEXT, .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
                 GAPX(2)
             }
-            CLAY_AUTO_ID({.layout = {.sizing = {FIX(16), FIX(16)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(9),
-                          .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
+            CLAY_AUTO_ID({.layout = {.sizing = {FIX(20), FIX(20)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(10),
+                          .backgroundColor = prominent ? RGB(38, 40, 46) : RGBA(0, 0, 0, 0),
+                          .border = {.color = Mix(RGB(82, 85, 94), RGB(145, 150, 160), b.hover),
+                                     .width = CLAY_BORDER_OUTSIDE(prominent ? 1.25f : 1)}}) {
+                IconV(I_PLUS, 11, C_DIM, 1.f - openAnim);
             }
         }
     }
@@ -1331,15 +1342,19 @@ static void EffectsView(void) {
 
     /* One width-constrained column keeps expanded sections within the
        inspector viewport and prevents horizontal spill into the right edge. */
-    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}, .clip = {.horizontal = true}}) {
-    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-        bool transitionModified = strcmp(gTransitionType, "none") != 0;
-        if (EffectsSectionHeader(CLAY_ID("TransHdr"), "Transitions", I_BOWTIE, gTransOpen, transitionModified)) gTransOpen = !gTransOpen;
+    /* Leave a small gutter on the scrollbar side: the inspector scrollbar is
+       overlaid inside the viewport, so full-width cards otherwise sit under it. */
+    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {0, 12, 0, 0}, .childGap = 10}, .clip = {.horizontal = true}}) {
+    bool transitionModified = strcmp(gTransitionType, "none") != 0;
+    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 0},
+                                  .backgroundColor = RGB(27, 28, 32), .cornerRadius = CLAY_CORNER_RADIUS(18),
+                                  .border = {.color = RGB(65, 68, 77), .width = CLAY_BORDER_OUTSIDE(2)},
+                                  .clip = {.horizontal = true}}) {
+        if (EffectsSectionHeader(CLAY_ID("TransHdr"), "Transitions", I_BOWTIE, gTransOpen, transitionModified, true, true)) gTransOpen = !gTransOpen;
         if (gTransOpen) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {12, 12, 10, 10}, .childGap = 8},
-                                         .backgroundColor = C_RCARD, .cornerRadius = CLAY_CORNER_RADIUS(18),
-                                         .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)},
-                                         .clip = {.horizontal = true}}) {
+            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 0, 12}, .childGap = 8},
+                                         .backgroundColor = RGB(27, 28, 32), .clip = {.horizontal = true}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = RGB(56, 59, 67)}) {}
                 if (next < 0) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
                         TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
@@ -1391,7 +1406,7 @@ static void EffectsView(void) {
     }
 
     CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-        if (EffectsSectionHeader(CLAY_ID("FiltersHdr"), "Filters", I_SPARKLE, gFiltOpen, gFilter != 0)) gFiltOpen = !gFiltOpen;
+        if (EffectsSectionHeader(CLAY_ID("FiltersHdr"), "Filters", I_SPARKLE, gFiltOpen, gFilter != 0, true, false)) gFiltOpen = !gFiltOpen;
         if (gFiltOpen) {
             CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {12, 12, 10, 10}, .childGap = 10},
                                         .backgroundColor = C_RCARD, .cornerRadius = CLAY_CORNER_RADIUS(18),
@@ -1438,7 +1453,7 @@ static void EffectsView(void) {
         bool anyVideoEffect = false;
         for (int i = 0; i < 4; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
         for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
-        if (EffectsSectionHeader(CLAY_ID("VfxHdr"), "Video Effects", I_FILM, gVfxOpen, anyVideoEffect)) gVfxOpen = !gVfxOpen;
+        if (EffectsSectionHeader(CLAY_ID("VfxHdr"), "Video Effects", I_FILM, gVfxOpen, anyVideoEffect, true, false)) gVfxOpen = !gVfxOpen;
         if (gVfxOpen) {
             CLAY(CLAY_ID("VfxList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
                 for (int i = 0; i < 4; i++) {
