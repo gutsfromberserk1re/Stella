@@ -153,7 +153,8 @@ impl Timeline {
         if clip.track.is_video() && self.snapping {
             let previous_start = clip.start;
             clip.start = self.snap_start(&clip.id, clip.start.max(0.0), clip.duration, 0.0, 0.25, None);
-            shift_clip_keyframes(&mut clip, clip.start - previous_start);
+            let start_delta = clip.start - previous_start;
+            shift_clip_keyframes(&mut clip, start_delta);
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
@@ -247,7 +248,8 @@ impl Timeline {
                     if let Some(mut linked) = self.clips.iter().find(|clip| clip.id == linked_id).cloned() {
                         let old_linked_start = linked.start;
                         linked.start = (linked.start + delta).max(0.0);
-                        shift_clip_keyframes(&mut linked, linked.start - old_linked_start);
+                        let linked_delta = linked.start - old_linked_start;
+                        shift_clip_keyframes(&mut linked, linked_delta);
                         self.replace(linked);
                     }
                 }
@@ -305,7 +307,8 @@ impl Timeline {
         }
         let previous_start = clip.start;
         clip.start = next_start;
-        shift_clip_keyframes(&mut clip, clip.start - previous_start);
+        let start_delta = clip.start - previous_start;
+        shift_clip_keyframes(&mut clip, start_delta);
         clip.duration = next_end - next_start;
         clip.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
         self.replace(clip.clone());
@@ -313,7 +316,8 @@ impl Timeline {
             if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
                 let previous_linked_start = linked.start;
                 linked.start = next_start;
-                shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
+                let linked_delta = linked.start - previous_linked_start;
+                shift_clip_keyframes(&mut linked, linked_delta);
                 linked.duration = next_end - next_start;
                 linked.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
                 if let Some(duration) = source_duration { linked.extra.insert("sourceDuration".into(), serde_json::json!(duration)); }
@@ -483,7 +487,8 @@ impl Timeline {
                     if let Some(mut linked) = self.clips.iter().find(|item| item.id == linked_id).cloned() {
                         let previous_linked_start = linked.start;
                         linked.start = (linked.start + delta).max(0.0);
-                        shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
+                        let linked_delta = linked.start - previous_linked_start;
+                        shift_clip_keyframes(&mut linked, linked_delta);
                         self.replace(linked);
                     }
                 }
@@ -521,7 +526,8 @@ impl Timeline {
                     if let Some(mut linked) = self.clips.iter().find(|item| item.id == linked_id).cloned() {
                         let previous_linked_start = linked.start;
                         linked.start = (linked.start + delta).max(0.0);
-                        shift_clip_keyframes(&mut linked, linked.start - previous_linked_start);
+                        let linked_delta = linked.start - previous_linked_start;
+                        shift_clip_keyframes(&mut linked, linked_delta);
                         self.replace(linked);
                     }
                 }

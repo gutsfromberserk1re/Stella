@@ -80,17 +80,32 @@ static void MediaView(void) {
 /* draggable knob: drag up/down to change, snaps to the centre detent */
 static void KnobGroup(int idx, const char *label) {
     static float sent[4] = {.5f, .5f, .5f, .5f};
+    static double lastClickTime[4];
+    static bool clickMoved[4];
     static const char *paths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
     CLAY(CLAY_IDI("KG", idx), {.layout = {COLM, .sizing = {FIT, FIT}, .childGap = 5, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
         Clay_ElementId kid = CLAY_IDI("Knob", idx);
         Bs b = Interact(kid);
         if (Clay_PointerOver(kid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            gDragId = kid.id; gKnobStartV = gKnob[idx]; gKnobStartY = GetMousePosition().y;
+            double now = GetTime();
+            if (lastClickTime[idx] > 0.0 && now - lastClickTime[idx] < 0.38 && !clickMoved[idx]) {
+                gKnob[idx] = .5f;
+                gDragId = 0;
+                lastClickTime[idx] = 0.0;
+            } else {
+                gDragId = kid.id;
+                gKnobStartV = gKnob[idx];
+                gKnobStartY = GetMousePosition().y;
+                clickMoved[idx] = false;
+                lastClickTime[idx] = now;
+            }
         }
         bool drag = false;
         if (gDragId == kid.id) {
             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                float v = gKnobStartV + (gKnobStartY - GetMousePosition().y) / 160.f;
+                float mouseY = GetMousePosition().y;
+                if (fabsf(mouseY - gKnobStartY) > 2.5f) clickMoved[idx] = true;
+                float v = gKnobStartV + (gKnobStartY - mouseY) / 160.f;
                 v = v < 0.f ? 0.f : v > 1.f ? 1.f : v;
                 if (fabsf(v - .5f) < .015f) v = .5f;
                 gKnob[idx] = v; drag = true;

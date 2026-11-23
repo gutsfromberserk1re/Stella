@@ -28,7 +28,7 @@ static void FillRR(Rectangle r, float rad, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
     float m = fminf(r.width, r.height);
     if (rad <= 0.5f) { DrawRectangleRec(r, c); return; }
-    DrawRectangleRounded(r, fminf(1.f, rad * 2.f / m), 20, c);
+    DrawRectangleRounded(r, fminf(1.f, rad * 2.f / m), 48, c);
 }
 static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     if (c.a == 0 || r.width <= 0 || r.height <= 0) return;
@@ -44,10 +44,10 @@ static void StrokeRR(Rectangle r, float rad, float t, Color c) {
     DrawRectangleRec((Rectangle){r.x + rad, r.y + r.height - t, r.width - 2 * rad, t}, c);
     DrawRectangleRec((Rectangle){r.x, r.y + rad, t, r.height - 2 * rad}, c);
     DrawRectangleRec((Rectangle){r.x + r.width - t, r.y + rad, t, r.height - 2 * rad}, c);
-    DrawRing((Vector2){r.x + rad, r.y + rad},                     rad - t, rad, 180, 270, 16, c);
-    DrawRing((Vector2){r.x + r.width - rad, r.y + rad},           rad - t, rad, 270, 360, 16, c);
-    DrawRing((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad - t, rad, 0, 90, 16, c);
-    DrawRing((Vector2){r.x + rad, r.y + r.height - rad},          rad - t, rad, 90, 180, 16, c);
+    DrawRing((Vector2){r.x + rad, r.y + rad},                     rad - t, rad, 180, 270, 48, c);
+    DrawRing((Vector2){r.x + r.width - rad, r.y + rad},           rad - t, rad, 270, 360, 48, c);
+    DrawRing((Vector2){r.x + r.width - rad, r.y + r.height - rad}, rad - t, rad, 0, 90, 48, c);
+    DrawRing((Vector2){r.x + rad, r.y + r.height - rad},          rad - t, rad, 90, 180, 48, c);
 }
 static void DottedLine(Vector2 a, Vector2 b, float dash, float gap, float thickness, Color color) {
     Vector2 d = {b.x - a.x, b.y - a.y};
@@ -83,8 +83,8 @@ static void FilledCapsule(Vector2 a, Vector2 b, float w, Color col) {
     DrawCircleV(a, w * .5f, col);
     DrawCircleV(b, w * .5f, col);
 }
-static void Ring(Vector2 c, float r, float t, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, 0, 360, 40, col); }
-static void Arc(Vector2 c, float r, float t, float a0, float a1, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, a0, a1, 32, col); }
+static void Ring(Vector2 c, float r, float t, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, 0, 360, 96, col); }
+static void Arc(Vector2 c, float r, float t, float a0, float a1, Color col) { DrawRing(c, fmaxf(0, r - t * .5f), r + t * .5f, a0, a1, 72, col); }
 static void Capsule(Vector2 c, float angDeg, float len, float rad, float t, Color col) {
     float a = angDeg * DEG2RAD;
     Vector2 d = {cosf(a), sinf(a)}, n = {-d.y, d.x};
@@ -138,13 +138,15 @@ static const char *gToolIconFiles[6] = {"color-palette.ico", "link.ico", "palm.i
 static Texture2D gKnobTexture, gAppLogo;
 
 static void LoadKnobTexture(void) {
-    const int size = 128;
+    /* Oversample the 72pt control for cleaner edges on high-DPI displays. */
+    const int size = 512;
     Image image = GenImageColor(size, size, (Color){0, 0, 0, 0});
     if (!image.data) return;
     Color *pixels = (Color *)image.data;
     const float center = (size - 1) * .5f;
+    const float unit = center / 1.08f;
     for (int y = 0; y < size; y++) for (int x = 0; x < size; x++) {
-        float dx = (x - center) / 60.f, dy = (y - center) / 60.f;
+        float dx = (x - center) / unit, dy = (y - center) / unit;
         float radius = sqrtf(dx * dx + dy * dy);
         Color color = {0, 0, 0, 0};
         if (radius <= .91f) {
@@ -842,7 +844,10 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         }
 
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
-        /* No selection perimeter: the clip body and trim grips provide the affordance. */
+        /* A subtle outline makes the selected clip visible without fighting
+           the thumbnails, waveform or keyframe diamonds. */
+        bool clipSelected = (cu->i & 1) != 0;
+        if (clipSelected) StrokeRR(r, 6.f, 1.25f, (Color){245, 245, 250, 185});
         if (clip && !audioOnly && r.width >= 18.f) {
             Color grip = (Color){210, 207, 222, 205};
             DrawLineEx((Vector2){r.x + 3.5f, r.y + 8.f}, (Vector2){r.x + 3.5f, r.y + r.height - 8.f}, 1.6f, grip);

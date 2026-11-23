@@ -169,6 +169,7 @@ static int   gClipDragTrack;
 static float gClipDragOffset, gClipDragOrigStart, gTimelinePanMouse, gTimelinePanOrig;
 static int   gClipTrimIndex = -1, gClipTrimEdge;
 static float gClipTrimOrigStart, gClipTrimOrigEnd, gClipTrimOrigOffset, gClipTrimSourceDuration;
+static float gClipTrimMouseX, gClipTrimPixelsPerSecond;
 static bool  gTimelinePanning, gTimelineMiddlePanning;
 static float gTimelinePanMouseY, gTimelineVerticalPanOrig, gTimelineVerticalScroll, gTimelineVerticalScrollT, gTimelineVerticalMax;
 static uint64_t gClipSerial = 1;
@@ -235,7 +236,7 @@ static float gMini[8];                                /* crop/distort numeric fi
 static float gRot, gRotT; static bool gRotDrag;       /* degrees -180..180 */
 #define NSL 48
 static float gSl[NSL], gSlT[NSL]; static bool gSlDrag[NSL]; /* slider 0..1 (0 = opacity, 40/41 = fades) */
-static Vector2 gWh[3], gWhT[3]; static bool gWhDrag[3];     /* wheel puck, unit disk */
+static Vector2 gWh[3], gWhT[3]; static bool gWhDrag[3], gWhResetPending[3]; /* wheel puck, unit disk */
 static int   gHsl = 0;                                /* selected HSL chip */
 static bool  gTransOpen = true;                       /* effects: transitions card */
 static int   gFilter = 0;                             /* effects: selected preset */

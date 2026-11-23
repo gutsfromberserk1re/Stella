@@ -24,3 +24,10 @@
 ## Validation
 - FFmpeg syntax checks passed for the waveform generation options and all four new look filter graphs.
 - Rust unit tests and the native Windows frontend build were not run in this environment because the Rust toolchain and frontend SDK headers are not installed. Re-run the project's Windows CI workflow to complete validation.
+
+## Timeline tracks, trimming and control reset
+- Video tracks V1-V4 and audio tracks A1-A2 remain available when empty.
+- Dragging a visible clip edge trims the source, and dragging back restores any remaining source footage. Linked audio and keyframes stay attached during the trim.
+- Selected clips receive a subtle white outline.
+- Double-clicking an audio knob resets it to its neutral/default value; double-clicking a grading puck recentres that wheel.
+- Rounded UI curves use denser geometry and the knob texture is supersampled for cleaner high-DPI rendering.

@@ -612,7 +612,7 @@ int main(void) {
                                                   timeBodyForWheel.width, timeBodyForWheel.height});
         Clay_UpdateScrollContainers(false, (Clay_Vector2){0, (gCtrlDown || shiftTimelineWheel) ? 0.f : gWheelDelta * 28.f}, gDt);
 
-        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { gDragId = 0; gDragWheel = -1; }
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) gDragId = 0;
         PlutoPollBackend();
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;

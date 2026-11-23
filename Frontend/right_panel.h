@@ -275,25 +275,46 @@ static void SliderLogic(Clay_ElementId id, int gi, float kr) {
 }
 
 static void WheelLogic(int i, Clay_ElementId id) {
+    static double lastClickTime[3];
+    static Vector2 pressPosition[3];
+    static bool pressMoved[3];
     Clay_BoundingBox bb = Clay_GetElementData(id).boundingBox;
     Vector2 m = GetMousePosition();
     float rad = fminf(bb.width, bb.height) / 2.f;
     Vector2 c = {bb.x + bb.width / 2.f, bb.y + bb.height / 2.f};
     float dx = m.x - c.x, dy = m.y - c.y;
-    if (rad > 1.f && Clay_PointerOver(id) && sqrtf(dx * dx + dy * dy) <= rad + 6.f) {
+    bool overWheel = rad > 1.f && Clay_PointerOver(id) && sqrtf(dx * dx + dy * dy) <= rad + 6.f;
+    if (overWheel) {
         gCross = true;
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gDragWheel = i;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            double now = GetTime();
+            if (lastClickTime[i] > 0.0 && now - lastClickTime[i] < 0.38 && !pressMoved[i]) {
+                gWhT[i] = (Vector2){0.f, 0.f};
+                gWhResetPending[i] = true;
+                lastClickTime[i] = 0.0;
+                gDragWheel = -1;
+            } else {
+                gDragWheel = i;
+                pressPosition[i] = m;
+                pressMoved[i] = false;
+                lastClickTime[i] = now;
+            }
+        }
     }
     gWhDrag[i] = false;
     if (gDragWheel == i) {
         gCross = true;
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && rad > 1.f) {
+            if (fabsf(m.x - pressPosition[i].x) + fabsf(m.y - pressPosition[i].y) > 2.5f)
+                pressMoved[i] = true;
             float px = dx / (rad - 1.f), py = dy / (rad - 1.f), l = sqrtf(px * px + py * py);
             if (l > 1.f) { px /= l; py /= l; }
-            /* Slightly soften the wheel response and let TickState ease the puck into place. */
             gWhT[i] = (Vector2){px * 0.92f, py * 0.92f};
             gWhDrag[i] = true;
-        } else gDragWheel = -1;
+        } else {
+            if (pressMoved[i]) lastClickTime[i] = 0.0;
+            gDragWheel = -1;
+        }
     }
 }
 
@@ -768,8 +789,9 @@ static void WheelItem(int i, const char *label) {
             sentInit = true;
             previousSelected = gTimelineSelected;
         }
-        if ((gWhDrag[i] || wasDragging[i]) &&
-            (fabsf(gWhT[i].x - sent[i].x) + fabsf(gWhT[i].y - sent[i].y) > .0015f)) {
+        bool resetPuck = gWhResetPending[i];
+        if ((gWhDrag[i] || wasDragging[i] || resetPuck) &&
+            (resetPuck || fabsf(gWhT[i].x - sent[i].x) + fabsf(gWhT[i].y - sent[i].y) > .0015f)) {
             static const char *grade[3] = {"shadows", "tint", "highlights"};
             float hue, amount; WheelInfo(gWhT[i], &hue, &amount);
             char updates[256];
@@ -778,6 +800,7 @@ static void WheelItem(int i, const char *label) {
             if (gWhDrag[i]) PlutoTimelineSetPropertiesLiveJson(updates);
             else PlutoTimelineSetPropertiesJson(updates);
             sent[i] = gWhT[i];
+            gWhResetPending[i] = false;
         }
         wasDragging[i] = gWhDrag[i];
         float hue, len; WheelInfo(gWh[i], &hue, &len);
