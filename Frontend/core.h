@@ -60,7 +60,7 @@ enum {
     I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
     K_APP_LOGO = 99,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
-    K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT, K_ROT_ICON
+    K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT, K_ROT_ICON, K_VSLIDER
 };
 
 typedef struct { int kind; Clay_Color a, b, c; float v, f; int i; } Cust;
@@ -179,7 +179,22 @@ static uint64_t gClipSerial = 1;
 #define STELLA_TEXT_MAX 512
 static char gTextContent[STELLA_TEXT_MAX] = "Your title";
 static int gTextFontSize = 96;
-static int gTextColorIndex = 0;
+static int gTextColorIndex = 0; /* legacy palette index, used when loading older title clips */
+static const Color gStellaTextColors[8] = {
+    {248, 248, 250, 255}, {255, 214, 92, 255}, {74, 210, 238, 255}, {255, 126, 154, 255},
+    {255, 154, 78, 255}, {126, 224, 156, 255}, {120, 160, 255, 255}, {234, 234, 242, 255}
+};
+/* Text / outline / shadow / plate colours. The centre of each wheel is its
+   neutral reset colour; wheel puck positions animate independently. */
+static const Color gTextAppearanceDefaults[4] = {
+    {245, 246, 249, 255}, {12, 13, 16, 230}, {0, 0, 0, 190}, {8, 9, 12, 178}
+};
+static Color gTextAppearance[4] = {
+    {245, 246, 249, 255}, {12, 13, 16, 230}, {0, 0, 0, 190}, {8, 9, 12, 178}
+};
+static Vector2 gTextWheelPuck[4], gTextWheelPuckT[4];
+static bool gTextWheelDrag[4];
+static int gDragTextWheel = -1;
 static int gTextAlign = 1; /* 0 left, 1 center, 2 right */
 static bool gTextBold = true;
 static bool gTextOutline;
@@ -287,6 +302,9 @@ typedef struct {
 } TimelineClipUi;
 static int gKeyframeDragClip = -1, gKeyframeDragIndex = -1;
 static float gKeyframeDragTime;
+/* The selected marker remains outlined after mouse release. */
+static int gSelectedKeyframeClip = -1;
+static float gSelectedKeyframeTime = -1.f;
 
 static TimelineClipUi gTimelineClips[MAX_TIMELINE_CLIPS];
 static int gTimelineClipCount;

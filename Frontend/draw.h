@@ -662,6 +662,18 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         DrawCircleV((Vector2){kx, r.y + rad}, rad - 3.f + cu->f, (Color){226, 227, 231, 255});
     } break;
 
+    case K_VSLIDER: {
+        float x = r.x + r.width * .5f;
+        float top = r.y + 9.f, bottom = r.y + r.height - 9.f;
+        if (bottom < top) bottom = top;
+        DrawLineEx((Vector2){x, top}, (Vector2){x, bottom}, 3.5f, (Color){45, 47, 54, 255});
+        float y = bottom - (bottom - top) * fmaxf(0.f, fminf(1.f, cu->v));
+        float hover = fmaxf(0.f, fminf(1.f, cu->f));
+        DrawCircleV((Vector2){x, y + 1.f}, 7.f + hover * .4f, (Color){0, 0, 0, 95});
+        DrawCircleV((Vector2){x, y}, 6.f + hover * .4f, (Color){220, 222, 228, 255});
+        DrawCircleV((Vector2){x, y}, 3.f, (Color){244, 245, 248, 255});
+    } break;
+
     case K_SLIDER: {
         /* i bit0 = big, bit1 = gradient (a -> b), bit2 = rainbow,
            bit3 = progress fill from the CENTRE (bipolar), bit4 = 3-stop gradient (a -> c -> b).
@@ -876,14 +888,17 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                 float x = r.x + (time - clip->start) / fmaxf(.001f, clip->duration) * r.width;
                 float y = r.y + 13.f, half = 8.f; /* 2px larger than the previous 14px diamond */
                 bool activeKey = fabsf(time - gPlayhead) < (1.f / 60.f);
-                Color key = activeKey ? (Color){255, 255, 255, 255} : (Color){226, 219, 247, 245};
+                bool selectedKey = gSelectedKeyframeClip == clipIndex && fabsf(time - gSelectedKeyframeTime) < .02f;
+                Color key = activeKey ? (Color){105, 226, 148, 255} : (Color){70, 190, 118, 255};
                 Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};
-                DrawCircleV((Vector2){x, y}, 10.5f, (Color){22, 19, 30, 230});
+                DrawCircleV((Vector2){x, y}, 10.5f, (Color){18, 28, 23, 235});
                 DrawTriangle(a, d, b, key); DrawTriangle(c, b, d, key);
-                DrawLineEx(a, b, 1.4f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
-                DrawLineEx(b, c, 1.4f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
-                DrawLineEx(c, d, 1.4f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
-                DrawLineEx(d, a, 1.4f, activeKey ? (Color){105, 94, 122, 255} : (Color){72, 58, 90, 255});
+                Color edge = selectedKey ? (Color){246, 247, 250, 255} : (Color){35, 111, 69, 255};
+                float edgeWidth = selectedKey ? 1.f : 1.25f;
+                DrawLineEx(a, b, edgeWidth, edge);
+                DrawLineEx(b, c, edgeWidth, edge);
+                DrawLineEx(c, d, edgeWidth, edge);
+                DrawLineEx(d, a, edgeWidth, edge);
             }
         }
     } break;

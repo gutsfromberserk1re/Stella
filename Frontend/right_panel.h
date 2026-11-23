@@ -30,6 +30,55 @@ static const char *gExtraFxKeys[] = {"blur", "grain", "vignette", "sharpen", "le
 static bool gExtraFxOn[EXTRA_FX_COUNT];
 static int gFilter;
 
+static int PlutoTextColorChannel(float value) {
+    return (int)fmaxf(0.f, fminf(255.f, roundf(value)));
+}
+
+static Color PlutoReadTextColor(const char *begin, const char *end, const char *prefix, Color fallback) {
+    char path[96];
+    Color result = fallback;
+    snprintf(path, sizeof(path), "props.text.%sR", prefix);
+    result.r = (unsigned char)PlutoTextColorChannel(PlutoReadNumber(begin, end, path, fallback.r));
+    snprintf(path, sizeof(path), "props.text.%sG", prefix);
+    result.g = (unsigned char)PlutoTextColorChannel(PlutoReadNumber(begin, end, path, fallback.g));
+    snprintf(path, sizeof(path), "props.text.%sB", prefix);
+    result.b = (unsigned char)PlutoTextColorChannel(PlutoReadNumber(begin, end, path, fallback.b));
+    snprintf(path, sizeof(path), "props.text.%sA", prefix);
+    result.a = (unsigned char)PlutoTextColorChannel(PlutoReadNumber(begin, end, path, fallback.a));
+    return result;
+}
+
+/* Convert a saved RGB colour back to the same hue/saturation disk used by the
+   Colors tab. Neutral colours sit at the centre of the wheel. */
+static Vector2 PlutoTextColorToWheel(Color color) {
+    float r = color.r / 255.f, g = color.g / 255.f, b = color.b / 255.f;
+    float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b));
+    float d = hi - lo, hue = 0.f, sat = hi > .0001f ? d / hi : 0.f;
+    if (d > .0001f) {
+        if (hi == r) hue = 60.f * fmodf((g - b) / d, 6.f);
+        else if (hi == g) hue = 60.f * ((b - r) / d + 2.f);
+        else hue = 60.f * ((r - g) / d + 4.f);
+    }
+    if (hue < 0.f) hue += 360.f;
+    float amount = fminf(.92f, sat * .92f);
+    float angle = (hue - 90.f) * DEG2RAD;
+    return (Vector2){cosf(angle) * amount, sinf(angle) * amount};
+}
+
+static void PlutoTextWheelApplyPosition(int index, Vector2 position) {
+    if (index < 0 || index >= 4) return;
+    float amount = sqrtf(position.x * position.x + position.y * position.y);
+    if (amount < .025f) {
+        gTextAppearance[index] = gTextAppearanceDefaults[index];
+        return;
+    }
+    float hue = 0.f, ignored = 0.f;
+    WheelInfo(position, &hue, &ignored);
+    Color selected = ColorFromHSV(hue, fminf(1.f, .30f + .70f * amount), 1.f);
+    selected.a = gTextAppearanceDefaults[index].a;
+    gTextAppearance[index] = selected;
+}
+
 /* Resolve inspector transform fields from the selected clip's current keyframe
    segment. The preview uses the same linear interpolation in Rust/WGPU. */
 static float PlutoKeyframedInspectorValue(const TimelineClipUi *clip, int field, float fallback, float at) {
@@ -170,6 +219,12 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         gTextFontSize = (int)Clampf((float)gTextFontSize, 24.f, 180.f);
         gTextColorIndex = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.color", 0.f));
         if (gTextColorIndex < 0 || gTextColorIndex > 7) gTextColorIndex = 0;
+        gTextAppearance[0] = PlutoReadTextColor(clipBegin, clipEnd, "ink", gStellaTextColors[gTextColorIndex]);
+        gTextAppearance[1] = PlutoReadTextColor(clipBegin, clipEnd, "outline", gTextAppearanceDefaults[1]);
+        gTextAppearance[2] = PlutoReadTextColor(clipBegin, clipEnd, "shadow", gTextAppearanceDefaults[2]);
+        gTextAppearance[3] = PlutoReadTextColor(clipBegin, clipEnd, "background", gTextAppearanceDefaults[3]);
+        for (int colorWheel = 0; colorWheel < 4; colorWheel++)
+            gTextWheelPuck[colorWheel] = gTextWheelPuckT[colorWheel] = PlutoTextColorToWheel(gTextAppearance[colorWheel]);
         gTextAlign = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.align", 1.f));
         if (gTextAlign < 0 || gTextAlign > 2) gTextAlign = 1;
         gTextPosX = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.x", .5f), .03f, .97f);
@@ -254,6 +309,13 @@ static void TickState(void) {
         gWh[i].x += (gWhT[i].x - gWh[i].x) * wheelFollow;
         gWh[i].y += (gWhT[i].y - gWh[i].y) * wheelFollow;
         if (fabsf(gWhT[i].x - gWh[i].x) < 0.001f && fabsf(gWhT[i].y - gWh[i].y) < 0.001f) gWh[i] = gWhT[i];
+    }
+    for (int i = 0; i < 4; i++) {
+        gTextWheelPuck[i].x += (gTextWheelPuckT[i].x - gTextWheelPuck[i].x) * wheelFollow;
+        gTextWheelPuck[i].y += (gTextWheelPuckT[i].y - gTextWheelPuck[i].y) * wheelFollow;
+        if (fabsf(gTextWheelPuckT[i].x - gTextWheelPuck[i].x) < .001f &&
+            fabsf(gTextWheelPuckT[i].y - gTextWheelPuck[i].y) < .001f)
+            gTextWheelPuck[i] = gTextWheelPuckT[i];
     }
 }
 
@@ -1490,10 +1552,6 @@ static void EffectsView(void) {
 }
 
 /* ---------------- integrated title editor ---------------- */
-static const Color gStellaTextColors[8] = {
-    {248, 248, 250, 255}, {255, 214, 92, 255}, {74, 210, 238, 255}, {255, 126, 154, 255},
-    {255, 154, 78, 255}, {126, 224, 156, 255}, {120, 160, 255, 255}, {234, 234, 242, 255}
-};
 
 static void PlutoTextAppendCodepoint(int cp) {
     size_t used = strlen(gTextContent);
@@ -1627,9 +1685,9 @@ static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity) {
         if (plate.y < 0.f) plate.y = 0.f;
         if (plate.x + plate.width > width) plate.width = width - plate.x;
         if (plate.y + plate.height > height) plate.height = height - plate.y;
-        ImageDrawRectangleRec(&image, plate, (Color){8, 9, 12, 178});
+        ImageDrawRectangleRec(&image, plate, gTextAppearance[3]);
     }
-    Color ink = gStellaTextColors[gTextColorIndex < 0 || gTextColorIndex > 7 ? 0 : gTextColorIndex];
+    Color ink = gTextAppearance[0];
     for (int i = 0; i < lineCount; i++) {
         float textWidth = MeasureTextEx(font, lines[i], (float)fontSize, 0.f).x;
         float drawX = gTextAlign == 0 ? x : gTextAlign == 1 ? anchorX - textWidth * .5f : anchorX - textWidth;
@@ -1637,13 +1695,13 @@ static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity) {
         Vector2 position = {drawX, y + (float)i * lineHeight};
         if (gTextShadow) {
             Vector2 shadow = {position.x + 5.f, position.y + 7.f};
-            ImageDrawTextEx(&image, font, lines[i], shadow, (float)fontSize, 0.f, (Color){0, 0, 0, 190});
+            ImageDrawTextEx(&image, font, lines[i], shadow, (float)fontSize, 0.f, gTextAppearance[2]);
         }
         if (gTextOutline) {
             static const int offsets[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
             for (int k = 0; k < 8; k++) {
                 Vector2 edge = {position.x + (float)offsets[k][0], position.y + (float)offsets[k][1]};
-                ImageDrawTextEx(&image, font, lines[i], edge, (float)fontSize, 0.f, (Color){0, 0, 0, 230});
+                ImageDrawTextEx(&image, font, lines[i], edge, (float)fontSize, 0.f, gTextAppearance[1]);
             }
         }
         ImageDrawTextEx(&image, font, lines[i], position, (float)fontSize, 0.f, ink);
@@ -1657,11 +1715,23 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     char escaped[STELLA_TEXT_MAX * 6 + 16];
     PlutoJsonEscape(gTextContent, escaped, sizeof(escaped));
     int n = snprintf(out, capacity,
-        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"color\":%d,\"align\":%d,\"bold\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"x\":%.5f,\"y\":%.5f}",
+        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"color\":%d,\"align\":%d,\"bold\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"x\":%.5f,\"y\":%.5f,"
+        "\"inkR\":%u,\"inkG\":%u,\"inkB\":%u,\"inkA\":%u,"
+        "\"outlineR\":%u,\"outlineG\":%u,\"outlineB\":%u,\"outlineA\":%u,"
+        "\"shadowR\":%u,\"shadowG\":%u,\"shadowB\":%u,\"shadowA\":%u,"
+        "\"backgroundR\":%u,\"backgroundG\":%u,\"backgroundB\":%u,\"backgroundA\":%u}",
         escaped, gTextFontSize, gTextColorIndex, gTextAlign,
         gTextBold ? "true" : "false", gTextOutline ? "true" : "false",
         gTextShadow ? "true" : "false", gTextBackground ? "true" : "false",
-        (double)gTextPosX, (double)gTextPosY);
+        (double)gTextPosX, (double)gTextPosY,
+        (unsigned)gTextAppearance[0].r, (unsigned)gTextAppearance[0].g,
+        (unsigned)gTextAppearance[0].b, (unsigned)gTextAppearance[0].a,
+        (unsigned)gTextAppearance[1].r, (unsigned)gTextAppearance[1].g,
+        (unsigned)gTextAppearance[1].b, (unsigned)gTextAppearance[1].a,
+        (unsigned)gTextAppearance[2].r, (unsigned)gTextAppearance[2].g,
+        (unsigned)gTextAppearance[2].b, (unsigned)gTextAppearance[2].a,
+        (unsigned)gTextAppearance[3].r, (unsigned)gTextAppearance[3].g,
+        (unsigned)gTextAppearance[3].b, (unsigned)gTextAppearance[3].a);
     return n > 0 && (size_t)n < capacity;
 }
 
@@ -1695,18 +1765,67 @@ static void PlutoTextPlaceAt(float xNormalized, float yNormalized) {
     PlutoTextApply(true);
 }
 
-static void TextColorButton(int i) {
-    Clay_ElementId id = CLAY_IDI("TextColor", i);
-    Bs b = Interact(id);
-    if (b.clicked) gTextColorIndex = i;
-    Clay_Color color = {gStellaTextColors[i].r, gStellaTextColors[i].g, gStellaTextColors[i].b, 255};
-    bool sel = gTextColorIndex == i;
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_C},
-              .backgroundColor = color, .cornerRadius = CLAY_CORNER_RADIUS(10),
-              .border = {.color = Mix(sel ? C_TEXT : RGB(52, 54, 61), RGB(255, 255, 255), sel ? .9f : b.hover * .3f),
-                         .width = CLAY_BORDER_OUTSIDE(sel ? 2 : 1)}}) {
-        if (sel)
-            CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = RGB(22, 23, 26), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+static void TextWheelLogic(int index, Clay_ElementId id) {
+    static double lastClickTime[4];
+    static Vector2 pressPosition[4];
+    static bool pressMoved[4];
+    if (index < 0 || index >= 4) return;
+    Clay_BoundingBox bb = Clay_GetElementData(id).boundingBox;
+    Vector2 mouse = GetMousePosition();
+    float radius = fminf(bb.width, bb.height) * .5f;
+    Vector2 center = {bb.x + bb.width * .5f, bb.y + bb.height * .5f};
+    float dx = mouse.x - center.x, dy = mouse.y - center.y;
+    bool over = radius > 1.f && Clay_PointerOver(id) && hypotf(dx, dy) <= radius + 6.f;
+    if (over) {
+        gCross = true;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            double now = GetTime();
+            if (lastClickTime[index] > 0.0 && now - lastClickTime[index] < .38 && !pressMoved[index]) {
+                gTextWheelPuckT[index] = (Vector2){0.f, 0.f};
+                PlutoTextWheelApplyPosition(index, (Vector2){0.f, 0.f});
+                lastClickTime[index] = 0.0;
+                gDragTextWheel = -1;
+            } else {
+                gDragTextWheel = index;
+                pressPosition[index] = mouse;
+                pressMoved[index] = false;
+                lastClickTime[index] = now;
+            }
+        }
+    }
+    gTextWheelDrag[index] = false;
+    if (gDragTextWheel == index) {
+        gCross = true;
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && radius > 1.f) {
+            if (fabsf(mouse.x - pressPosition[index].x) + fabsf(mouse.y - pressPosition[index].y) > 2.5f)
+                pressMoved[index] = true;
+            float px = dx / (radius - 1.f), py = dy / (radius - 1.f);
+            float length = hypotf(px, py);
+            if (length > .92f) { px *= .92f / length; py *= .92f / length; }
+            gTextWheelPuckT[index] = (Vector2){px, py};
+            PlutoTextWheelApplyPosition(index, gTextWheelPuckT[index]);
+            gTextWheelDrag[index] = true;
+        } else {
+            if (pressMoved[index]) lastClickTime[index] = 0.0;
+            gDragTextWheel = -1;
+        }
+    }
+}
+
+static void TextWheelItem(int index, const char *label) {
+    CLAY(CLAY_IDI("TextWheelCol", index), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6,
+                                                        .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
+        Clay_ElementId id = CLAY_IDI("TextWheel", index);
+        Bs b = Interact(id);
+        TextWheelLogic(index, id);
+        Vector2 puck = gTextWheelPuck[index];
+        Color color = gTextAppearance[index];
+        CLAY(id, {.layout = {.sizing = {FIX(96), FIX(96)}},
+                  .custom = {.customData = NC(K_WHEEL, C_CARD,
+                      (Clay_Color){puck.x, puck.y, 0, 0},
+                      (Clay_Color){color.r, color.g, color.b, color.a},
+                      1.f, fmaxf(b.hover * .6f, gTextWheelDrag[index] ? 1.f : 0.f), 0)}}) {}
+        Tx(label, 14.5f, C_TEXT, 1);
     }
 }
 
@@ -1776,7 +1895,7 @@ static void TextPosField(int n, const char *lab, float *norm, float lo, float hi
 static void TextPosGrid(void) {
     static const float xs[3] = {.1f, .5f, .9f};
     static const float ys[3] = {.12f, .5f, .88f};
-    CLAY(CLAY_ID("TxtPosGrid"), {.layout = {COLM, .sizing = {FIX(100), FIX(88)}, .padding = CLAY_PADDING_ALL(6)},
+    CLAY(CLAY_ID("TxtPosGrid"), {.layout = {COLM, .sizing = {FIX(88), FIX(84)}, .padding = CLAY_PADDING_ALL(5)},
                                  .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
                                  .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
         for (int row = 0; row < 3; row++) {
@@ -1829,6 +1948,8 @@ static void TextView(void) {
                                     .width = CLAY_BORDER_OUTSIDE(1)}}) {
                 TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 16, gTextContent[0] ? C_TEXT : C_MUTED, 0);
             }
+            if (TextActionButton("TextApply", gTextTitleSelected ? "Update selected title" : "Add title to timeline", true))
+                PlutoTextApply(false);
         }
 
         /* ---- Position (where the title sits in the frame) ---- */
@@ -1841,11 +1962,23 @@ static void TextView(void) {
                     gTextPosX = .5f; gTextPosY = .78f;
                 }
             }
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
-                TextPosGrid();
-                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-                    TextPosField(0, "X", &gTextPosX, .03f, .97f);
-                    TextPosField(1, "Y", &gTextPosY, .04f, .96f);
+            if (gRightW <= RIGHT_MIN + 28.f) {
+                /* The narrow inspector stacks the position picker and fields
+                   so the percentage controls never extend beyond the panel. */
+                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 9, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
+                    TextPosGrid();
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
+                        TextPosField(0, "X", &gTextPosX, .03f, .97f);
+                        TextPosField(1, "Y", &gTextPosY, .04f, .96f);
+                    }
+                }
+            } else {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
+                    TextPosGrid();
+                    CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
+                        TextPosField(0, "X", &gTextPosX, .03f, .97f);
+                        TextPosField(1, "Y", &gTextPosY, .04f, .96f);
+                    }
                 }
             }
         }
@@ -1884,10 +2017,12 @@ static void TextView(void) {
         CLAY(CLAY_ID("TextLookCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
             Tx("Color", 18, C_TEXT, 0);
             for (int row = 0; row < 2; row++) {
-                CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIX(34)}, .childGap = 6}}) {
-                    for (int col = 0; col < 4; col++) TextColorButton(row * 4 + col);
+                CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
+                    TextWheelItem(row * 2, row == 0 ? "Text color" : "Shadow color");
+                    TextWheelItem(row * 2 + 1, row == 0 ? "Outline color" : "Background color");
                 }
             }
+            Tx("Double-click a wheel puck to reset", 12.5f, C_MUTED, 0);
             GAPY(2)
             Tx("Style", 18, C_TEXT, 0);
             CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
@@ -1898,31 +2033,6 @@ static void TextView(void) {
                 TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
                 TextStyleToggle("TextBackground", "Background", &gTextBackground);
             }
-        }
-
-        /* ---- Clip length + actions ---- */
-        CLAY(CLAY_ID("TextClipCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
-                Tx("Clip length", 18, C_TEXT, 0);
-                HSPACE
-                float durationValue = gTextDuration;
-                if (ValBoxEditable(CLAY_ID("TextDuration"), &durationValue, "s", 82, 27, 16, 13, 8, .5f, 30.f, 1))
-                    gTextDuration = durationValue;
-            }
-        }
-        if (TextActionButton("TextApply", gTextTitleSelected ? "Update selected title" : "Add title to timeline", true))
-            PlutoTextApply(false);
-        if (TextActionButton("TextNew", "Create another title", false))
-            PlutoTextApply(true);
-        if (TextActionButton("TextToolPlace", gTimelineTool == 3 ? "Text tool active  \xC2\xB7  click preview" : "Place with text tool", false)) {
-            gTimelineTool = 3;
-            gRightTab = 3;
-            gTextInputFocused = false;
-        }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .padding = {4, 4, 0, 6}}}) {
-            TxWrap(gTextTitleSelected ? "Editing a title clip. Changes apply with Update selected title."
-                                      : "Titles are transparent overlays on the upper video track. Drag and trim them like video.",
-                   12.5f, C_MUTED, 0);
         }
     }
 }
