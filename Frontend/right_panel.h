@@ -2,6 +2,18 @@
 /* ------------------------------------------------------------------ */
 /* UI: inspector (right) - interaction helpers                         */
 /* ------------------------------------------------------------------ */
+/* Clay_SID expects a Clay_String, not a raw C string. Build a short-lived
+   non-owning key for runtime helper arguments such as TextApply/TextBold. */
+static Clay_ElementId TextDynamicElementId(const char *name) {
+    if (!name) name = "";
+    Clay_String key = {
+        .isStaticallyAllocated = false,
+        .length = (int32_t)strlen(name),
+        .chars = name
+    };
+    return Clay__HashString(key, 0, 0);
+}
+
 static float SlDefault(int gi) {
     if (gi == 0) return 1.f;                 /* opacity */
     if (gi == 40 || gi == 41) return 0.f;    /* fade durations */
@@ -1524,7 +1536,7 @@ static void TextColorButton(int i) {
 }
 
 static bool TextActionButton(const char *idName, const char *label, bool primary) {
-    Clay_ElementId id = CLAY_SID(idName);
+    Clay_ElementId id = TextDynamicElementId(idName);
     Bs b = Interact(id);
     CLAY(id, {.layout = {.sizing = {GROW, FIX(42)}, .padding = {14, 12, 0, 0}, .childAlignment = AL_C},
               .backgroundColor = primary ? Mix(RGB(60, 111, 224), RGB(83, 132, 245), b.hover) : BtnBg(C_RFIELD, RGB(48, 50, 58), b),
@@ -1536,7 +1548,7 @@ static bool TextActionButton(const char *idName, const char *label, bool primary
 }
 
 static void TextStyleToggle(const char *idName, const char *label, bool *value) {
-    Clay_ElementId id = CLAY_SID(idName);
+    Clay_ElementId id = TextDynamicElementId(idName);
     Bs b = Interact(id);
     if (b.clicked) *value = !*value;
     CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {10, 8, 0, 0}, .childAlignment = AL_Y},

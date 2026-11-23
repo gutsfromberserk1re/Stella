@@ -163,6 +163,181 @@ static void LoadKnobTexture(void) {
     if (gKnobTexture.id) SetTextureFilter(gKnobTexture, TEXTURE_FILTER_BILINEAR);
 }
 
+/* ------------------------------------------------------------------ */
+/* colour-grading wheel: ONE baked texture, same recipe as the web UI  */
+/*   conic hue ring + centre-fade radial gradient                      */
+/*   + inset shadow (0 3px 12px black 55%) + 1px inset rim (white 10%) */
+/* Baked once per size (no overlapping rings), drawn as a single quad. */
+/* ------------------------------------------------------------------ */
+static Texture2D gWheelTex, gPuckTex, gPuckFillTex;
+static int gWheelTexN, gPuckTexN;
+static float gWheelTexK, gPuckTexK;
+
+/* WHEEL_BAKE_BEGIN  (pure C: no raylib calls, so it can be unit-tested on its own) */
+/* The reference design is the web UI rendered at 90%: every CSS length (blur, offsets, rim, puck size) is x0.9. */
+#define WHEEL_CSS_SCALE .9f
+static float WheelClamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
+
+static void WheelHsl(float h, float s, float l, float rgb[3]) {
+    float c = (1.f - fabsf(2.f * l - 1.f)) * s, hp = h / 60.f;
+    float x = c * (1.f - fabsf(fmodf(hp, 2.f) - 1.f)), m = l - c * .5f, r = 0.f, g = 0.f, b = 0.f;
+    if (hp < 1.f) { r = c; g = x; }
+    else if (hp < 2.f) { r = x; g = c; }
+    else if (hp < 3.f) { g = c; b = x; }
+    else if (hp < 4.f) { g = x; b = c; }
+    else if (hp < 5.f) { r = x; b = c; }
+    else { r = c; b = x; }
+    rgb[0] = (r + m) * 255.f; rgb[1] = (g + m) * 255.f; rgb[2] = (b + m) * 255.f;
+}
+
+/* Gaussian-blurred, anti-aliased disc (radius rad, centre cx,cy, in pixels) into a W x W map of 0..1. */
+static bool WheelBlurredDisc(float *map, int W, float cx, float cy, float rad, float sigma) {
+    int kr = (int)ceilf(3.f * sigma);
+    float *tmp = (float *)MemAlloc((unsigned int)(W * W) * (unsigned int)sizeof(float));
+    float *ker = (float *)MemAlloc((unsigned int)(2 * kr + 1) * (unsigned int)sizeof(float));
+    if (!tmp || !ker) { MemFree(tmp); MemFree(ker); return false; }
+    float sum = 0.f;
+    for (int i = -kr; i <= kr; i++) { ker[i + kr] = expf(-.5f * (float)(i * i) / (sigma * sigma)); sum += ker[i + kr]; }
+    for (int i = 0; i < 2 * kr + 1; i++) ker[i] /= sum;
+    for (int y = 0; y < W; y++) for (int x = 0; x < W; x++)
+        map[y * W + x] = WheelClamp01(rad + .5f - hypotf((float)x + .5f - cx, (float)y + .5f - cy));
+    for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) {
+        float a = 0.f;
+        for (int i = -kr; i <= kr; i++) { int xx = x + i; if (xx >= 0 && xx < W) a += ker[i + kr] * map[y * W + xx]; }
+        tmp[y * W + x] = a;
+    }
+    for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) {
+        float a = 0.f;
+        for (int i = -kr; i <= kr; i++) { int yy = y + i; if (yy >= 0 && yy < W) a += ker[i + kr] * tmp[yy * W + x]; }
+        map[y * W + x] = a;
+    }
+    MemFree(tmp); MemFree(ker);
+    return true;
+}
+
+static float WheelSampleMap(const float *map, int W, float u, float v) {
+    int x0 = (int)floorf(u), y0 = (int)floorf(v);
+    float fx = u - (float)x0, fy = v - (float)y0;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    x0 = x0 < 0 ? 0 : x0 > W - 1 ? W - 1 : x0; x1 = x1 < 0 ? 0 : x1 > W - 1 ? W - 1 : x1;
+    y0 = y0 < 0 ? 0 : y0 > W - 1 ? W - 1 : y0; y1 = y1 < 0 ? 0 : y1 > W - 1 ? W - 1 : y1;
+    float top = map[y0 * W + x0] * (1.f - fx) + map[y0 * W + x1] * fx;
+    float bot = map[y1 * W + x0] * (1.f - fx) + map[y1 * W + x1] * fx;
+    return top * (1.f - fy) + bot * fy;
+}
+
+/* The wheel itself. N = texture size in pixels, k = pixels per UI point (1 normally, 2 on a 2x display).
+   Straight (non-premultiplied) RGBA out. */
+static bool WheelBake(unsigned char *px, int N, float k) {
+    /* hue stops, clockwise from the top, evenly spaced every 60 degrees */
+    static const float stops[7][3] = {{0, 62, 46}, {60, 62, 44}, {120, 55, 38}, {180, 58, 40}, {240, 62, 54}, {300, 58, 46}, {360, 62, 46}};
+    float hue[7][3];
+    for (int i = 0; i < 7; i++) WheelHsl(stops[i][0], stops[i][1] / 100.f, stops[i][2] / 100.f, hue[i]);
+
+    const float u = k * WHEEL_CSS_SCALE;                              /* one CSS px, in texture pixels */
+    const float R = (float)N * .5f, sigma = 6.f * u;                  /* blur 12px -> sigma 6px */
+    const int pad = (int)ceilf(3.f * sigma) + (int)ceilf(3.f * u) + 2, W = N + 2 * pad;
+    float *hole = (float *)MemAlloc((unsigned int)(W * W) * (unsigned int)sizeof(float));
+    if (!hole) return false;
+    /* inset shadow = everything OUTSIDE the box shifted down by 3px, blurred */
+    if (!WheelBlurredDisc(hole, W, R + (float)pad, R + 3.f * u + (float)pad, R, sigma)) { MemFree(hole); return false; }
+
+    enum { SS = 4 };
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        float sum[3] = {0, 0, 0}, all[3] = {0, 0, 0};
+        int inside = 0;
+        for (int sy = 0; sy < SS; sy++) for (int sx = 0; sx < SS; sx++) {
+            float fx = (float)x + ((float)sx + .5f) / SS, fy = (float)y + ((float)sy + .5f) / SS;
+            float dx = fx - R, dy = fy - R, rho = hypotf(dx, dy), rc = rho < R ? rho : R;
+            /* conic gradient: 0deg at the top, clockwise, sRGB blend between stops */
+            float ang = atan2f(dx, -dy) * (180.f / 3.14159265f);
+            if (ang < 0.f) ang += 360.f;
+            float seg = ang / 60.f; int si = (int)seg; if (si > 5) si = 5;
+            float sf = seg - (float)si, col[3];
+            for (int c = 0; c < 3; c++) col[c] = hue[si][c] + (hue[si + 1][c] - hue[si][c]) * sf;
+            /* radial gradient on top: #232427 -> 85% at 18% -> transparent at 72% (of the farthest-corner distance) */
+            float t = rc / (R * 1.41421356f), a = t <= .18f ? 1.f - .15f * (t / .18f) : t <= .72f ? .85f * (1.f - (t - .18f) / .54f) : 0.f;
+            col[0] += (35.f - col[0]) * a; col[1] += (36.f - col[1]) * a; col[2] += (39.f - col[2]) * a;
+            /* inset shadow 0 3px 12px rgba(0,0,0,.55) */
+            float sh = .55f * (1.f - WheelSampleMap(hole, W, fx - .5f + (float)pad, fy - .5f + (float)pad));
+            for (int c = 0; c < 3; c++) col[c] *= 1.f - sh;
+            /* inset 0 0 0 1px rgba(255,255,255,.1) */
+            if (rho > R - u) for (int c = 0; c < 3; c++) col[c] += (255.f - col[c]) * .1f;
+            for (int c = 0; c < 3; c++) { all[c] += col[c]; if (rho <= R) sum[c] += col[c]; }
+            if (rho <= R) inside++;
+        }
+        unsigned char *o = px + 4 * (y * N + x);
+        for (int c = 0; c < 3; c++) {
+            float v = inside ? sum[c] / (float)inside : all[c] / (float)(SS * SS);
+            o[c] = (unsigned char)(v < 0.f ? 0.f : v > 255.f ? 255.f : v + .5f);
+        }
+        o[3] = (unsigned char)(255.f * (float)inside / (float)(SS * SS) + .5f);
+    }
+    MemFree(hole);
+    return true;
+}
+
+/* Puck sprite: soft drop shadow (0 2px 8px black 70%) under a white disc of radius 10 (the 2.5px border).
+   Sprite is 52 x 52 points, centred on the puck. */
+#define PUCK_SPRITE_PT 52
+static bool PuckBake(unsigned char *px, int N, float k) {
+    float *map = (float *)MemAlloc((unsigned int)(N * N) * (unsigned int)sizeof(float));
+    if (!map) return false;
+    const float u = k * WHEEL_CSS_SCALE, C = (float)N * .5f;
+    if (!WheelBlurredDisc(map, N, C, C + 2.f * u, 10.f * u, 4.f * u)) { MemFree(map); return false; }
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        float cd = WheelClamp01(10.f * u + .5f - hypotf((float)x + .5f - C, (float)y + .5f - C));
+        float sh = .7f * map[y * N + x], oa = cd + sh * (1.f - cd);
+        unsigned char *o = px + 4 * (y * N + x);
+        o[0] = o[1] = o[2] = (unsigned char)(oa > 0.f ? 255.f * cd / oa + .5f : 0.f);
+        o[3] = (unsigned char)(255.f * oa + .5f);
+    }
+    MemFree(map);
+    return true;
+}
+
+/* Anti-aliased white disc of radius 7.5 CSS px (the puck's colour fill); tinted when drawn. */
+#define PUCK_FILL_PT 18
+static void PuckFillBake(unsigned char *px, int N, float k) {
+    const float u = k * WHEEL_CSS_SCALE, C = (float)N * .5f;
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        unsigned char *o = px + 4 * (y * N + x);
+        o[0] = o[1] = o[2] = 255;
+        o[3] = (unsigned char)(255.f * WheelClamp01(7.5f * u + .5f - hypotf((float)x + .5f - C, (float)y + .5f - C)) + .5f);
+    }
+}
+/* WHEEL_BAKE_END */
+
+static Texture2D WheelUpload(int N, bool (*fill)(unsigned char *, int, float), float k) {
+    Texture2D tex = {0};
+    Image img = GenImageColor(N, N, (Color){0, 0, 0, 0});
+    if (!img.data) return tex;
+    if (fill((unsigned char *)img.data, N, k)) {
+        tex = LoadTextureFromImage(img);
+        if (tex.id) SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+    }
+    UnloadImage(img);
+    return tex;
+}
+static bool PuckFillBakeB(unsigned char *px, int N, float k) { PuckFillBake(px, N, k); return true; }
+
+/* (Re)bake only when the size or display scale changes. */
+static void EnsureWheelTextures(float diameter, float k) {
+    int N = (int)roundf(diameter * k);
+    if (N >= 16 && (gWheelTexN != N || gWheelTexK != k)) {
+        if (gWheelTex.id) UnloadTexture(gWheelTex);
+        gWheelTexN = N; gWheelTexK = k;
+        gWheelTex = WheelUpload(N, WheelBake, k);
+    }
+    if (gPuckTexK != k || !gPuckTexN) {
+        if (gPuckTex.id) UnloadTexture(gPuckTex);
+        if (gPuckFillTex.id) UnloadTexture(gPuckFillTex);
+        gPuckTexK = k; gPuckTexN = 1;
+        gPuckTex = WheelUpload((int)roundf(PUCK_SPRITE_PT * k), PuckBake, k);
+        gPuckFillTex = WheelUpload((int)roundf(PUCK_FILL_PT * k), PuckFillBakeB, k);
+    }
+}
+
 static Texture2D LoadToolIconIco(const char *path) {
     Texture2D texture = {0};
 #ifdef _WIN32
@@ -261,7 +436,7 @@ static bool DrawAssetIcon(int k, Rectangle r, Color tint) {
                k == I_MAGNET ? 4 : k == I_LIBRARY ? 5 : -1;
     if (slot < 0 || gToolIcons[slot].id == 0) return false;
     Texture2D tex = gToolIcons[slot];
-    if (k == I_LINK) { r.x += r.width * .12f; r.y += r.height * .12f; r.width *= .76f; r.height *= .76f; }
+    if (k == I_LINK) { r.x += r.width * .19f; r.y += r.height * .19f; r.width *= .62f; r.height *= .62f; }
     DrawTexturePro(tex, (Rectangle){0, 0, (float)tex.width, (float)tex.height}, r, (Vector2){0, 0}, 0.f, tint);
     return true;
 }
@@ -287,6 +462,9 @@ static void LoadUiIcons(void) {
 static void UnloadUiIcons(void) {
     for (int i = 0; i < 6; i++) if (gToolIcons[i].id) UnloadTexture(gToolIcons[i]);
     if (gKnobTexture.id) UnloadTexture(gKnobTexture);
+    if (gWheelTex.id) UnloadTexture(gWheelTex);
+    if (gPuckTex.id) UnloadTexture(gPuckTex);
+    if (gPuckFillTex.id) UnloadTexture(gPuckFillTex);
     if (gAppLogo.id) UnloadTexture(gAppLogo);
 }
 
@@ -447,26 +625,31 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     } break;
 
     case K_WHEEL: {
-        /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured? */
+        /* b.r / b.g = puck position (unit disk), c = puck colour, v = coloured?, f = hover/drag */
         Vector2 c = {r.x + r.width / 2, r.y + r.height / 2};
         float rad = fminf(r.width, r.height) / 2 - 1;
-        /* Muted, dark hue wheel: low saturation/value, slightly darker toward the bottom. */
-        for (int i = 0; i < 72; i++) {
-            float a0 = i * 5.f, mid = (a0 + 2.8f) * DEG2RAD;
-            float shade = 1.f - .20f * fmaxf(0.f, sinf(mid));
-            DrawCircleSector(c, rad, a0, a0 + 5.6f, 3, ColorFromHSV(fmodf(a0 + 90.f, 360.f), .56f, .60f * shade));
-        }
-        /* Radial wash: the centre melts into neutral dark grey, the rim keeps its colour. */
-        for (int k = 0; k < 24; k++) {
-            float t0 = k / 24.f, t1 = (k + 1) / 24.f;
-            float fall = powf(1.f - (t0 + t1) * .5f, 1.5f);
-            DrawRing(c, rad * t0, rad * t1 + .6f, 0, 360, 48, (Color){40, 41, 46, U8(205.f * fall)});
-        }
-        Ring(c, rad, 1.5f, (Color){38, 40, 46, 255});
+        float k = fmaxf(1.f, gDpiScale);
+        EnsureWheelTextures(2.f * rad, k);
+        /* The whole wheel is a single pre-baked texture (hue ring + soft centre + inset shadow + rim). */
+        if (gWheelTex.id) {
+            float dw = (float)gWheelTex.width / k;
+            DrawTexturePro(gWheelTex, (Rectangle){0, 0, (float)gWheelTex.width, (float)gWheelTex.height},
+                           (Rectangle){roundf(c.x - dw * .5f), roundf(c.y - dw * .5f), dw, dw}, (Vector2){0, 0}, 0.f, WHITE);
+        } else DrawCircleV(c, rad, (Color){40, 41, 46, 255});
+        /* Puck: soft shadow + white border + fill. Grows a little on hover and more while dragging. */
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
-        float dot = 9.5f + 1.5f * cu->f;
-        DrawCircleV(p, dot + 1.8f, (Color){232, 233, 238, 255});
-        DrawCircleV(p, dot - 1.f, cu->v > .5f ? RC(cu->c) : (Color){212, 213, 219, 255});
+        float s = 1.f + .2f * cu->f;
+        if (gPuckTex.id) {
+            float sw = (float)gPuckTex.width / k * s;
+            DrawTexturePro(gPuckTex, (Rectangle){0, 0, (float)gPuckTex.width, (float)gPuckTex.height},
+                           (Rectangle){p.x - sw * .5f, p.y - sw * .5f, sw, sw}, (Vector2){0, 0}, 0.f, WHITE);
+        } else DrawCircleV(p, 9.f * s, WHITE);
+        Color fill = cu->v > .5f ? RC(cu->c) : (Color){220, 221, 226, 255};
+        if (gPuckFillTex.id) {
+            float fw = (float)gPuckFillTex.width / k * s;
+            DrawTexturePro(gPuckFillTex, (Rectangle){0, 0, (float)gPuckFillTex.width, (float)gPuckFillTex.height},
+                           (Rectangle){p.x - fw * .5f, p.y - fw * .5f, fw, fw}, (Vector2){0, 0}, 0.f, fill);
+        } else DrawCircleV(p, 6.75f * s, fill);
     } break;
 
     case K_SWITCH: {
