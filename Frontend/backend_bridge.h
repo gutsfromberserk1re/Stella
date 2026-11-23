@@ -421,6 +421,8 @@ static void PlutoTimelineSelect(int index) {
     PlutoTextAutoUpdateFlush();
     PlutoTimelineEndPropertyEdit();
     gTimelineSelected = index;
+    gSelectedKeyframeClip = -1;
+    gSelectedKeyframeTime = -1.f;
     PlutoTimelineCall("{\"command\":\"timeline_get\"}");
     gPreviewDirty = true;
 }
@@ -527,7 +529,11 @@ static bool PlutoTimelineDelete(int index) {
     char id[128], request[256]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
     snprintf(request, sizeof(request), "{\"command\":\"timeline_delete_clip\",\"id\":\"%s\"}", id);
     bool okay = PlutoTimelineCall(request);
-    if (okay) gPreviewDirty = true;
+    if (okay) {
+        gPreviewDirty = true;
+        gSelectedKeyframeClip = -1;
+        gSelectedKeyframeTime = -1.f;
+    }
     return okay;
 }
 
@@ -601,9 +607,28 @@ static bool PlutoTimelineAddKeyframe(float at) {
     return okay;
 }
 
+static bool PlutoTimelineDeleteKeyframe(int index, float at) {
+    if (index < 0 || index >= gTimelineClipCount) return false;
+    char id[128], request[512];
+    PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
+    snprintf(request, sizeof(request),
+        "{\"command\":\"timeline_delete_keyframe\",\"id\":\"%s\",\"at\":%.6f}", id, at);
+    PlutoTimelineEndPropertyEdit();
+    bool okay = PlutoTimelineCall(request);
+    if (okay) {
+        gSelectedKeyframeClip = -1;
+        gSelectedKeyframeTime = -1.f;
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    }
+    return okay;
+}
+
 static bool PlutoTimelineHistory(bool redo) {
     bool okay = PlutoTimelineCall(redo ? "{\"command\":\"timeline_redo\"}" : "{\"command\":\"timeline_undo\"}");
     if (okay) {
+        gSelectedKeyframeClip = -1;
+        gSelectedKeyframeTime = -1.f;
         /* Undo/redo returns the authoritative timeline; refresh the preview immediately. */
         gPreviewDirty = true;
         gPreviewDebounce = 0.f;
@@ -966,6 +991,7 @@ static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) { (vo
 static void PlutoTimelineEndPropertyEdit(void) { gTimelinePropertyEditOpen = false; gTextAutoUpdateCommitAt = 0.0; }
 static bool PlutoTimelineMoveKeyframe(int index, float from, float to, bool live) { (void)index; (void)from; (void)to; (void)live; return false; }
 static bool PlutoTimelineAddKeyframe(float at) { (void)at; return false; }
+static bool PlutoTimelineDeleteKeyframe(int index, float at) { (void)index; (void)at; return false; }
 static bool PlutoTimelineSetBoolProperty(const char *path, bool value) { (void)path; (void)value; return false; }
 static bool PlutoTimelineSetStringProperty(const char *path, const char *value) { (void)path; (void)value; return false; }
 static uint64_t PlutoRequestPreview(void) { return 0; }

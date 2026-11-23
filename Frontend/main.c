@@ -557,9 +557,21 @@ int main(void) {
         }
         if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
             gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
-            PlutoTimelineDelete(gTimelineSelected);
-            memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
-            gTimelineSelected = -1;
+            /* A focused/selected keyframe takes priority over clip deletion.
+               Clicking a diamond selects it; placing the playhead over one is
+               also enough to target it, matching the toolbar's add/remove toggle. */
+            int keyIndex = TimelineSelectedKeyframeIndex(gTimelineSelected);
+            if (keyIndex < 0) keyIndex = TimelineKeyframeAtPlayhead(gTimelineSelected);
+            if (keyIndex >= 0) {
+                float keyTime = gTimelineClips[gTimelineSelected].keyframes[keyIndex].time;
+                PlutoTimelineDeleteKeyframe(gTimelineSelected, keyTime);
+            } else {
+                PlutoTimelineDelete(gTimelineSelected);
+                memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
+                gTimelineSelected = -1;
+                gSelectedKeyframeClip = -1;
+                gSelectedKeyframeTime = -1.f;
+            }
         }
         bool navLeft = IsKeyDown(KEY_LEFT), navRight = IsKeyDown(KEY_RIGHT);
         bool navActive = gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && (navLeft || navRight);
@@ -619,7 +631,7 @@ int main(void) {
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
-        if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && !gTextAutoUpdatePending) {
             PlutoTimelineEndPropertyEdit();
         }
         PlutoTextAutoUpdateTick();

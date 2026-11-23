@@ -313,6 +313,45 @@ static int TimelineKeyframeHit(int clipIndex, Clay_BoundingBox bounds, Vector2 m
     return -1;
 }
 
+static int TimelineKeyframeAtTime(int clipIndex, float time, float tolerance) {
+    if (clipIndex < 0 || clipIndex >= gTimelineClipCount) return -1;
+    TimelineClipUi *clip = &gTimelineClips[clipIndex];
+    int best = -1;
+    float bestDistance = tolerance;
+    for (int k = 0; k < clip->keyframeCount; k++) {
+        float distance = fabsf(clip->keyframes[k].time - time);
+        if (distance <= bestDistance) { best = k; bestDistance = distance; }
+    }
+    return best;
+}
+
+static int TimelineKeyframeAtPlayhead(int clipIndex) {
+    float tolerance = .5f / (float)fmaxf(1, gPreviewFps) + .001f;
+    return TimelineKeyframeAtTime(clipIndex, gPlayhead, tolerance);
+}
+
+static int TimelineSelectedKeyframeIndex(int clipIndex) {
+    if (gSelectedKeyframeClip != clipIndex || gSelectedKeyframeTime < 0.f) return -1;
+    return TimelineKeyframeAtTime(clipIndex, gSelectedKeyframeTime, .0015f);
+}
+
+static bool TimelineKeyframeToolbarButton(Clay_ElementId id, int icon, bool active, bool accent, float size) {
+    Bs b = Interact(id);
+    Clay_Color base = active ? RGB(55, 45, 70) : RGB(28, 29, 34);
+    Clay_Color hover = active ? RGB(76, 62, 96) : RGB(45, 47, 54);
+    Clay_Color iconColor = accent ? (active ? RGB(225, 207, 255) : RGB(183, 164, 211))
+                                : RGB(166, 169, 179);
+    CLAY(id, {.layout = {.sizing = {FIX(size), FIX(30)}, .childAlignment = AL_C},
+              .backgroundColor = BtnBg(base, hover, b),
+              .cornerRadius = CLAY_CORNER_RADIUS(8),
+              .border = {.color = Mix(RGB(45, 46, 53), accent ? RGB(126, 99, 164) : RGB(83, 86, 96),
+                                      (active ? .72f : 0.f) + b.hover * .22f),
+                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Icon(icon, 15.5f, iconColor);
+    }
+    return b.clicked;
+}
+
 static bool TimelineKeyframeAtPointer(Vector2 mouse) {
     for (int i = 0; i < gTimelineClipCount; i++) {
         Clay_BoundingBox bounds = Clay_GetElementData(CLAY_IDI("TimelineClip", i)).boundingBox;
@@ -845,26 +884,52 @@ static void Timeline(void) {
             if (IconBtn(CLAY_ID("Undo"), I_UNDO, 34, 16, RGB(143, 146, 155), false, 8)) TimelineHistoryAction(false);
             if (IconBtn(CLAY_ID("Redo"), I_REDO, 34, 16, RGB(143, 146, 155), false, 8)) TimelineHistoryAction(true);
             HSPACE
-            CLAY(CLAY_ID("KfGroup"), {.layout = {.sizing = {FIT, FIX(32)}, .padding = {2, 2, 0, 0}, .childAlignment = AL_Y},
-                                      .backgroundColor = RGB(21, 22, 26), .cornerRadius = CLAY_CORNER_RADIUS(10),
+            int keyframeOnPlayhead = TimelineKeyframeAtPlayhead(gTimelineSelected);
+            CLAY(CLAY_ID("KfGroup"), {.layout = {.sizing = {FIT, FIX(36)}, .padding = {3, 3, 0, 0}, .childGap = 2, .childAlignment = AL_Y},
+                                      .backgroundColor = RGB(21, 22, 26), .cornerRadius = CLAY_CORNER_RADIUS(11),
                                       .border = {.color = RGB(40, 42, 48), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                if (IconBtn(CLAY_ID("KfPrev"), I_KF_PREV, 28, 14, RGB(90, 93, 102), false, 8) &&
+                if (TimelineKeyframeToolbarButton(CLAY_ID("KfPrev"), I_KF_PREV, false, false, 30) &&
                     gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
                     float prev = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i].time < gPlayhead - .02f && (prev < 0.f || clip->keyframes[i].time > prev)) prev = clip->keyframes[i].time;
-                    gPlayhead = prev >= 0.f ? prev : 0.f; gPreviewDirty = true; gPreviewDebounce = 1.f;
+                        if (clip->keyframes[i].time < gPlayhead - .001f && (prev < 0.f || clip->keyframes[i].time > prev)) prev = clip->keyframes[i].time;
+                    gPlayhead = prev >= 0.f ? prev : 0.f;
+                    if (prev >= 0.f) {
+                        gSelectedKeyframeClip = gTimelineSelected;
+                        gSelectedKeyframeTime = prev;
+                    } else {
+                        gSelectedKeyframeClip = -1;
+                        gSelectedKeyframeTime = -1.f;
+                    }
+                    gPreviewDirty = true; gPreviewDebounce = 0.f;
                 }
-                if (IconBtn(CLAY_ID("KfAdd"), I_KF_DIAMOND, 28, 14, C_DIM, false, 8) && gTimelineSelected >= 0)
-                    PlutoTimelineAddKeyframe(gPlayhead);
-                if (IconBtn(CLAY_ID("KfNext"), I_KF_NEXT, 28, 14, RGB(90, 93, 102), false, 8) &&
+                if (TimelineKeyframeToolbarButton(CLAY_ID("KfToggle"),
+                            keyframeOnPlayhead >= 0 ? I_KF_DIAMOND_MINUS : I_KF_DIAMOND,
+                            keyframeOnPlayhead >= 0, true, 32) && gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
+                    if (keyframeOnPlayhead >= 0) {
+                        float at = gTimelineClips[gTimelineSelected].keyframes[keyframeOnPlayhead].time;
+                        PlutoTimelineDeleteKeyframe(gTimelineSelected, at);
+                    } else if (PlutoTimelineAddKeyframe(gPlayhead)) {
+                        gSelectedKeyframeClip = gTimelineSelected;
+                        gSelectedKeyframeTime = gPlayhead;
+                    }
+                }
+                if (TimelineKeyframeToolbarButton(CLAY_ID("KfNext"), I_KF_NEXT, false, false, 30) &&
                     gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
                     float next = -1.f;
                     TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
                     for (int i = 0; i < clip->keyframeCount; i++)
-                        if (clip->keyframes[i].time > gPlayhead + .02f && (next < 0.f || clip->keyframes[i].time < next)) next = clip->keyframes[i].time;
-                    gPlayhead = next >= 0.f ? next : TimelineDuration(); gPreviewDirty = true; gPreviewDebounce = 1.f;
+                        if (clip->keyframes[i].time > gPlayhead + .001f && (next < 0.f || clip->keyframes[i].time < next)) next = clip->keyframes[i].time;
+                    gPlayhead = next >= 0.f ? next : TimelineDuration();
+                    if (next >= 0.f) {
+                        gSelectedKeyframeClip = gTimelineSelected;
+                        gSelectedKeyframeTime = next;
+                    } else {
+                        gSelectedKeyframeClip = -1;
+                        gSelectedKeyframeTime = -1.f;
+                    }
+                    gPreviewDirty = true; gPreviewDebounce = 0.f;
                 }
             }
             GAPX(14)

@@ -1170,7 +1170,14 @@ impl PreviewEngine {
             }
         }
 
-        let mut sources = Vec::with_capacity(active.len());
+        // Several timeline layers may intentionally reference the same source
+        // frame (for example, stacked copies with different transforms/opacity).
+        // Decode that source/time only once, then fan the shared Arc pixel buffer
+        // back out to every layer. Keep each layer's own index so compositing order
+        // and per-layer uniforms remain unchanged.
+        let mut sources: Vec<DecodeSource> = Vec::with_capacity(active.len());
+        let mut source_indices = Vec::with_capacity(active.len());
+        let mut source_lookup: HashMap<(String, i64), usize> = HashMap::new();
         for clip in &active {
             let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             let source = preview_source_path(clip);
@@ -1188,7 +1195,19 @@ impl PreviewEngine {
                 eprintln!("Stella native preview fallback for '{}': empty source path", original);
                 return note_fallback(4);
             }
-            sources.push(DecodeSource { path: source, source_time, remaining });
+            // Microsecond identity is deliberately finer than a video frame:
+            // it merges duplicate layer requests without merging neighbouring
+            // source frames from high-frame-rate footage.
+            let lookup_key = (source.clone(), (source_time * 1_000_000.0).round() as i64);
+            if let Some(&index) = source_lookup.get(&lookup_key) {
+                sources[index].remaining = sources[index].remaining.max(remaining);
+                source_indices.push(index);
+            } else {
+                let index = sources.len();
+                source_lookup.insert(lookup_key, index);
+                sources.push(DecodeSource { path: source, source_time, remaining });
+                source_indices.push(index);
+            }
         }
 
         // Resolution-aware source sizing. Decode enough pixels to keep the
@@ -1202,6 +1221,7 @@ impl PreviewEngine {
             481..=720 => 1440,// 720p output: 1280x720
             _ => 1920,        // 1080p output: 1920x1080
         };
+        let source_paths: Vec<String> = sources.iter().map(|source| source.path.clone()).collect();
         let batch = match self.decoder_worker.decode(DecodeTask {
             sources,
             fps: fps as f64,
@@ -1219,11 +1239,20 @@ impl PreviewEngine {
         let decoded = batch.frames;
         *ring_depth = batch.prefetched_frames;
         let null_props = Value::Null;
-        let layers: Vec<GpuLayerFrame<'_>> = active.iter().zip(decoded.iter()).map(|(clip, frame)| {
+        // Stable source-frame keys let the GPU keep one uploaded texture for
+        // identical source frames shared by multiple clip layers.
+        let source_keys: Vec<String> = active.iter().zip(source_indices.iter()).map(|(_clip, &source_index)| {
+            let frame = &decoded[source_index];
+            let path = &source_paths[source_index];
+            format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
+        }).collect();
+        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
+            let frame = &decoded[source_indices[index]];
             let props = clip.extra.get("props").unwrap_or(&null_props);
             let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
             GpuLayerFrame {
                 key: clip.id.as_str(),
+                source_key: source_keys[index].as_str(),
                 pixels: frame.rgba.as_slice(),
                 width: frame.width,
                 height: frame.height,
@@ -1568,6 +1597,34 @@ fn dispatch(request: Value) -> Result<Value, String> {
                 list.push(json!({"time": at, "values": request["values"].clone()}));
             }
             list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
+            commit_history_change(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_delete_keyframe" => {
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let at = request["at"].as_f64().filter(|value| value.is_finite())
+                .ok_or("Keyframe time is invalid")?;
+            // Validate before opening an undo transaction, so an accidental
+            // delete click away from a marker never creates an empty undo step.
+            {
+                let clip = timeline.clips.iter().find(|clip| clip.id == id)
+                    .ok_or_else(|| format!("Clip {id} was not found"))?;
+                let list = clip.extra.get("keyframes").and_then(Value::as_array)
+                    .ok_or("Clip has no keyframes")?;
+                if !list.iter().any(|keyframe|
+                    (keyframe["time"].as_f64().unwrap_or(f64::NAN) - at).abs() < 0.001) {
+                    return Err("Keyframe could not be found".into());
+                }
+            }
+            let before = begin_history_change(backend, &timeline, false)?;
+            let clip = timeline.clips.iter_mut().find(|clip| clip.id == id)
+                .ok_or_else(|| format!("Clip {id} was not found"))?;
+            let list = clip.extra.get_mut("keyframes").and_then(Value::as_array_mut)
+                .ok_or("Clip has no keyframes")?;
+            let index = list.iter().position(|keyframe|
+                (keyframe["time"].as_f64().unwrap_or(f64::NAN) - at).abs() < 0.001)
+                .ok_or("Keyframe could not be found")?;
+            list.remove(index);
             commit_history_change(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }

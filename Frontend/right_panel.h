@@ -1403,19 +1403,25 @@ static void EffectsView(void) {
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
 
-    /* Lock the tab to the inspector's real width (tab bar width minus InspContent's 13+13 padding).
-       Without this a long unwrapped line in an open card widens the whole column. */
-    float effectsInnerW = Clay_GetElementData(CLAY_ID("InspTabs")).boundingBox.width - 26.f;
-    Clay_SizingAxis effectsW = effectsInnerW > 40.f ? (Clay_SizingAxis)FIX(effectsInnerW) : (Clay_SizingAxis)GROW;
-    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {effectsW, FIT},
-                                         .padding = {0, 12, 0, 0}, .childGap = 10},
+    /* Let the Effects page share the exact content width supplied by InspContent.
+       A second, manually calculated width used to add the inspector padding twice
+       and made the expanded empty-transition state push the whole column sideways. */
+    static int measuredFrom = -2, measuredNext = -2;
+    bool transitionContextChanged = from != measuredFrom || next != measuredNext;
+    if (transitionContextChanged) {
+        measuredFrom = from;
+        measuredNext = next;
+        gTransitionBodyMeasured = false;
+        gEffectSectionHeight[0] = next < 0 ? 96.f : 265.f;
+    }
+    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10},
                                   .clip = {.horizontal = true}}) {
         /* Transitions: a measured-height wrapper animates the content just
            like the Colors accordions, with the same 1px border and radius. */
         Clay_ElementId transId = CLAY_ID("TransHdr");
         float transOpen = EaseIO(AnimLin(transId.id, gTransOpen ? 1.f : 0.f, 0.2f));
         float transMeasured = Clay_GetElementData(CLAY_ID("TransBody")).boundingBox.height;
-        if (transMeasured > 1.f) {
+        if (!transitionContextChanged && transMeasured > 1.f) {
             gEffectSectionHeight[0] = transMeasured;
             gTransitionBodyMeasured = true;
         } else if (!gTransitionBodyMeasured) {
@@ -1940,18 +1946,27 @@ static void PlutoTextAutoUpdateFlush(void) {
         strcmp(gTimelineClips[gTimelineSelected].id, gTextAutoUpdateClipId) == 0;
     gTextAutoUpdatePending = false;
     if (sameClip && PlutoTextApply(false, true)) {
+        double now = GetTime();
         gTextAutoObservedSignature = PlutoTextStateSignature();
-        gTextAutoUpdateChangedAt = GetTime();
-        gTextAutoUpdateCommitAt = GetTime() + .65;
+        gTextAutoUpdateChangedAt = now;
+        gTextAutoUpdateLastFlushAt = now;
+        /* Consecutive updates inside one editing burst share one undo step. */
+        gTextAutoUpdateCommitAt = now + .65;
     }
 }
 
 static void PlutoTextAutoUpdateTick(void) {
-    if (gTextAutoUpdatePending && GetTime() - gTextAutoUpdateChangedAt >= .28)
+    double now = GetTime();
+    /* Throttle live PNG regeneration to ~10 updates/sec while a control is
+       actively changing. This keeps text visibly live during drags as well as
+       typing; the old quiet-period debounce waited until the user stopped. */
+    if (gTextAutoUpdatePending &&
+        (gTextAutoUpdateLastFlushAt <= 0.0 || now - gTextAutoUpdateLastFlushAt >= .10))
         PlutoTextAutoUpdateFlush();
-    if (gTimelinePropertyEditOpen && gTextAutoUpdateCommitAt > 0.0 && GetTime() >= gTextAutoUpdateCommitAt) {
+    if (gTimelinePropertyEditOpen && gTextAutoUpdateCommitAt > 0.0 && now >= gTextAutoUpdateCommitAt) {
         PlutoTimelineEndPropertyEdit();
         gTextAutoUpdateCommitAt = 0.0;
+        gTextAutoUpdateLastFlushAt = 0.0;
     }
 }
 
@@ -2039,11 +2054,17 @@ static void TextStyleToggle(const char *idName, const char *label, bool *value) 
     Bs b = Interact(id);
     if (b.clicked) *value = !*value;
     float on = Anim(id.id + 0x5a31u, *value ? 1.f : 0.f, 22.f);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {5, 7, 0, 0}, .childGap = 9, .childAlignment = AL_Y}}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {FIX(42), FIX(24)}},
-                      .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on,
-                                                  b.hover * .8f - b.press * 1.2f, 0)}}) {}
-        Tx(label, 14.5f, *value ? C_TEXT : C_DIM, 0);
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(40)}, .childAlignment = AL_C},
+              .backgroundColor = BtnBg(C_RFIELD, RGB(46, 47, 54), b),
+              .cornerRadius = CLAY_CORNER_RADIUS(10),
+              .border = {.color = Mix(C_RCARDB, RGB(83, 86, 96), b.hover * .45f),
+                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .childGap = 8, .childAlignment = AL_Y}}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {FIX(42), FIX(24)}},
+                          .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on,
+                                                      b.hover * .8f - b.press * 1.2f, 0)}}) {}
+            Tx(label, 14.5f, *value ? C_TEXT : C_DIM, 0);
+        }
     }
 }
 
@@ -2105,7 +2126,9 @@ static void TextPosGrid(void) {
 }
 
 static void TextView(void) {
-    CLAY(CLAY_ID("TextCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
+    CLAY(CLAY_ID("TextCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10,
+                                         .childAlignment = {.x = CLAY_ALIGN_X_CENTER}},
+                               .clip = {.horizontal = true}}) {
 
         /* ---- Content ---- */
         CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {

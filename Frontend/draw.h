@@ -554,6 +554,8 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
     case I_KF_NEXT: LN(.7, .2, .7, .8); LN(.28, .28, .54, .5); LN(.54, .5, .28, .72); break;
     case I_KF_DIAMOND: LN(.5, .1, .88, .5); LN(.88, .5, .5, .9); LN(.5, .9, .12, .5); LN(.12, .5, .5, .1);
                     LN(.5, .32, .68, .5); LN(.68, .5, .5, .68); LN(.5, .68, .32, .5); LN(.32, .5, .5, .32); break;
+    case I_KF_DIAMOND_MINUS: LN(.5, .1, .88, .5); LN(.88, .5, .5, .9); LN(.5, .9, .12, .5); LN(.12, .5, .5, .1);
+        LN(.29, .5, .71, .5); break;
     case I_ZOOM_OUT:Ring(P(.44, .44), .3f * w, t, c); LN(.66, .66, .9, .9); LN(.3, .44, .58, .44); break;
     case I_ZOOM_IN: Ring(P(.44, .44), .3f * w, t, c); LN(.66, .66, .9, .9); LN(.3, .44, .58, .44); LN(.44, .3, .44, .58); break;
     case I_MAGNET:  {
@@ -918,13 +920,14 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                 if (time < clip->start || time > clip->start + clip->duration) continue;
                 float x = r.x + (time - clip->start) / fmaxf(.001f, clip->duration) * r.width;
                 float y = r.y + 13.f, half = 8.f; /* 2px larger than the previous 14px diamond */
-                bool activeKey = fabsf(time - gPlayhead) < (1.f / 60.f);
+                bool activeKey = fabsf(time - gPlayhead) <= (0.5f / (float)fmaxf(1, gPreviewFps) + .001f);
                 bool selectedKey = gSelectedKeyframeClip == clipIndex && fabsf(time - gSelectedKeyframeTime) < .02f;
-                Color key = activeKey ? (Color){105, 226, 148, 255} : (Color){70, 190, 118, 255};
+                Color key = activeKey ? (Color){221, 202, 255, 255} : (Color){180, 151, 232, 255};
                 Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};
-                DrawCircleV((Vector2){x, y}, 10.5f, (Color){18, 28, 23, 235});
+                /* Keep the marker crisp: the old dark circular backing made the
+                   keyframes look like green buttons instead of timeline diamonds. */
                 DrawTriangle(a, d, b, key); DrawTriangle(c, b, d, key);
-                Color edge = selectedKey ? (Color){246, 247, 250, 255} : (Color){35, 111, 69, 255};
+                Color edge = selectedKey ? (Color){245, 236, 255, 255} : (Color){112, 82, 161, 255};
                 float edgeWidth = selectedKey ? 1.f : 1.25f;
                 DrawLineEx(a, b, edgeWidth, edge);
                 DrawLineEx(b, c, edgeWidth, edge);

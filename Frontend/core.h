@@ -56,7 +56,7 @@ enum {
     I_CHEV_UP, I_CHEV_DN, I_SEARCH, I_LIBRARY, I_UNDO, I_REDO, I_EXPORT, I_NOTE, I_PALETTE,
     I_GRADING, I_SLIDERS, I_SUN, I_DROP, I_MOUNTAIN, I_DISTORT, I_SKIP_B, I_SKIP_F, I_PLAY,
     I_PAUSE, I_LOOP, I_GRID, I_POINTER, I_HAND, I_SCISSORS, I_TEXT, I_TRASH, I_KF_PREV, I_KF_NEXT,
-    I_KF_DIAMOND, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
+    I_KF_DIAMOND, I_KF_DIAMOND_MINUS, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
     I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
     K_APP_LOGO = 99,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
@@ -213,7 +213,7 @@ static Rectangle gTextBoxDragRect;
 static Rectangle gTextBoxScreenRect;
 static bool gTextBoxScreenRectValid;
 static bool gTextAutoUpdatePending;
-static double gTextAutoUpdateChangedAt, gTextAutoUpdateCommitAt;
+static double gTextAutoUpdateChangedAt, gTextAutoUpdateCommitAt, gTextAutoUpdateLastFlushAt;
 static char gTextAutoUpdateClipId[64];
 static uint64_t gTextAutoObservedSignature;
 static char gTextAutoObservedClipId[64];

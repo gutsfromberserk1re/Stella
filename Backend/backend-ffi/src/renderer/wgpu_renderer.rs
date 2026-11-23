@@ -7,11 +7,18 @@ use super::params::LayerUniforms;
 
 const SHADER: &str = include_str!("preview.wgsl");
 
+struct SourceResources {
+    width: u32,
+    height: u32,
+    // Retain the texture alongside its view for the lifetime of any bind group.
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 struct LayerResources {
     width: u32,
     height: u32,
-    _texture: wgpu::Texture,
-    _view: wgpu::TextureView,
+    source_key: String,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
@@ -30,6 +37,10 @@ struct RendererState {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
+    // Source pixels are cached independently from clip/layer uniforms. Multiple
+    // layers can therefore share one texture upload while retaining separate
+    // transforms, opacity, keyframes and blend order.
+    sources: HashMap<String, SourceResources>,
     layers: HashMap<String, LayerResources>,
     target: Option<TargetResources>,
 }
@@ -80,7 +91,8 @@ fn state() -> Result<&'static Mutex<RendererState>, String> {
             mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest, ..Default::default()
         });
-        Ok::<_, String>(RendererState { device: Arc::new(device), queue: Arc::new(queue), pipeline, sampler, layers: HashMap::new(), target: None })
+        Ok::<_, String>(RendererState { device: Arc::new(device), queue: Arc::new(queue), pipeline, sampler,
+            sources: HashMap::new(), layers: HashMap::new(), target: None })
     })?;
     let _ = GPU.set(Mutex::new(created));
     GPU.get().ok_or_else(|| "wgpu renderer initialization failed".to_string())
@@ -88,6 +100,8 @@ fn state() -> Result<&'static Mutex<RendererState>, String> {
 
 pub struct GpuLayerFrame<'a> {
     pub key: &'a str,
+    /// Identity of the decoded source frame, shared by duplicate clip layers.
+    pub source_key: &'a str,
     pub pixels: &'a [u8],
     pub width: u32,
     pub height: u32,
@@ -127,41 +141,88 @@ impl GpuPreviewRenderer {
 
         for layer in layers {
             let uniforms = layer.uniforms.with_sizes(layer.width, layer.height, tw, th);
-            let recreate = renderer.layers.get(layer.key).is_none_or(|resource| resource.width != layer.width || resource.height != layer.height);
-            if recreate {
+
+            // A source-frame texture is uploaded once, regardless of how many
+            // timeline clips reference it. New frames get new bounded cache
+            // entries; an existing key is already populated with the same RGBA.
+            if !renderer.sources.contains_key(layer.source_key) {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Stella persistent source texture"), size: wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
+                    label: Some("Stella shared preview source texture"),
+                    size: wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
                     mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
                 });
+                queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    layer.pixels,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(layer.width * 4), rows_per_image: Some(layer.height) },
+                    wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
+                );
                 let view = texture.create_view(&Default::default());
-                let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Stella persistent layer uniforms"), contents: bytemuck::bytes_of(&uniforms),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                renderer.sources.insert(layer.source_key.to_owned(), SourceResources {
+                    width: layer.width, height: layer.height, _texture: texture, view,
                 });
+            }
+
+            let recreate_layer = renderer.layers.get(layer.key).is_none_or(|resource|
+                resource.width != layer.width || resource.height != layer.height || resource.source_key != layer.source_key);
+            if recreate_layer {
+                // Preserve the layer's uniform buffer when only its source frame
+                // changes; rebuild only the bind group to point at the shared
+                // source texture for this frame.
+                let uniform_buffer = renderer.layers.remove(layer.key)
+                    .map(|resource| resource.uniform_buffer)
+                    .unwrap_or_else(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Stella persistent layer uniforms"),
+                        contents: bytemuck::bytes_of(&uniforms),
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    }));
+                let source = renderer.sources.get(layer.source_key).expect("shared source texture was inserted");
+                debug_assert_eq!(source.width, layer.width);
+                debug_assert_eq!(source.height, layer.height);
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Stella persistent layer bind group"), layout: &renderer.pipeline.get_bind_group_layout(0),
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source.view) },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&renderer.sampler) },
                         wgpu::BindGroupEntry { binding: 2, resource: uniform_buffer.as_entire_binding() },
                     ],
                 });
                 renderer.layers.insert(layer.key.to_owned(), LayerResources {
-                    width: layer.width, height: layer.height, _texture: texture, _view: view, uniform_buffer, bind_group,
+                    width: layer.width, height: layer.height, source_key: layer.source_key.to_owned(),
+                    uniform_buffer, bind_group,
                 });
             }
-            let resource = renderer.layers.get(layer.key).expect("layer resource was just created");
-            queue.write_texture(wgpu::ImageCopyTexture { texture: &resource._texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                layer.pixels, wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(layer.width * 4), rows_per_image: Some(layer.height) },
-                wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 });
-            queue.write_buffer(&resource.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            if let Some(resource) = renderer.layers.get(layer.key) {
+                queue.write_buffer(&resource.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            }
         }
-        // Keep the cache bounded when many clips have been visited in a project.
-        if renderer.layers.len() > 32 {
-            let active: std::collections::HashSet<&str> = layers.iter().map(|layer| layer.key).collect();
-            let stale: Vec<String> = renderer.layers.keys().filter(|key| !active.contains(key.as_str())).take(renderer.layers.len() - 24).cloned().collect();
+
+        // Keep only a modest working set of source textures in memory. Never
+        // evict a frame used by this composite; prune matching stale layer
+        // bindings too, so a later re-use cannot accidentally sample an old view.
+        {
+            let active_sources: std::collections::HashSet<&str> = layers.iter().map(|layer| layer.source_key).collect();
+            // Retain only four previous preview frames beyond the currently
+            // active sources; a fixed 24-frame cache could consume hundreds of
+            // MiB at 1080p, especially with many simultaneous video layers.
+            let keep_sources = active_sources.len() + 4;
+            let stale: Vec<String> = renderer.sources.keys()
+                .filter(|key| !active_sources.contains(key.as_str()))
+                .take(renderer.sources.len().saturating_sub(keep_sources)).cloned().collect();
+            for key in stale {
+                renderer.sources.remove(&key);
+                renderer.layers.retain(|_, layer| layer.source_key != key);
+            }
+        }
+        {
+            let active_layers: std::collections::HashSet<&str> = layers.iter().map(|layer| layer.key).collect();
+            let keep_layers = active_layers.len() + 8;
+            let stale: Vec<String> = renderer.layers.keys()
+                .filter(|key| !active_layers.contains(key.as_str()))
+                .take(renderer.layers.len().saturating_sub(keep_layers)).cloned().collect();
             for key in stale { renderer.layers.remove(&key); }
         }
 
