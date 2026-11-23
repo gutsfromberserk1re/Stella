@@ -489,7 +489,9 @@ mod tests {
             &props, 0.0, &keyframes, Some(("wipeleft", 0.35))
         );
         assert!((u.opacity() - 0.60).abs() < 1e-5);
-        assert_eq!(u.transition, [-1.0, 0.0, 0.35, 2.0]);
+        // `wipeleft` reveals from left to right (positive X); `wiperight`
+        // uses the opposite axis and is covered by the transition mapping test below.
+        assert_eq!(u.transition, [1.0, 0.0, 0.35, 2.0]);
     }
 
     #[test]

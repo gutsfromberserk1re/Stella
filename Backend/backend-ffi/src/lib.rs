@@ -228,8 +228,6 @@ fn decode_ahead_loop(
         })).is_err() {
             return;
         }
-        prefetched_from_previous = 0;
-
         let mut prefetched = 0usize;
         'prefetch: for step in 1..=PREFETCH_FRAMES {
             if !task.prefetch { break; }
@@ -1532,18 +1530,13 @@ fn dispatch(request: Value) -> Result<Value, String> {
                 .ok_or_else(|| format!("Clip {id} was not found"))?;
             let keyframes = clip.extra.entry("keyframes".into()).or_insert_with(|| json!([]));
             let list = keyframes.as_array_mut().ok_or("Clip keyframes are invalid")?;
-            let mut changed = false;
             if let Some(existing) = list.iter_mut().find(|keyframe| (keyframe["time"].as_f64().unwrap_or(-1.0) - at).abs() < 0.0001) {
                 existing["values"] = request["values"].clone();
-                changed = true;
             } else {
                 list.push(json!({"time": at, "values": request["values"].clone()}));
-                changed = true;
             }
-            if changed {
-                list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
-                commit_history_change(backend, before)?;
-            }
+            list.sort_by(|a, b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
+            commit_history_change(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
         "timeline_move_keyframe" => {
