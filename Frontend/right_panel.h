@@ -1211,7 +1211,7 @@ static void ExtraFxRow(int i) {
     float squash = Clampf(Spring(id.id + 7u, down ? 1.f : 0.f, 700.f, 26.f), 0.f, 1.2f);
     int inset = (int)roundf(squash * 4.f);
     int verticalInset = (int)roundf(squash * 1.5f);
-    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}) {
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}}) {
         CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
                   .backgroundColor = Mix(Mix(C_RCARD, RGB(33, 34, 38), openAnim), Mix(RGB(36, 37, 43), RGB(40, 41, 47), openAnim), b.hover),
                   .cornerRadius = CLAY_CORNER_RADIUS(18),
@@ -1247,7 +1247,7 @@ static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon,
     float squash = Clampf(Spring(id.id + 7u, down ? 1.f : 0.f, 700.f, 26.f), 0.f, 1.2f);
     int inset = (int)roundf(squash * 4.f);
     int verticalInset = (int)roundf(squash * 1.5f);
-    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}) {
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}}) {
         CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
                   .backgroundColor = Mix(Mix(C_RCARD, RGB(33, 34, 38), openAnim), Mix(RGB(36, 37, 43), RGB(40, 41, 47), openAnim), b.hover),
                   .cornerRadius = CLAY_CORNER_RADIUS(18),
