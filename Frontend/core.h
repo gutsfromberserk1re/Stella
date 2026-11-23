@@ -240,7 +240,6 @@ static Vector2 gWh[3], gWhT[3]; static bool gWhDrag[3], gWhResetPending[3]; /* w
 static int   gHsl = 0;                                /* selected HSL chip */
 static bool  gTransOpen = false;                      /* effects: transitions card (collapsed on launch) */
 static int   gFilter = 0;                             /* effects: selected preset */
-static int   gFilterCategory = 0;
 static float gFilterIntensity = 1.f, gFilterIntensitySent = 1.f;
 static bool  gFilterIntensityDrag;
 static uint32_t gDragId;                              /* active drag target (slider/ruler) */

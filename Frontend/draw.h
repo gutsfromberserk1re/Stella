@@ -815,7 +815,22 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         /* Render the waveform before the fade overlay: drawing it afterwards
            used to hide the fade completely. Keep the video/audio split crisp. */
         if (wave.id && hasAudio && audioBand.width > 0.f && audioBand.height > 0.f) {
-            DrawTexturePro(wave, (Rectangle){0, 0, (float)wave.width, (float)wave.height}, audioBand,
+            /* Waveform pixels represent the full source file. A timeline trim
+               changes sourceOffset + duration, so crop the source rectangle to
+               that exact range instead of stretching the full waveform into
+               the shorter on-timeline clip. */
+            float sourceDuration = clip && clip->sourceDuration > 0.001f
+                ? clip->sourceDuration
+                : (clip ? clip->sourceOffset + clip->duration : 0.f);
+            float sourceStart = sourceDuration > 0.001f && clip
+                ? fmaxf(0.f, fminf(1.f, clip->sourceOffset / sourceDuration)) : 0.f;
+            float sourceEnd = sourceDuration > 0.001f && clip
+                ? fmaxf(sourceStart, fminf(1.f, (clip->sourceOffset + clip->duration) / sourceDuration)) : 1.f;
+            float sourceWidth = fmaxf(1.f, (sourceEnd - sourceStart) * (float)wave.width);
+            Rectangle waveformSource = {sourceStart * (float)wave.width, 0.f,
+                                         fminf(sourceWidth, (float)wave.width - sourceStart * (float)wave.width),
+                                         (float)wave.height};
+            DrawTexturePro(wave, waveformSource, audioBand,
                            (Vector2){0, 0}, 0.f, (Color){255, 255, 255, 255});
         }
         if (!audioOnly && hasAudio && audioBand.height > 0.f) {

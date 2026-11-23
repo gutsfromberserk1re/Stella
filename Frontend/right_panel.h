@@ -76,7 +76,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         {"props.colors.detail.sharpness", "props.colors.detail.clarity", "props.colors.detail.vignette"}
     };
     static const char *wheelNames[3] = {"shadows", "tint", "highlights"};
-    static const char *presetNames[12] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro", "teal_orange", "sepia", "bleach", "pastel"};
+    static const char *presetNames[6] = {"none", "vivid", "noir", "fade", "warm", "cool"};
     static const char *effectNames[4] = {"chromatic", "glow", "glitch", "pixelate"};
     static const char *audioPaths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
 
@@ -156,7 +156,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     char preset[32] = {0};
     gFilter = 0;
     if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.preset.id", preset, sizeof(preset)))
-        for (int i = 0; i < 12; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
+        for (int i = 0; i < 6; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
     gFilterIntensity = gFilterIntensitySent = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.effects.preset.intensity", 100.f) / 100.f, 0.f, 1.f);
     strcpy(gTransitionType, "none");
     gTransitionDuration = PlutoReadNumber(clipBegin, clipEnd, "props.transitionOut.duration", 1.f);
@@ -1014,44 +1014,16 @@ static void ColorsView(void) {
 
 /* ---------------- effects tab ---------------- */
 typedef struct { Clay_Color a, b, sun; } FilterP;
-static const FilterP kFilters[12] = {
+static const FilterP kFilters[6] = {
     {{236,110,96,255},  {84,66,208,255},  {250,226,140,255}},
     {{255,150,40,255},  {70,88,232,255},  {255,222,120,255}},
     {{158,158,164,255}, {38,38,44,255},   {240,240,244,255}},
     {{232,160,136,255}, {120,98,192,255}, {250,226,150,255}},
     {{60,176,204,255},  {38,48,124,255},  {250,236,170,255}},
     {{128,196,112,255}, {28,86,80,255},   {250,236,160,255}},
-    {{204,80,164,255},  {58,30,112,255},  {252,214,150,255}},
-    {{242,204,100,255}, {156,66,52,255},  {255,244,200,255}},
-    {{42,116,130,255},  {190,105,58,255}, {255,204,132,255}},
-    {{154,105,65,255},  {75,47,34,255},   {244,190,113,255}},
-    {{175,188,196,255}, {49,57,69,255},   {245,232,207,255}},
-    {{220,170,194,255}, {120,164,196,255},{255,226,205,255}},
 };
-static const char *kFilterNames[12] = {"Original", "Vivid", "Noir", "Fade", "Warm", "Cool", "Cinema", "Retro", "Teal & Orange", "Sepia", "Bleach Bypass", "Pastel"};
-static const char *kFilterIds[12] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro", "teal_orange", "sepia", "bleach", "pastel"};
-
-static bool FilterVisibleInCategory(int preset) {
-    switch (gFilterCategory) {
-    case 1: return preset == 1 || preset == 4 || preset == 5 || preset == 8 || preset == 11; /* Color */
-    case 2: return preset == 3 || preset == 6 || preset == 7 || preset == 9 || preset == 10; /* Film */
-    case 3: return preset == 2;                                    /* Mono */
-    default: return true;
-    }
-}
-
-static void FilterCategoryButton(int index, const char *label) {
-    Clay_ElementId id = CLAY_IDI("FilterCategory", index);
-    Bs b = Interact(id);
-    if (b.clicked) gFilterCategory = index;
-    bool selected = gFilterCategory == index;
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(32)}, .padding = {11, 9, 0, 0}, .childAlignment = AL_C},
-              .backgroundColor = selected ? RGB(43,45,52) : BtnBg(C_RCARD, RGB(38,40,46), b),
-              .cornerRadius = CLAY_CORNER_RADIUS(16),
-              .border = {.color = Mix(C_RCARDB, RGB(91,94,103), selected ? .9f : b.hover * .48f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        Tx(label, 13, selected ? C_TEXT : C_MUTED, 0);
-    }
-}
+static const char *kFilterNames[6] = {"Original", "Vivid", "Noir", "Fade", "Warm", "Cool"};
+static const char *kFilterIds[6] = {"none", "vivid", "noir", "fade", "warm", "cool"};
 
 static void FilterThumb(int i) {
     Clay_ElementId id = CLAY_IDI("Flt", i);
@@ -1069,8 +1041,6 @@ static void FilterThumb(int i) {
 }
 
 /* ---- video effects (accordion: one effect open at a time) ---- */
-#define FX_ITEM_H 48.f
-#define FX_BODY_H 171.f   /* accounts for padded fixed rows, sliders, and both parameter gaps */
 typedef struct { const char *name; const char *p1, *p2; bool angle; } FxDef;
 static const FxDef kFx[4] = {
     {"Chromatic aberration", "Amount",    "Angle", true},
@@ -1141,9 +1111,9 @@ static void FxParam(int i, int p, const char *label) {
 }
 
 static void FxBody(int i) {
-    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 8, 8, 8}, .childGap = 8},
-                                 .backgroundColor = C_RFIELD, .cornerRadius = CLAY_CORNER_RADIUS(14),
-                                 .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+    CLAY(CLAY_IDI("FxBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 12, 12, 12}, .childGap = 9},
+                                 .backgroundColor = C_RCARD}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
             Clay_ElementId swid = CLAY_IDI("FxSw", i);
             Bs sb = Interact(swid);
@@ -1187,7 +1157,7 @@ static void FxBody(int i) {
     }
 }
 
-static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool prominent, bool connected);
+static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected);
 
 static void ExtraFxRow(int i) {
     Clay_ElementId id = CLAY_IDI("FxExtra", i);
@@ -1235,44 +1205,44 @@ static void ExtraFxRow(int i) {
 /* Effect rows use the same 48px accordion card as the Colors panel. */
 static bool FxHeader(int i, float open) {
     Clay_ElementId id = CLAY_IDI("FxHdr", i);
-    return EffectsSectionHeader(id, kFx[i].name, I_SPARKLE, open > 0.5f, gFxOn[i], false, false);
+    return EffectsSectionHeader(id, kFx[i].name, I_SPARKLE, open > 0.5f, gFxOn[i], true);
 }
 
-#define TRANS_DESC_H 252.f
-#define TRANS_EMPTY_H 46.f
-static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool prominent, bool connected) {
+static float gEffectSectionHeight[3] = {96.f, 286.f, 1005.f};
+static float gFxBodyHeight[4] = {180.f, 180.f, 180.f, 180.f};
+static bool gTransitionBodyMeasured;
+
+static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected) {
     Bs b = Interact(id);
-    float openAnim = EaseIO(AnimLin(id.id, open ? 1.f : 0.f, 0.2f));
+    float openAnim = EaseIO(AnimLin(id.id + 0x173u, open ? 1.f : 0.f, 0.2f));
     bool down = Clay_PointerOver(id) && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     float squash = Clampf(Spring(id.id + 7u, down ? 1.f : 0.f, 700.f, 26.f), 0.f, 1.2f);
     int inset = (int)roundf(squash * 4.f);
     int verticalInset = (int)roundf(squash * 1.5f);
-    /* Top-level Effects groups need a clearer surface than the nested effect
-       rows. A connected header delegates its outline to the enclosing card,
-       so the Transitions header and its controls read as one accordion. */
-    Clay_Color base = prominent ? RGB(30, 31, 35) : C_RCARD;
-    Clay_Color hoverBase = prominent ? RGB(42, 44, 50) : RGB(40, 41, 47);
-    Clay_Color borderBase = prominent ? RGB(58, 61, 69) : C_RCARDB;
-    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {connected ? 0 : inset, connected ? 0 : inset,
-                                                                       connected ? 0 : verticalInset, connected ? 0 : verticalInset}}}) {
+    Clay_Color base = C_RCARD;
+    Clay_Color hoverBase = RGB(40, 41, 47);
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)},
+                              .padding = {connected ? 0 : inset, connected ? 0 : inset,
+                                          connected ? 0 : verticalInset, connected ? 0 : verticalInset}}}) {
         CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
-                  .backgroundColor = Mix(Mix(base, prominent ? RGB(36, 38, 43) : RGB(33, 34, 38), openAnim), hoverBase, b.hover),
+                  .backgroundColor = Mix(Mix(base, RGB(33, 34, 38), openAnim), hoverBase, b.hover * 0.55f),
                   .cornerRadius = connected ? CLAY_CORNER_RADIUS(0) : CLAY_CORNER_RADIUS(18),
                   .border = {.color = connected ? RGBA(0, 0, 0, 0) :
-                                  Mix(Mix(borderBase, prominent ? RGB(78, 82, 92) : RGB(62, 64, 72), openAnim),
-                                      prominent ? RGB(104, 109, 120) : RGB(84, 87, 96), b.hover * 0.7f),
-                             .width = CLAY_BORDER_OUTSIDE(connected ? 0 : prominent ? 2 : 1)}}) {
+                                  Mix(C_RCARDB, RGB(62, 64, 72), b.hover * 0.48f),
+                             .width = CLAY_BORDER_OUTSIDE(connected ? 0 : 1)}}) {
             Icon(icon, 22, C_ICON);
             Tx(title, 18, C_TEXT, 0);
             HSPACE
             if (modified) {
-                CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = C_TEXT, .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+                CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = C_TEXT,
+                              .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
                 GAPX(2)
             }
-            CLAY_AUTO_ID({.layout = {.sizing = {FIX(20), FIX(20)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(10),
-                          .backgroundColor = prominent ? RGB(38, 40, 46) : RGBA(0, 0, 0, 0),
-                          .border = {.color = Mix(RGB(82, 85, 94), RGB(145, 150, 160), b.hover),
-                                     .width = CLAY_BORDER_OUTSIDE(prominent ? 1.25f : 1)}}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {FIX(20), FIX(20)}, .childAlignment = AL_C},
+                          .cornerRadius = CLAY_CORNER_RADIUS(10),
+                          .backgroundColor = RGBA(0, 0, 0, 0),
+                          .border = {.color = Mix(RGB(74, 77, 85), RGB(112, 116, 125), b.hover * 0.55f),
+                                     .width = CLAY_BORDER_OUTSIDE(1)}}) {
                 IconV(I_PLUS, 11, C_DIM, 1.f - openAnim);
             }
         }
@@ -1340,132 +1310,182 @@ static void EffectsView(void) {
     int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
     int next = TransitionNextClip(from);
 
-    /* One width-constrained column keeps expanded sections within the
-       inspector viewport and prevents horizontal spill into the right edge. */
-    /* Leave a small gutter on the scrollbar side: the inspector scrollbar is
-       overlaid inside the viewport, so full-width cards otherwise sit under it. */
-    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {0, 12, 0, 0}, .childGap = 10}, .clip = {.horizontal = true}}) {
-    bool transitionModified = strcmp(gTransitionType, "none") != 0;
-    CLAY(CLAY_ID("TransCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 0},
-                                  .backgroundColor = RGB(27, 28, 32), .cornerRadius = CLAY_CORNER_RADIUS(18),
-                                  .border = {.color = RGB(65, 68, 77), .width = CLAY_BORDER_OUTSIDE(2)},
+    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT},
+                                         .padding = {0, 12, 0, 0}, .childGap = 10},
                                   .clip = {.horizontal = true}}) {
-        if (EffectsSectionHeader(CLAY_ID("TransHdr"), "Transitions", I_BOWTIE, gTransOpen, transitionModified, true, true)) gTransOpen = !gTransOpen;
-        if (gTransOpen) {
-            CLAY(CLAY_ID("TransDesc"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 14, 0, 12}, .childGap = 8},
-                                         .backgroundColor = RGB(27, 28, 32), .clip = {.horizontal = true}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = RGB(56, 59, 67)}) {}
-                if (next < 0) {
-                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
-                        TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+        /* Transitions: a measured-height wrapper animates the content just
+           like the Colors accordions, with the same 1px border and radius. */
+        Clay_ElementId transId = CLAY_ID("TransHdr");
+        float transOpen = EaseIO(AnimLin(transId.id, gTransOpen ? 1.f : 0.f, 0.2f));
+        float transMeasured = Clay_GetElementData(CLAY_ID("TransBody")).boundingBox.height;
+        if (transMeasured > 1.f) {
+            gEffectSectionHeight[0] = transMeasured;
+            gTransitionBodyMeasured = true;
+        } else if (!gTransitionBodyMeasured) {
+            gEffectSectionHeight[0] = next < 0 ? 96.f : 265.f;
+        }
+        float transWrapHeight = roundf(transOpen * (gEffectSectionHeight[0] + 10.f));
+        bool transitionModified = strcmp(gTransitionType, "none") != 0;
+        if (EffectsSectionHeader(transId, "Transitions", I_BOWTIE, gTransOpen,
+                                 transitionModified, false)) gTransOpen = !gTransOpen;
+        if (transWrapHeight >= 1.f) {
+            CLAY(CLAY_ID("TransWrap"), {.layout = {COLM, .sizing = {GROW, FIX(transWrapHeight)}},
+                                        .clip = {.horizontal = true, .vertical = true}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY(CLAY_ID("TransBody"), {.layout = {COLM, .sizing = {GROW, FIT},
+                                                  .padding = {14, 14, 12, 12}, .childGap = 8}, RCARD,
+                                             .clip = {.horizontal = true}}) {
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
+                    if (next < 0) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                            TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+                        }
+                    } else {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
+                            TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                        }
+                        const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
+                        const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
+                        for (int row = 0; row < 3; row++) {
+                            CLAY(CLAY_IDI("TransitionChoiceRow", row),
+                                 {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5},
+                                  .clip = {.horizontal = true}}) {
+                                for (int col = 0; col < 2; col++) {
+                                    int i = row * 2 + col;
+                                    Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
+                                    Bs cb = Interact(cid);
+                                    bool selected = strcmp(gTransitionType, keys[i]) == 0;
+                                    if (cb.clicked) { strcpy(gTransitionType, keys[i]); CommitTransition(); }
+                                    CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .padding = {6, 6, 0, 0},
+                                                          .childAlignment = AL_C},
+                                              .backgroundColor = BtnBg(selected ? C_SEL : C_CARD,
+                                                                        RGB(43, 45, 52), cb),
+                                              .cornerRadius = CLAY_CORNER_RADIUS(10),
+                                              .border = {.color = Mix(C_CARDB, RGB(80, 83, 91),
+                                                                      selected ? .60f : cb.hover * .32f),
+                                                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                                        TxWrap(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
+                                    }
+                                }
+                            }
+                        }
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
+                            Tx("Duration", 13, C_MUTED, 0); HSPACE;
+                            float durationValue = gTransitionDuration;
+                            if (ValBoxEditable(CLAY_ID("TransitionDurationValue"), &durationValue,
+                                               "s", 72, 22, 13, 11, 10, .1f, 2.f, 1)) {
+                                gTransitionDuration = durationValue;
+                                CommitTransition();
+                            }
+                        }
+                        Clay_ElementId did = CLAY_ID("TransitionDuration");
+                        static bool durationDrag;
+                        if (Clay_PointerOver(did) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) durationDrag = true;
+                        if (durationDrag && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                            Clay_BoundingBox bb = Clay_GetElementData(did).boundingBox;
+                            if (bb.width > 1.f)
+                                gTransitionDuration = .1f + 1.9f * Clampf((GetMousePosition().x - bb.x) / bb.width, 0.f, 1.f);
+                        }
+                        if (durationDrag && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                            durationDrag = false;
+                            CommitTransition();
+                        }
+                        CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
+                                   .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160),
+                                                               C_CARD, (gTransitionDuration - .1f) / 1.9f,
+                                                               durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
                     }
-                } else {
-                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
-                        TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                }
+            }
+        }
+
+        /* Filters: six practical presets, no category pills or hidden rows. */
+        Clay_ElementId filtersId = CLAY_ID("FiltersHdr");
+        float filtersOpen = EaseIO(AnimLin(filtersId.id, gFiltOpen ? 1.f : 0.f, 0.2f));
+        float filtersMeasured = Clay_GetElementData(CLAY_ID("FiltBody")).boundingBox.height;
+        if (filtersMeasured > 1.f) gEffectSectionHeight[1] = filtersMeasured;
+        float filtersWrapHeight = roundf(filtersOpen * (gEffectSectionHeight[1] + 10.f));
+        if (EffectsSectionHeader(filtersId, "Filters", I_SPARKLE, gFiltOpen,
+                                 gFilter != 0, false)) gFiltOpen = !gFiltOpen;
+        if (filtersWrapHeight >= 1.f) {
+            CLAY(CLAY_ID("FiltersWrap"), {.layout = {COLM, .sizing = {GROW, FIX(filtersWrapHeight)}},
+                                          .clip = {.horizontal = true, .vertical = true}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, FIT},
+                                                 .padding = {12, 12, 10, 10}, .childGap = 10}, RCARD,
+                                           .clip = {.horizontal = true}}) {
+                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
+                        Tx("Looks", 14, C_TEXT, 0);
+                        HSPACE
+                        Clay_ElementId rid = CLAY_ID("FiltersReset");
+                        Bs rb = Interact(rid);
+                        Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
+                        CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
+                            ResetIcon(rid, I_RESET, 14, rc, rb.clicked);
+                            Tx("Reset", 13, rc, 0);
+                        }
+                        if (rb.clicked) {
+                            gFilter = 0;
+                            gFilterIntensity = gFilterIntensitySent = 1.f;
+                            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
+                        }
                     }
-                    const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
-                    const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
-                    for (int row = 0; row < 3; row++) {
-                        CLAY(CLAY_IDI("TransitionChoiceRow", row), {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5}, .clip = {.horizontal = true}}) {
-                            for (int col = 0; col < 2; col++) {
-                                int i = row * 2 + col;
-                                Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
-                                Bs cb = Interact(cid);
-                                bool selected = strcmp(gTransitionType, keys[i]) == 0;
-                                if (cb.clicked) { strcpy(gTransitionType, keys[i]); CommitTransition(); }
-                                CLAY(cid, {.layout = {.sizing = {GROW, GROW}, .padding = {6, 6, 0, 0}, .childAlignment = AL_C},
-                                          .backgroundColor = BtnBg(selected ? C_SEL : C_CARD, RGB(43, 45, 52), cb),
-                                          .cornerRadius = CLAY_CORNER_RADIUS(10),
-                                          .border = {.color = Mix(C_CARDB, RGB(80, 83, 91), selected ? .72f : cb.hover * .38f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                                    TxWrap(names[i], 13, selected ? C_TEXT : C_MUTED, 0);
+                    for (int row = 0; row < 2; row++) {
+                        CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIX(78)}, .childGap = 8}}) {
+                            for (int col = 0; col < 3; col++) FilterThumb(row * 3 + col);
+                        }
+                    }
+                    FilterIntensityControl();
+                }
+            }
+        }
+
+        /* Video Effects: section expansion and each individual effect use
+           measured-height animation. Every effect's header and controls share
+           one bordered card so the expanded rows stay visually connected. */
+        bool anyVideoEffect = false;
+        for (int i = 0; i < 4; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
+        for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
+        Clay_ElementId vfxId = CLAY_ID("VfxHdr");
+        float vfxOpen = EaseIO(AnimLin(vfxId.id, gVfxOpen ? 1.f : 0.f, 0.2f));
+        float vfxMeasured = Clay_GetElementData(CLAY_ID("VfxBody")).boundingBox.height;
+        if (vfxMeasured > 1.f) gEffectSectionHeight[2] = vfxMeasured;
+        float vfxWrapHeight = roundf(vfxOpen * (gEffectSectionHeight[2] + 10.f));
+        if (EffectsSectionHeader(vfxId, "Video Effects", I_FILM, gVfxOpen,
+                                 anyVideoEffect, false)) gVfxOpen = !gVfxOpen;
+        if (vfxWrapHeight >= 1.f) {
+            CLAY(CLAY_ID("VfxWrap"), {.layout = {COLM, .sizing = {GROW, FIX(vfxWrapHeight)}},
+                                      .clip = {.horizontal = true, .vertical = true}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
+                CLAY(CLAY_ID("VfxBody"), {.layout = {COLM, .sizing = {GROW, FIT},
+                                               .padding = {10, 10, 10, 10}, .childGap = 8}, RCARD,
+                                          .clip = {.horizontal = true}}) {
+                    for (int i = 0; i < 4; i++) {
+                        Clay_ElementId fxId = CLAY_IDI("FxHdr", i);
+                        float fxOpen = EaseIO(AnimLin(fxId.id, gFxOpen == i ? 1.f : 0.f, 0.2f));
+                        float fxMeasured = Clay_GetElementData(CLAY_IDI("FxBody", i)).boundingBox.height;
+                        if (fxMeasured > 1.f) gFxBodyHeight[i] = fxMeasured;
+                        float fxWrapHeight = roundf(fxOpen * gFxBodyHeight[i]);
+                        CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 0},
+                                                       .backgroundColor = C_RCARD,
+                                                       .cornerRadius = CLAY_CORNER_RADIUS(18),
+                                                       .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)},
+                                                       .clip = {.horizontal = true, .vertical = true}}) {
+                            if (FxHeader(i, gFxOpen == i ? 1.f : 0.f))
+                                gFxOpen = (gFxOpen == i) ? -1 : i;
+                            if (fxWrapHeight >= 1.f) {
+                                CLAY(CLAY_IDI("FxBodyWrap", i),
+                                     {.layout = {COLM, .sizing = {GROW, FIX(fxWrapHeight)}},
+                                      .clip = {.horizontal = true, .vertical = true}}) {
+                                    FxBody(i);
                                 }
                             }
                         }
                     }
-                    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
-                        Tx("Duration", 13, C_MUTED, 0); HSPACE;
-                        float durationValue = gTransitionDuration;
-                        if (ValBoxEditable(CLAY_ID("TransitionDurationValue"), &durationValue, "s", 72, 22, 13, 11, 10, .1f, 2.f, 1)) {
-                            gTransitionDuration = durationValue;
-                            CommitTransition();
-                        }
-                    }
-                    Clay_ElementId did = CLAY_ID("TransitionDuration");
-                    static bool durationDrag;
-                    if (Clay_PointerOver(did) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) durationDrag = true;
-                    if (durationDrag && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                        Clay_BoundingBox bb = Clay_GetElementData(did).boundingBox;
-                        if (bb.width > 1.f) gTransitionDuration = .1f + 1.9f * Clampf((GetMousePosition().x - bb.x) / bb.width, 0.f, 1.f);
-                    }
-                    if (durationDrag && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { durationDrag = false; CommitTransition(); }
-                    CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
-                               .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, (gTransitionDuration - .1f) / 1.9f, durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
+                    for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
                 }
             }
         }
-    }
-
-    CLAY(CLAY_ID("FiltersCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-        if (EffectsSectionHeader(CLAY_ID("FiltersHdr"), "Filters", I_SPARKLE, gFiltOpen, gFilter != 0, true, false)) gFiltOpen = !gFiltOpen;
-        if (gFiltOpen) {
-            CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {12, 12, 10, 10}, .childGap = 10},
-                                        .backgroundColor = C_RCARD, .cornerRadius = CLAY_CORNER_RADIUS(18),
-                                        .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)},
-                                        .clip = {.horizontal = true}}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
-                    Tx("Looks", 14, C_TEXT, 0);
-                    HSPACE
-                    Clay_ElementId rid = CLAY_ID("FiltersReset");
-                    Bs rb = Interact(rid);
-                    Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
-                    CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
-                        ResetIcon(rid, I_RESET, 14, rc, rb.clicked);
-                        Tx("Reset", 13, rc, 0);
-                    }
-                    if (rb.clicked) {
-                        gFilter = 0;
-                        gFilterIntensity = gFilterIntensitySent = 1.f;
-                        PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.preset.id\",\"value\":\"none\"},{\"path\":\"props.effects.preset.intensity\",\"value\":100}]");
-                    }
-                }
-                CLAY(CLAY_ID("FilterCategories"), {.layout = {.sizing = {GROW, FIX(32)}, .childGap = 6}}) {
-                    FilterCategoryButton(0, "All");
-                    FilterCategoryButton(1, "Color");
-                    FilterCategoryButton(2, "Film");
-                    FilterCategoryButton(3, "Mono");
-                }
-                int visible[12], visibleCount = 0;
-                for (int i = 0; i < 12; i++) if (FilterVisibleInCategory(i)) visible[visibleCount++] = i;
-                for (int row = 0; row < (visibleCount + 2) / 3; row++) {
-                    CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIX(78)}, .childGap = 8}}) {
-                        for (int col = 0; col < 3; col++) {
-                            int item = row * 3 + col;
-                            if (item < visibleCount) FilterThumb(visible[item]);
-                        }
-                    }
-                }
-                FilterIntensityControl();
-            }
-        }
-    }
-
-    CLAY(CLAY_ID("VfxCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-        bool anyVideoEffect = false;
-        for (int i = 0; i < 4; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
-        for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
-        if (EffectsSectionHeader(CLAY_ID("VfxHdr"), "Video Effects", I_FILM, gVfxOpen, anyVideoEffect, true, false)) gVfxOpen = !gVfxOpen;
-        if (gVfxOpen) {
-            CLAY(CLAY_ID("VfxList"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-                for (int i = 0; i < 4; i++) {
-                    CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}, .clip = {.horizontal = true}}) {
-                        if (FxHeader(i, gFxOpen == i ? 1.f : 0.f)) gFxOpen = (gFxOpen == i) ? -1 : i;
-                        if (gFxOpen == i) FxBody(i);
-                    }
-                }
-                for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
-            }
-        }
-    }
     }
 }
 

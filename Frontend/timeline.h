@@ -6,6 +6,9 @@ static float TimelinePps(void) { return 21.5f * gTimelineZoom; }
 static float gTimelineLaneHeight = 56.f;
 
 static bool TimelineTrackIsVideo(int track) { return track >= 0 && track < 4; }
+static int TimelineTrackUnderPointer(void);
+static float gTimelineLastRevealY = -1.f;
+static bool gTimelineWasDraggingVideo;
 
 static bool TimelineVideoTrackIsVisible(int track) {
     for (int i = 0; i < gTimelineVideoTracks; i++)
@@ -15,6 +18,9 @@ static bool TimelineVideoTrackIsVisible(int track) {
 
 static void TimelineAddVisibleVideoTrack(int track) {
     if (track < 0 || track >= 4 || TimelineVideoTrackIsVisible(track) || gTimelineVideoTracks >= 4) return;
+    /* Higher-numbered video layers sit above V1. Keeping the list in
+       descending order also means a newly revealed layer is inserted at the
+       top, exactly where an upward drag expects the next lane to appear. */
     int insert = gTimelineVideoTracks;
     while (insert > 0 && gTimelineVideoTrackIds[insert - 1] < track) {
         gTimelineVideoTrackIds[insert] = gTimelineVideoTrackIds[insert - 1];
@@ -25,13 +31,81 @@ static void TimelineAddVisibleVideoTrack(int track) {
 }
 
 static void TimelineRebuildVisibleVideoTracks(void) {
-    /* Keep all four video lanes mounted in the timeline, even when empty.
-       Editors conventionally expose V1–V4 as a stable stack; collapsing
-       unused lanes made a clip on V4 look as though V2 and V3 did not exist
-       and caused the visible row layout to change as clips were moved. */
+    /* V1 is the permanent base lane. Higher video lanes only occupy space
+       while they contain media or are temporarily exposed during a drag. */
     gTimelineVideoTracks = 0;
-    for (int track = 3; track >= 0; track--)
-        TimelineAddVisibleVideoTrack(track);
+    TimelineAddVisibleVideoTrack(0);
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        int track = gTimelineClips[i].track;
+        if (TimelineTrackIsVideo(track)) TimelineAddVisibleVideoTrack(track);
+    }
+    if (gTimelinePendingVideoTrack >= 1)
+        for (int track = 1; track <= gTimelinePendingVideoTrack; track++)
+            TimelineAddVisibleVideoTrack(track);
+}
+
+static void TimelineExpandVideoTracksForDrag(void) {
+    bool draggingVideo = false;
+    int sourceTrack = -1;
+    if (gClipDragIndex >= 0 && gClipDragIndex < gTimelineClipCount &&
+        TimelineTrackIsVideo(gClipDragTrack)) {
+        draggingVideo = true;
+        sourceTrack = gClipDragTrack;
+    } else if (gMediaDragIndex >= 0 && gMediaDragIndex < gImportedCount &&
+               strcmp(gImported[gMediaDragIndex].kind, "audio") != 0) {
+        draggingVideo = true;
+    }
+    if (!draggingVideo || (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+                           !IsMouseButtonReleased(MOUSE_BUTTON_LEFT))) {
+        gTimelineWasDraggingVideo = false;
+        gTimelineLastRevealY = -1.f;
+        return;
+    }
+
+    Vector2 mouse = GetMousePosition();
+    if (!gTimelineWasDraggingVideo) {
+        int highestAtStart = 0;
+        for (int i = 0; i < gTimelineVideoTracks; i++)
+            if (gTimelineVideoTrackIds[i] > highestAtStart) highestAtStart = gTimelineVideoTrackIds[i];
+        Clay_BoundingBox top = Clay_GetElementData(CLAY_IDI("TrackLane", highestAtStart)).boundingBox;
+        /* A clip drag starts inside a lane, so require a deliberate 12px
+           upward movement from the grab point. A media-library drag starts
+           outside the timeline, so use the visible top lane as its threshold. */
+        gTimelineLastRevealY = sourceTrack >= 0 ? mouse.y - 12.f
+            : (top.height > 0.f ? top.y + 15.f : mouse.y);
+    }
+    gTimelineWasDraggingVideo = true;
+
+    int hovered = TimelineTrackUnderPointer();
+    if (TimelineTrackIsVideo(hovered)) {
+        /* Reveal skipped tracks between the source lane and the lane under
+           the pointer. During the drag those intermediate rows stay mounted;
+           after release only tracks containing media remain visible. */
+        int first = sourceTrack >= 0 ? (sourceTrack < hovered ? sourceTrack : hovered) : 0;
+        int last = sourceTrack >= 0 ? (sourceTrack > hovered ? sourceTrack : hovered) : hovered;
+        for (int track = first; track <= last; track++) {
+            if (track > gTimelinePendingVideoTrack) gTimelinePendingVideoTrack = track;
+            TimelineAddVisibleVideoTrack(track);
+        }
+    }
+
+    /* One additional lane appears for each deliberate upward movement. The
+       pointer can travel just above the track viewport into the ruler area,
+       so each new lane requires another small upward step instead of all
+       four lanes popping open at once. */
+    int highest = -1;
+    for (int i = 0; i < gTimelineVideoTracks; i++)
+        if (gTimelineVideoTrackIds[i] > highest) highest = gTimelineVideoTrackIds[i];
+    if (highest >= 0 && highest < 3) {
+        Clay_BoundingBox top = Clay_GetElementData(CLAY_IDI("TrackLane", highest)).boundingBox;
+        if (top.height > 0.f && mouse.y <= gTimelineLastRevealY &&
+            mouse.y >= top.y - 48.f) {
+            if (highest + 1 > gTimelinePendingVideoTrack)
+                gTimelinePendingVideoTrack = highest + 1;
+            TimelineAddVisibleVideoTrack(highest + 1);
+            gTimelineLastRevealY = mouse.y - 12.f;
+        }
+    }
 }
 
 static int TimelineTrackUnderPointer(void) {
@@ -640,6 +714,7 @@ static void Timeline(void) {
     gMediaDropPreviewClip = -1;
     gMediaDropPreviewMedia = -1;
     TimelineRebuildVisibleVideoTracks();
+    TimelineExpandVideoTracksForDrag();
     float pps = TimelinePps();
     Vector2 mouse = GetMousePosition();
     Clay_BoundingBox timelineBounds = Clay_GetElementData(CLAY_ID("Timeline")).boundingBox;
@@ -717,10 +792,12 @@ static void Timeline(void) {
     /* Both audio lanes stay available even while empty. */
     gTimelineAudioTracks = 2;
 
-    /* Keep lanes comfortably readable; overflow scrolls instead of squeezing rows. */
+    /* Track rows keep one fixed, readable height at every timeline size.
+       A shorter timeline scrolls vertically; it never compresses the rows. */
     TimelineRebuildVisibleVideoTracks();
+    TimelineExpandVideoTracksForDrag();
     int laneCount = gTimelineVideoTracks + gTimelineAudioTracks;
-    gTimelineLaneHeight = fminf(56.f, fmaxf(40.f, (gTimeH - 90.5f) / fmaxf(1, laneCount) - 2.25f));
+    gTimelineLaneHeight = 56.f;
     float trackViewportHeight = fmaxf(1.f, gTimeH - 90.5f);
     gTimelineVerticalMax = fmaxf(0.f, laneCount * (gTimelineLaneHeight + 2.25f) - trackViewportHeight);
     if (gShiftDown && !gCtrlDown && gWheelDelta != 0.f && inTimelineBody)
