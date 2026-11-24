@@ -52,6 +52,8 @@ static PREVIEW_PATH: AtomicU64 = AtomicU64::new(0);
 /// 4 missing/empty source, 5 decoder error, 6 GPU composite error.
 static PREVIEW_FALLBACK_REASON: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_COMPOSITE_US: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_TRANSFER_US: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_CONVERT_US: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_PUBLISH_US: AtomicU64 = AtomicU64::new(0);
 fn note_fallback(reason: u64) -> Result<Option<(u32, u32, f64)>, String> {
     PREVIEW_FALLBACK_REASON.store(reason, Ordering::Relaxed);
@@ -146,6 +148,8 @@ impl Drop for PreviewStream {
 
 #[derive(Clone)]
 struct DecodeSource {
+    /// Stable timeline clip identity; each clip maintains its own decode cursor.
+    stream_key: String,
     path: String,
     source_time: f64,
     remaining: f64,
@@ -167,6 +171,8 @@ struct DecodeTask {
 struct DecodeBatch {
     frames: Vec<DecodedFrame>,
     decode_ms: f64,
+    transfer_us: u64,
+    convert_us: u64,
     prefetched_frames: usize,
 }
 
@@ -210,11 +216,13 @@ fn decode_ahead_loop(
             None => match requests.recv() { Ok(task) => task, Err(_) => return },
         };
 
+        decoder::begin_decode_timing();
         let decode_started = Instant::now();
         let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
-            .map(|source| pool.frame_at(&source.path, source.source_time, source.max_width, task.stepping))
+            .map(|source| pool.frame_at(&source.stream_key, &source.path, source.source_time, source.max_width, task.stepping))
             .collect();
         let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let (transfer_us, convert_us) = decoder::take_decode_timing();
         let Ok(frames) = current else {
             let error = current.err().unwrap_or_else(|| "Video frame decode failed".into());
             if replies.send(Err(error)).is_err() { return; }
@@ -226,6 +234,8 @@ fn decode_ahead_loop(
         if replies.send(Ok(DecodeBatch {
             frames,
             decode_ms,
+            transfer_us,
+            convert_us,
             prefetched_frames: prefetched_from_previous,
         })).is_err() {
             return;
@@ -245,7 +255,7 @@ fn decode_ahead_loop(
                     Err(TryRecvError::Empty) => {}
                 }
                 if ahead_seconds >= source.remaining { continue; }
-                if pool.frame_at(&source.path, source.source_time + ahead_seconds, source.max_width, false).is_ok() {
+                if pool.frame_at(&source.stream_key, &source.path, source.source_time + ahead_seconds, source.max_width, false).is_ok() {
                     prefetched += 1;
                 }
             }
@@ -404,8 +414,8 @@ fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview
                 "path":PREVIEW_PATH.load(Ordering::Relaxed),"fallbackReason":PREVIEW_FALLBACK_REASON.load(Ordering::Relaxed),
                 "compositeMs":PREVIEW_COMPOSITE_US.load(Ordering::Relaxed) as f64/1000.0,
                 "publishMs":PREVIEW_PUBLISH_US.load(Ordering::Relaxed) as f64/1000.0,
-                "transferMs":decoder::last_transfer_us() as f64/1000.0,
-                "convertMs":decoder::last_convert_us() as f64/1000.0,
+                "transferMs":PREVIEW_TRANSFER_US.load(Ordering::Relaxed) as f64/1000.0,
+                "convertMs":PREVIEW_CONVERT_US.load(Ordering::Relaxed) as f64/1000.0,
                 "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),"proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),"originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
                 "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
             Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
@@ -1238,7 +1248,7 @@ impl PreviewEngine {
             } else {
                 let index = sources.len();
                 source_lookup.insert(lookup_key, index);
-                sources.push(DecodeSource { path: source, source_time, remaining, max_width: layer_max_width });
+                sources.push(DecodeSource { stream_key: clip.id.clone(), path: source, source_time, remaining, max_width: layer_max_width });
                 source_indices.push(index);
             }
         }
@@ -1257,6 +1267,8 @@ impl PreviewEngine {
             }
         };
         *decode_ms = batch.decode_ms;
+        PREVIEW_TRANSFER_US.store(batch.transfer_us, Ordering::Relaxed);
+        PREVIEW_CONVERT_US.store(batch.convert_us, Ordering::Relaxed);
         let decoded = batch.frames;
         *ring_depth = batch.prefetched_frames;
         // Stable source-frame keys let the GPU keep one uploaded texture for
@@ -1300,6 +1312,8 @@ impl PreviewEngine {
     fn render(&mut self, request: &Value, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64, usize) {
         let mut setup_ms = 0.0;
         let mut decode_ms = 0.0;
+        PREVIEW_TRANSFER_US.store(0, Ordering::Relaxed);
+        PREVIEW_CONVERT_US.store(0, Ordering::Relaxed);
         let mut ring_depth = 0usize;
         let result = (|| -> Result<(u32, u32, f64), String> {
             let timeline: Arc<Timeline> = if request["useSnapshot"].as_bool() == Some(true) {

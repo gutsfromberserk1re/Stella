@@ -1,15 +1,17 @@
 //! Persistent in-process FFmpeg video decoder used by the preview worker.
 //!
-//! A decoder context is opened once per media source and reused for sequential
-//! playback. Seeking flushes that context instead of spawning ffmpeg/ffprobe
+//! A decoder context is opened once per timeline clip and reused for sequential
+//! playback. Clips that share a file but use different source offsets therefore
+//! keep independent read cursors. Seeking flushes that context instead of spawning ffmpeg/ffprobe
 //! processes for every preview frame. Recently decoded frames are kept in a
 //! bounded LRU-style cache so scrubbing back to a nearby frame is immediate.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, Ordering::Relaxed},
         Arc, OnceLock,
     },
 };
@@ -28,9 +30,9 @@ use ffmpeg::{
 };
 
 const MAX_CACHED_FRAME_BYTES: usize = 128 * 1024 * 1024;
-// Match a mid-range editing workload: keep the active source set small and
-// let the frame cache serve recently visited media after decoder eviction.
-const MAX_OPEN_DECODERS: usize = 6;
+// Each active timeline clip can own a decoder context. Keep enough slots for
+// common multi-track compositions while bounding memory use on mid-range PCs.
+const MAX_OPEN_DECODERS: usize = 12;
 const SEEK_REUSE_WINDOW_SECONDS: f64 = 1.25;
 /// Frames converted *before* a step-seek target so repeated reverse frame
 /// steps are served from the cache instead of re-seeking to a keyframe
@@ -46,13 +48,27 @@ static LAST_FRAME_HW: AtomicBool = AtomicBool::new(false);
 
 pub fn last_frame_was_hardware() -> bool { LAST_FRAME_HW.load(Relaxed) }
 
-/// Phase 0 timing: microseconds spent moving the last frame to system memory
-/// (hardware transfer) and in the fused convert+scale kernel. These are part of
-/// `decodeWaitMs`; reporting them separately shows where decode time really goes.
-static LAST_TRANSFER_US: AtomicU64 = AtomicU64::new(0);
-static LAST_CONVERT_US: AtomicU64 = AtomicU64::new(0);
-pub fn last_transfer_us() -> u64 { LAST_TRANSFER_US.load(Relaxed) }
-pub fn last_convert_us() -> u64 { LAST_CONVERT_US.load(Relaxed) }
+/// Request-scoped timing: microseconds spent moving decoded frames to system
+/// memory and in the fused convert+scale kernel. These are included in
+/// `decodeWaitMs`; totals are collected across all source layers in the batch.
+thread_local! {
+    // Per-thread counters keep thumbnail/media work from contaminating preview
+    // telemetry. The preview worker resets and snapshots its own counters around
+    // the requested batch, before decode-ahead starts touching more frames.
+    static DECODE_TRANSFER_US: Cell<u64> = Cell::new(0);
+    static DECODE_CONVERT_US: Cell<u64> = Cell::new(0);
+}
+
+pub fn begin_decode_timing() {
+    DECODE_TRANSFER_US.with(|value| value.set(0));
+    DECODE_CONVERT_US.with(|value| value.set(0));
+}
+
+pub fn take_decode_timing() -> (u64, u64) {
+    let transfer = DECODE_TRANSFER_US.with(|value| { let total = value.get(); value.set(0); total });
+    let convert = DECODE_CONVERT_US.with(|value| { let total = value.get(); value.set(0); total });
+    (transfer, convert)
+}
 
 static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -347,11 +363,11 @@ impl VideoDecoder {
         let max_width = self.max_width;
         let transfer_started = std::time::Instant::now();
         let software = to_software(decoded, &mut self.hw_transfer)?;
-        LAST_TRANSFER_US.store(transfer_started.elapsed().as_micros() as u64, Relaxed);
+        DECODE_TRANSFER_US.with(|value| value.set(value.get().saturating_add(transfer_started.elapsed().as_micros() as u64)));
         LAST_FRAME_HW.store(!std::ptr::eq(software, decoded), Relaxed);
         let convert_started = std::time::Instant::now();
         let converted = convert_frame_to_rgba(software, pts_seconds, max_width);
-        LAST_CONVERT_US.store(convert_started.elapsed().as_micros() as u64, Relaxed);
+        DECODE_CONVERT_US.with(|value| value.set(value.get().saturating_add(convert_started.elapsed().as_micros() as u64)));
         converted
     }
 
@@ -855,20 +871,26 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32
 
 #[derive(Default)]
 pub struct DecoderPool {
+    // Keep an independent sequential decoder per timeline clip. Several clips
+    // can point at the same media file while sampling different source-time
+    // ranges; a single path-keyed decoder would seek backwards/forwards between
+    // those ranges on every preview frame.
     decoders: HashMap<String, VideoDecoder>,
     decoder_order: VecDeque<String>,
     frame_rates: HashMap<String, f64>,
+    // Decoded pixels remain shared by media path + source frame + output size,
+    // even when different clip-specific decoder contexts produce them.
     frames: HashMap<FrameKey, DecodedFrame>,
     frame_order: VecDeque<FrameKey>,
     cached_bytes: usize,
 }
 
 impl DecoderPool {
-    fn remember_decoder(&mut self, path: &str, decoder: VideoDecoder) {
+    fn remember_decoder(&mut self, stream_key: &str, path: &str, decoder: VideoDecoder) {
         self.frame_rates.insert(path.to_owned(), decoder.frame_rate);
-        self.decoders.insert(path.to_owned(), decoder);
-        self.decoder_order.retain(|item| item != path);
-        self.decoder_order.push_back(path.to_owned());
+        self.decoders.insert(stream_key.to_owned(), decoder);
+        self.decoder_order.retain(|item| item != stream_key);
+        self.decoder_order.push_back(stream_key.to_owned());
         while self.decoder_order.len() > MAX_OPEN_DECODERS {
             if let Some(oldest) = self.decoder_order.pop_front() {
                 self.decoders.remove(&oldest);
@@ -895,20 +917,20 @@ impl DecoderPool {
         }
     }
 
-    /// `stepping` marks an explicit frame-step (arrow keys). Only then are the
-    /// frames just before a seek target converted and cached, so ordinary
-    /// timeline scrubbing keeps its cheap discard-before-convert path.
-    pub fn frame_at(&mut self, path: &str, seconds: f64, max_width: u32, stepping: bool) -> Result<DecodedFrame, String> {
+    /// `stream_key` is normally the timeline clip ID. It keeps the decoder's
+    /// read head aligned with that clip's own source-time progression. The
+    /// pixel cache is still global to the underlying file, so exact duplicate
+    /// source-frame requests are shared without a second decode.
+    pub fn frame_at(&mut self, stream_key: &str, path: &str, seconds: f64, max_width: u32, stepping: bool) -> Result<DecodedFrame, String> {
         let max_width = max_width.max(2) & !1;
-        // Check the frame cache before reopening a decoder. This matters when a
-        // source was evicted from the small open-decoder pool but its pixels
-        // are still hot in the larger decoded-frame cache.
+        // Obtain stream metadata once per underlying file. Opening this clip's
+        // own decoder below does not need to repeat metadata discovery.
         let frame_rate = if let Some(rate) = self.frame_rates.get(path).copied() {
             rate
         } else {
             let decoder = VideoDecoder::open(path, max_width)?;
             let rate = decoder.frame_rate;
-            self.remember_decoder(path, decoder);
+            self.remember_decoder(stream_key, path, decoder);
             rate
         };
         let frame_index = (seconds.max(0.0) * frame_rate).round() as i64;
@@ -918,31 +940,33 @@ impl DecoderPool {
                 self.frame_order.remove(index);
             }
             self.frame_order.push_back(key);
-            // A cache hit is still active use: keep its open decoder near the
-            // MRU end so rapid scrubbing does not evict the current source.
-            if self.decoders.contains_key(path) {
-                self.decoder_order.retain(|item| item != path);
-                self.decoder_order.push_back(path.to_owned());
+            if self.decoders.contains_key(stream_key) {
+                self.decoder_order.retain(|item| item != stream_key);
+                self.decoder_order.push_back(stream_key.to_owned());
             }
             return Ok(frame);
         }
 
-        let decoder_width_changed = self.decoders.get(path)
-            .map_or(false, |decoder| decoder.max_width != max_width);
-        if decoder_width_changed {
-            self.decoders.remove(path);
-            self.decoder_order.retain(|item| item != path);
+        let decoder_path_changed = self.decoders.get(stream_key).is_some_and(|decoder| decoder.path != path);
+        if decoder_path_changed {
+            self.decoders.remove(stream_key);
+            self.decoder_order.retain(|item| item != stream_key);
         }
-        if !self.decoders.contains_key(path) {
+        if !self.decoders.contains_key(stream_key) {
             let decoder = VideoDecoder::open(path, max_width)?;
-            self.remember_decoder(path, decoder);
+            self.remember_decoder(stream_key, path, decoder);
         } else {
-            self.decoder_order.retain(|item| item != path);
-            self.decoder_order.push_back(path.to_owned());
+            self.decoder_order.retain(|item| item != stream_key);
+            self.decoder_order.push_back(stream_key.to_owned());
         }
 
-        let (decoded, history) = self.decoders.get_mut(path)
-            .ok_or("Video decoder cache lost its source")?.decode_at(seconds, stepping)?;
+        let decoder = self.decoders.get_mut(stream_key)
+            .ok_or("Video decoder cache lost its clip stream")?;
+        // Output width can change with animated scale or preview quality. It is
+        // a conversion setting, not codec state, so update it without reopening
+        // the FFmpeg input/decoder context.
+        decoder.max_width = max_width;
+        let (decoded, history) = decoder.decode_at(seconds, stepping)?;
         // History first so the requested frame ends up most-recently-used.
         for earlier in &history {
             let index = (earlier.pts_seconds.max(0.0) * frame_rate).round() as i64;
