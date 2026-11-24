@@ -506,6 +506,67 @@ int main(void) {
         gFK[2] = gFK[source];
     }
 
+    /* Title typography has its own small, cross-platform font set. Keep the
+       existing three UI weights untouched; title slots are 3..6 regular and
+       7..10 bold so inspector typography never changes the application UI. */
+    if (okR) { strcpy(gFontPath[3], gFontPath[0]); gFontOK[3] = true; gFK[3] = gFK[0]; }
+    if (okSB) { strcpy(gFontPath[7], gFontPath[2]); gFontOK[7] = true; gFK[7] = gFK[2]; }
+    const char *arialRegular[] = {
+        "C:/Windows/Fonts/arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    };
+    const char *arialBold[] = {
+        "C:/Windows/Fonts/arialbd.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    };
+    const char *georgiaRegular[] = {
+        "C:/Windows/Fonts/georgia.ttf", "/System/Library/Fonts/Supplemental/Georgia.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Georgia.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+    };
+    const char *georgiaBold[] = {
+        "C:/Windows/Fonts/georgiab.ttf", "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Georgia_Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
+    };
+    const char *monoRegular[] = {
+        "C:/Windows/Fonts/consola.ttf", "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf"
+    };
+    const char *monoBold[] = {
+        "C:/Windows/Fonts/consolab.ttf", "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Bold.ttf"
+    };
+    FindFont(arialRegular, (int)(sizeof(arialRegular) / sizeof(arialRegular[0])), 4);
+    FindFont(georgiaRegular, (int)(sizeof(georgiaRegular) / sizeof(georgiaRegular[0])), 5);
+    FindFont(monoRegular, (int)(sizeof(monoRegular) / sizeof(monoRegular[0])), 6);
+    FindFont(arialBold, (int)(sizeof(arialBold) / sizeof(arialBold[0])), 8);
+    FindFont(georgiaBold, (int)(sizeof(georgiaBold) / sizeof(georgiaBold[0])), 9);
+    FindFont(monoBold, (int)(sizeof(monoBold) / sizeof(monoBold[0])), 10);
+    for (int i = 0; i < 4; i++) {
+        int regularSlot = 3 + i, boldSlot = 7 + i;
+        if (!gFontOK[regularSlot]) {
+            int source = gFontOK[3] ? 3 : 0;
+            strcpy(gFontPath[regularSlot], gFontPath[source]);
+            gFontOK[regularSlot] = gFontOK[source];
+            gFK[regularSlot] = gFK[source];
+        }
+        if (!gFontOK[boldSlot]) {
+            int source = gFontOK[7] ? 7 : (gFontOK[regularSlot] ? regularSlot : 0);
+            strcpy(gFontPath[boldSlot], gFontPath[source]);
+            gFontOK[boldSlot] = gFontOK[source];
+            gFK[boldSlot] = gFK[source];
+        }
+    }
+
     for (int i = 0; i < NSL; i++) gSl[i] = gSlT[i] = SlDefault(i);
 
     uint64_t mem = Clay_MinMemorySize();
@@ -548,10 +609,10 @@ int main(void) {
             if (gCtrlDown && IsKeyPressed(KEY_Z)) TimelineHistoryAction(gShiftDown);
             else if (gCtrlDown && IsKeyPressed(KEY_Y)) TimelineHistoryAction(true);
             else if (!gCtrlDown && !altDown) {
-                if (IsKeyPressed(KEY_V)) { gTimelineTool = 0; gTextInputFocused = false; }
-                if (IsKeyPressed(KEY_H)) { gTimelineTool = 1; gTextInputFocused = false; }
-                if (IsKeyPressed(KEY_C)) { gTimelineTool = 2; gTextInputFocused = false; }
-                if (IsKeyPressed(KEY_T)) { gTimelineTool = 3; gRightTab = 3; gTextInputFocused = false; }
+                if (IsKeyPressed(KEY_V)) { gTimelineTool = 0; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+                if (IsKeyPressed(KEY_H)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+                if (IsKeyPressed(KEY_C)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+                if (IsKeyPressed(KEY_T)) { gTimelineTool = 3; gRightTab = 3; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             }
         }
         if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_K) &&
@@ -645,7 +706,8 @@ int main(void) {
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
-        if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && !gTextAutoUpdatePending) {
+        if (gTimelinePropertyEditOpen && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) &&
+            !gTextAutoUpdatePending && gTextAutoUpdateCommitAt <= 0.0) {
             PlutoTimelineEndPropertyEdit();
         }
         PlutoTextAutoUpdateTick();

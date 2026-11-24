@@ -502,7 +502,12 @@ static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, c
         gTimelinePropertyEditOpen = true;
         okay = PlutoTimelineCallFast(request);
     } else okay = PlutoTimelineCall(request);
-    if (okay) { gTextTitleSelected = true; gRightTab = 3; gPreviewDirty = true; }
+    if (okay) {
+        gTextTitleSelected = true;
+        gRightTab = 3;
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    }
     return okay;
 }
 
@@ -650,6 +655,7 @@ static void PlutoPollBackend(void) {
                                    gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
             if (matchingRequest) {
                 gPreviewTaskId = 0;
+                gPreviewTextPathInFlight[0] = 0;
                 bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
                 float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
                 bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
@@ -792,6 +798,7 @@ static void PlutoUnloadMedia(void) {
     free(gPreviewPixels);
     gPreviewPixels = NULL;
     gPreviewPixelCapacity = 0;
+    gPreviewTextPathInFlight[0] = 0;
 }
 
 static uint64_t PlutoRequestPreview(void) {
@@ -806,6 +813,7 @@ static uint64_t PlutoRequestPreview(void) {
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
         gPreviewTaskId = taskId;
+        snprintf(gPreviewTextPathInFlight, sizeof(gPreviewTextPathInFlight), "%s", gTextOutputPath);
         gPreviewRequestAt = gPlayhead;
         gPreviewRequestRes = gPreviewRes;
         gPreviewRequestStartedAt = GetTime();
@@ -887,11 +895,14 @@ static bool PlutoTimelineSetPropertiesLiveJson(const char *propertiesJson) {
 
 static void PlutoTimelineEndPropertyEdit(void) {
     if (!gTimelinePropertyEditOpen) return;
+    /* A live title update has already requested the latest WGPU frame. Do not
+       add the generic one-second settle delay when its undo group is committed. */
+    const bool finishingTextEdit = gTextAutoUpdateCommitAt > 0.0;
     gTimelinePropertyEditOpen = false;
     gTextAutoUpdateCommitAt = 0.0;
     /* Commit one undo snapshot and refresh the local keyframe/inspector cache once. */
     gPreviewDirty = true;
-    gPreviewDebounce = 1.f;
+    gPreviewDebounce = finishingTextEdit ? 0.f : 1.f;
     PlutoTimelineCall("{\"command\":\"timeline_end_property_edit\"}");
 }
 

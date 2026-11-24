@@ -1172,13 +1172,13 @@ static void Timeline(void) {
 
     CLAY(CLAY_ID("Timeline"), {.layout = {COLM, .sizing = {GROW, CLAY_SIZING_FIXED(gTimeH)}}, PANEL}) {
         CLAY(CLAY_ID("TlBar"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 12, 0, 0}, .childGap = 4, .childAlignment = AL_Y}}) {
-            if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) { gTimelineTool = 0; gTextInputFocused = false; }
-            if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) { gTimelineTool = 1; gTextInputFocused = false; }
-            if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; }
+            if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) { gTimelineTool = 0; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+            if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+            if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             if (IconBtn(CLAY_ID("ToolText"), I_TEXT, 36, 18, C_DIM, gTimelineTool == 3, 9)) {
                 gTimelineTool = 3;
                 gRightTab = 3;
-                gTextInputFocused = false;
+                gTextInputFocused = false; gTextFocusStartedAt = 0.0;
                 gScroll = gScrollT = 0.f;
             }
             GAPX(8)

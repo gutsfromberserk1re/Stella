@@ -57,7 +57,7 @@ enum {
     I_GRADING, I_SLIDERS, I_SUN, I_DROP, I_MOUNTAIN, I_DISTORT, I_SKIP_B, I_SKIP_F, I_PLAY,
     I_PAUSE, I_LOOP, I_GRID, I_POINTER, I_HAND, I_SCISSORS, I_TEXT, I_TRASH, I_KF_PREV, I_KF_NEXT,
     I_KF_DIAMOND, I_KF_DIAMOND_MINUS, I_ZOOM_OUT, I_ZOOM_IN, I_MAGNET, I_FILM, I_BOWTIE, I_SPARKLE,
-    I_MINIMIZE, I_MAXIMIZE, I_CLOSE,
+    I_MINIMIZE, I_MAXIMIZE, I_CLOSE, I_ALIGN_LEFT, I_ALIGN_CENTER, I_ALIGN_RIGHT, I_BOLD, I_ITALIC, I_UNDERLINE,
     K_APP_LOGO = 99,
     K_THUMB = 100, K_KNOB, K_WHEEL, K_SWITCH, K_SLIDER, K_ROTRULER, K_RULER, K_PREVIEW,
     K_CLIP, K_SCROLLBAR, K_PILL, K_FILTER, K_CHIP, K_GLOW, K_SPLIT, K_ROT_ICON, K_VSLIDER
@@ -75,7 +75,7 @@ static Cust *NC(int k, Clay_Color a, Clay_Color b, Clay_Color c, float v, float 
 /* ------------------------------------------------------------------ */
 /* globals / state                                                     */
 /* ------------------------------------------------------------------ */
-static float gFK[3] = {1.f, 1.f, 1.f};   /* per-weight font metrics normalisation */
+static float gFK[11] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};   /* UI + title-font metrics */
 static float gDpiScale = 1.f;
 static float gDt;
 static float gWheelDelta;
@@ -94,6 +94,9 @@ static float gPreviewDisplayedAt = -1.f;
 static bool  gTimelineScrubbing;
 static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
+/* Title image currently being read by the in-flight WGPU preview request.
+   Live text updates write to the other TGA slot to avoid a file-read race. */
+static char gPreviewTextPathInFlight[1024];
 static float gPreviewRequestAt;
 static int gPreviewRequestRes;
 static double gPreviewRequestStartedAt;
@@ -174,8 +177,8 @@ static bool  gTimelinePanning, gTimelineMiddlePanning;
 static float gTimelinePanMouseY, gTimelineVerticalPanOrig, gTimelineVerticalScroll, gTimelineVerticalScrollT, gTimelineVerticalMax;
 static uint64_t gClipSerial = 1;
 
-/* Native title-card editor. Titles are rasterized to transparent PNG layers
-   so the same asset is used by the WGPU preview and FFmpeg export. */
+/* Native title-card editor. Compact transparent lossless raster layers are
+   positioned by the shared WGPU compositor for both preview and final export. */
 #define STELLA_TEXT_MAX 512
 static char gTextContent[STELLA_TEXT_MAX] = "Your title";
 static int gTextFontSize = 96;
@@ -197,6 +200,12 @@ static bool gTextWheelDrag[4];
 static int gDragTextWheel = -1;
 static int gTextAlign = 1; /* 0 left, 1 center, 2 right */
 static bool gTextBold = true;
+static bool gTextItalic;
+static bool gTextUnderline;
+static int gTextFontFamily; /* 0 System, 1 Arial, 2 Georgia, 3 Monospace */
+static bool gTextFontMenuOpen;
+static double gTextCaretT;
+static double gTextFocusStartedAt;
 static bool gTextOutline;
 static bool gTextShadow = true;
 static bool gTextBackground;
@@ -218,10 +227,15 @@ static char gTextAutoUpdateClipId[64];
 static uint64_t gTextAutoObservedSignature;
 static char gTextAutoObservedClipId[64];
 static bool gTextAutoObserverInitialized;
+static char gTextOutputPath[1024];
+static bool gTextHasCroppedAsset;
+static uint64_t gTextRenderedSignature;
 static float gTextDuration = 5.f;
 static void PlutoTextCreateBox(float x, float y, float width, float height);
 static void PlutoTextAutoUpdateFlush(void);
+static uint64_t PlutoTextRasterSignature(void);
 static void PlutoTimelineEndPropertyEdit(void);
+static void PlutoDrawTextCaret(void);
 static int   gWindowAction; /* 0 none, 1 minimize, 2 maximize/restore, 3 close */
 static bool  gWantQuit;
 #ifdef _WIN32
@@ -363,11 +377,11 @@ static const char *Fmt(const char *f, ...) {
 /* ------------------------------------------------------------------ */
 /* crisp font cache: one atlas per (font, exact pixel size)            */
 /* ------------------------------------------------------------------ */
-static char gFontPath[3][260];
-static bool gFontOK[3];
+static char gFontPath[11][260];
+static bool gFontOK[11];
 static int  gFcps[100], gFcpN;
 typedef struct { int slot, px; Font f; } FontEnt;
-static FontEnt gFC[160];
+static FontEnt gFC[256];
 static int gFCN;
 
 static int PxOf(int slot, float size) {
@@ -375,11 +389,11 @@ static int PxOf(int slot, float size) {
     return p < 6 ? 6 : p > 192 ? 192 : p;
 }
 static Font FontPx(int slot, int px) {
-    if (slot < 0 || slot > 2) slot = 0;
+    if (slot < 0 || slot > 10) slot = 0;
     if (!gFontOK[slot]) return GetFontDefault();
     for (int i = 0; i < gFCN; i++)
         if (gFC[i].slot == slot && gFC[i].px == px) return gFC[i].f;
-    if (gFCN >= 160) return GetFontDefault();
+    if (gFCN >= 256) return GetFontDefault();
     Font f = LoadFontEx(gFontPath[slot], px, gFcps, gFcpN);
     if (f.texture.id == 0) { gFontOK[slot] = false; return GetFontDefault(); }
     SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);

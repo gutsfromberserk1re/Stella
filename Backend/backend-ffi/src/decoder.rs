@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc, OnceLock,
     },
+    time::UNIX_EPOCH,
 };
 
 use ffmpeg_next as ffmpeg;
@@ -107,6 +108,9 @@ struct VideoDecoder {
     time_base: Rational,
     frame_rate: f64,
     cursor_seconds: f64,
+    // FFmpeg's decoder drain is a one-way state until the next seek. Repeated
+    // preview requests at/after EOF must not send a second EOF packet.
+    decoder_eof: bool,
     // Maximum decoded RGBA width for preview. Keeping this near the monitor's
     // effective resolution avoids uploading full 1080p/4K frames for a small
     // preview surface.
@@ -360,6 +364,7 @@ impl VideoDecoder {
             time_base,
             frame_rate,
             cursor_seconds: -1.0,
+            decoder_eof: false,
             max_width: max_width.max(2) & !1,
             stream_color_space,
             stream_color_range,
@@ -398,6 +403,7 @@ impl VideoDecoder {
         }
         self.input.clear_eof();
         self.decoder.flush();
+        self.decoder_eof = false;
         self.cursor_seconds = -1.0;
         Ok(())
     }
@@ -498,7 +504,12 @@ impl VideoDecoder {
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
-                    self.decoder.send_eof().map_err(|error| format!("Video decoder flush failed: {error}"))?;
+                    if !self.decoder_eof {
+                        match self.decoder.send_eof() {
+                            Ok(()) | Err(ffmpeg::Error::Eof) => self.decoder_eof = true,
+                            Err(error) => return Err(format!("Video decoder flush failed: {error}")),
+                        }
+                    }
                     while self.decoder.receive_frame(&mut decoded).is_ok() {
                         let timestamp = decoded.timestamp().or_else(|| decoded.pts());
                         let pts_seconds = timestamp
@@ -814,6 +825,78 @@ fn scale_packed_to_rgba(
     });
 }
 
+/// Decode Stella's own uncompressed RGBA TGA title textures without creating
+/// an FFmpeg format/codec context for each live colour update. Other still-image
+/// formats continue through the normal FFmpeg decoder below.
+fn decode_uncompressed_tga(path: &str, max_width: u32, revision: i64) -> Result<Option<DecodedFrame>, String> {
+    if !Path::new(path).extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tga")) {
+        return Ok(None);
+    }
+
+    let bytes = std::fs::read(path).map_err(|error| format!("Could not read title texture: {error}"))?;
+    if bytes.len() < 18 { return Err("Title TGA header is truncated".into()); }
+    let id_length = bytes[0] as usize;
+    let color_map_type = bytes[1];
+    let image_type = bytes[2];
+    let width = u16::from_le_bytes([bytes[12], bytes[13]]) as usize;
+    let height = u16::from_le_bytes([bytes[14], bytes[15]]) as usize;
+    let depth = bytes[16];
+    let descriptor = bytes[17];
+
+    // Raylib's ExportImage writes type-2, 32-bit TGA files. Leave other TGA
+    // variants to FFmpeg rather than partially decoding an unsupported layout.
+    if color_map_type != 0 || image_type != 2 || (depth != 24 && depth != 32) {
+        return Ok(None);
+    }
+    if width == 0 || height == 0 {
+        return Err("Title TGA has invalid dimensions".into());
+    }
+    let bytes_per_pixel = (depth / 8) as usize;
+    let pixels = width.checked_mul(height).ok_or("Title TGA dimensions overflow")?;
+    let pixel_bytes = pixels.checked_mul(bytes_per_pixel).ok_or("Title TGA size overflow")?;
+    let data_start = 18usize.checked_add(id_length).ok_or("Title TGA offset overflow")?;
+    let data_end = data_start.checked_add(pixel_bytes).ok_or("Title TGA size overflow")?;
+    if data_end > bytes.len() {
+        return Err("Title TGA pixel data is truncated".into());
+    }
+    if pixel_bytes > 512 * 1024 * 1024 {
+        return Err("Title TGA is too large for the preview decoder".into());
+    }
+
+    let top_origin = descriptor & 0x20 != 0;
+    let right_origin = descriptor & 0x10 != 0;
+    let mut bgra = vec![0u8; pixels * 4];
+    for y in 0..height {
+        let source_y = if top_origin { y } else { height - 1 - y };
+        for x in 0..width {
+            let source_x = if right_origin { width - 1 - x } else { x };
+            let source = data_start + (source_y * width + source_x) * bytes_per_pixel;
+            let target = (y * width + x) * 4;
+            // TGA stores colour in BGRA order; WGPU expects RGBA.
+            bgra[target] = bytes[source];
+            bgra[target + 1] = bytes[source + 1];
+            bgra[target + 2] = bytes[source + 2];
+            bgra[target + 3] = if bytes_per_pixel == 4 { bytes[source + 3] } else { 255 };
+        }
+    }
+
+    let (out_width, out_height) = scaled_size(width as u32, height as u32, max_width);
+    let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
+    scale_packed_to_rgba(
+        &mut rgba, &bgra, width * 4, 4, [2, 1, 0, 3],
+        width, height, out_width as usize, out_height as usize,
+    );
+    Ok(Some(DecodedFrame {
+        width: out_width,
+        height: out_height,
+        // Still-image timestamps are otherwise unused. Carry the file revision
+        // here so the WGPU source cache sees a changed title at the same path.
+        pts_seconds: revision.max(0) as f64 / 1_000_000_000.0,
+        rgba: Arc::new(rgba),
+    }))
+}
+
 fn convert_frame_to_rgba(
     source: &frame::Video,
     pts_seconds: f64,
@@ -958,11 +1041,29 @@ impl DecoderPool {
     }
 
     /// Load and cache the first frame of a still image for WGPU compositing.
-    /// Still images are decoded once per path/size and reused for every timeline
-    /// timestamp; they must not be passed through the sequential video seek path.
+    /// Image revisions are keyed by file modification time, so a live title can
+    /// reuse its path without returning stale pixels after a colour/style edit.
     pub fn still_frame(&mut self, path: &str, max_width: u32) -> Result<DecodedFrame, String> {
         let max_width = max_width.max(2) & !1;
-        let key = FrameKey { path: path.to_owned(), index: i64::MIN, max_width };
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("Could not inspect still image: {error}"))?;
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let modified_ns = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let revision = modified_ns.min(i64::MAX as u128) as i64;
+
+        // A live title reuses one of two stable paths. Drop only stale versions
+        // of that path so editing never accumulates old title textures in cache.
+        let stale: Vec<FrameKey> = self.frames.keys()
+            .filter(|key| key.path == path && key.max_width == max_width && key.index != revision)
+            .cloned().collect();
+        for stale_key in stale {
+            if let Some(frame) = self.frames.remove(&stale_key) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(frame.rgba.len());
+            }
+        }
+        self.frame_order.retain(|key| key.path != path || key.max_width != max_width || key.index == revision);
+
+        let key = FrameKey { path: path.to_owned(), index: revision, max_width };
         if let Some(frame) = self.frames.get(&key).cloned() {
             if let Some(index) = self.frame_order.iter().position(|item| item == &key) {
                 self.frame_order.remove(index);
@@ -971,8 +1072,16 @@ impl DecoderPool {
             return Ok(frame);
         }
 
-        let mut decoder = VideoDecoder::open_with(path, max_width, false)?;
-        let frame = decoder.decode_first_frame()?;
+        let frame = match decode_uncompressed_tga(path, max_width, revision)? {
+            Some(frame) => frame,
+            None => {
+                let mut decoder = VideoDecoder::open_with(path, max_width, false)?;
+                let mut frame = decoder.decode_first_frame()?;
+                // Include file revision in the GPU key for all image formats.
+                frame.pts_seconds = revision.max(0) as f64 / 1_000_000_000.0;
+                frame
+            }
+        };
         self.cache_insert(key, &frame);
         Ok(frame)
     }
@@ -1020,13 +1129,35 @@ impl DecoderPool {
             self.decoder_order.push_back(stream_key.to_owned());
         }
 
-        let decoder = self.decoders.get_mut(stream_key)
-            .ok_or("Video decoder cache lost its clip stream")?;
-        // Output width can change with animated scale or preview quality. It is
-        // a conversion setting, not codec state, so update it without reopening
-        // the FFmpeg input/decoder context.
-        decoder.max_width = max_width;
-        let (decoded, history) = decoder.decode_at(seconds, stepping)?;
+        let decode_result = {
+            let decoder = self.decoders.get_mut(stream_key)
+                .ok_or("Video decoder cache lost its clip stream")?;
+            // Output width can change with animated scale or preview quality. It is
+            // a conversion setting, not codec state, so update it without reopening
+            // the FFmpeg input/decoder context.
+            decoder.max_width = max_width;
+            decoder.decode_at(seconds, stepping)
+        };
+        let (decoded, history) = match decode_result {
+            Ok(result) => result,
+            Err(error) if error.starts_with("No decoded video frame at") &&
+                self.decoders.get(stream_key).is_some_and(|decoder| decoder.decoder_eof) => {
+                // Hold the closest already-decoded source frame when a clip's
+                // source is shorter than its timeline duration. This is normal
+                // EOF behavior, not a reason to fail the WGPU preview request.
+                // The cached pixels are still consumed exclusively by WGPU.
+                let held = self.frames.iter()
+                    .filter(|(cached_key, _)| cached_key.path == path &&
+                        cached_key.max_width == max_width && cached_key.index <= frame_index)
+                    .max_by_key(|(cached_key, _)| cached_key.index)
+                    .map(|(_, frame)| frame.clone());
+                match held {
+                    Some(frame) => (frame, Vec::new()),
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         // History first so the requested frame ends up most-recently-used.
         for earlier in &history {
             let index = (earlier.pts_seconds.max(0.0) * frame_rate).round() as i64;
@@ -1153,6 +1284,29 @@ mod still_image_tests {
         assert_eq!((first.width, first.height), (2, 2));
         assert!(Arc::ptr_eq(&first.rgba, &second.rgba));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn title_tga_decodes_as_rgba_without_ffmpeg() {
+        let path = std::env::temp_dir().join(format!(
+            "stella-title-tga-{}.tga", std::process::id()
+        ));
+        let mut data = vec![0u8; 18];
+        data[2] = 2; // uncompressed true colour
+        data[12..14].copy_from_slice(&2u16.to_le_bytes());
+        data[14..16].copy_from_slice(&1u16.to_le_bytes());
+        data[16] = 32;
+        data[17] = 0x28; // top-left origin, eight alpha bits
+        // TGA stores BGRA; decoded output must be RGBA.
+        data.extend_from_slice(&[30, 20, 10, 40, 70, 60, 50, 80]);
+        std::fs::write(&path, data).expect("write title TGA fixture");
+
+        let frame = decode_uncompressed_tga(path.to_str().unwrap(), 2, 123)
+            .expect("TGA parser succeeds").expect("recognized uncompressed TGA");
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(&frame.rgba[..], &[10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(frame.pts_seconds, 123.0 / 1_000_000_000.0);
         let _ = std::fs::remove_file(path);
     }
 }

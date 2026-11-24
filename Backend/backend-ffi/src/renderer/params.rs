@@ -166,15 +166,24 @@ impl LayerUniforms {
         let preset_intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
 
         // ------------------------------------------------------------ transform
-        let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
-        let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
+        // Text PNGs are stored cropped to their editable text frame. Their
+        // local layout transform is separate from the clip Transform tab, so
+        // editing text never overwrites user-authored clip transforms.
+        let text_layout = &props["text"]["layout"];
+        let layout_scale_w = (n(&text_layout["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
+        let layout_scale_h = (n(&text_layout["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
+        let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0 * layout_scale_w).clamp(0.01, 10.0);
+        let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0 * layout_scale_h).clamp(0.01, 10.0);
         let rotation = n(transform, "rotation", 0.0).to_radians();
         let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
         u.geo0 = [scale_w as f32, scale_h as f32, rotation as f32, opacity as f32];
 
-        // Position is stored in 1920x1080 space; shake is added here per frame.
-        let mut pos_x = n(&transform["position"], "x", 0.0);
-        let mut pos_y = n(&transform["position"], "y", 0.0);
+        // Both local text-frame placement and the clip Transform position are
+        // reference-pixel offsets from the composition centre.
+        let mut pos_x = n(&transform["position"], "x", 0.0)
+            + n(&text_layout["position"], "x", 0.0);
+        let mut pos_y = n(&transform["position"], "y", 0.0)
+            + n(&text_layout["position"], "y", 0.0);
         if on(effects, "shake") {
             let shake = &effects["shake"];
             let amount = n(shake, "amount", 18.0) * 0.18;
@@ -424,6 +433,33 @@ mod tests {
         assert!((u.geo1[1] + 0.1).abs() < 1e-6);
         assert!((u.crop[0] - 0.1).abs() < 1e-6);
         assert!((u.crop[3] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cropped_title_layout_composes_with_clip_transform() {
+        let props = json!({
+            "transform": {
+                "position": {"x": 10.0, "y": -20.0},
+                "scale": {"w": 200.0, "h": 150.0},
+                "rotation": 0.0,
+                "opacity": 100.0
+            },
+            "text": {
+                "isTitle": true,
+                "layout": {
+                    "position": {"x": 400.0, "y": 120.0},
+                    "scale": {"w": 76.0, "h": 60.0}
+                }
+            }
+        });
+        let uniforms = LayerUniforms::from_props(&props, 0.0);
+
+        // The cropped text frame supplies its own placement/size while the
+        // clip Transform tab remains additive/multiplicative on top of it.
+        assert!((uniforms.geo0[0] - 1.52).abs() < 1e-5);
+        assert!((uniforms.geo0[1] - 0.90).abs() < 1e-5);
+        assert!((uniforms.geo1[0] - (410.0 / 1920.0)).abs() < 1e-6);
+        assert!((uniforms.geo1[1] - (100.0 / 1080.0)).abs() < 1e-6);
     }
 
     #[test]

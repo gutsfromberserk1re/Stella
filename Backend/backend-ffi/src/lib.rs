@@ -1122,7 +1122,7 @@ fn render_wgpu_export_frame(
             decoder_pool.frame_at(&clip.id, path, source_time, layer_max_width, false)?
         };
         let source_key = if is_still_image {
-            format!("still:{}:{}x{}", path, frame.width, frame.height)
+            format!("still:{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
         } else {
             format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
         };
@@ -1623,7 +1623,7 @@ impl PreviewEngine {
             let frame = &decoded[source_index];
             let path = &source_paths[source_index];
             if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
-                format!("still:{}:{}x{}", path, frame.width, frame.height)
+                format!("still:{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
             } else {
                 format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
             }

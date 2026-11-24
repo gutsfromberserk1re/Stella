@@ -573,6 +573,21 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
     case I_MINIMIZE: LN(.18, .5, .82, .5); break;
     case I_MAXIMIZE: StrokeRR((Rectangle){x + .2f * w, y + .2f * h, .6f * w, .6f * h}, 1.5f, t, c); break;
     case I_CLOSE: LN(.22, .22, .78, .78); LN(.78, .22, .22, .78); break;
+    case I_ALIGN_LEFT:  LN(.18, .25, .82, .25); LN(.18, .45, .60, .45); LN(.18, .65, .76, .65); LN(.18, .82, .48, .82); break;
+    case I_ALIGN_CENTER: LN(.15, .25, .85, .25); LN(.30, .45, .70, .45); LN(.20, .65, .80, .65); LN(.36, .82, .64, .82); break;
+    case I_ALIGN_RIGHT: LN(.18, .25, .82, .25); LN(.40, .45, .82, .45); LN(.24, .65, .82, .65); LN(.52, .82, .82, .82); break;
+    case I_BOLD: {
+        Font iconFont = FontPx(2, 34);
+        Vector2 textSize = MeasureTextEx(iconFont, "B", 34.f, 0.f);
+        DrawTextEx(iconFont, "B", (Vector2){x + (w - textSize.x) * .5f, y + (h - textSize.y) * .5f}, 34.f, 0.f, c);
+    } break;
+    case I_ITALIC: LN(.35, .23, .70, .23); LN(.65, .23, .38, .77); LN(.30, .77, .65, .77); break;
+    case I_UNDERLINE: {
+        Font iconFont = FontPx(2, 34);
+        Vector2 textSize = MeasureTextEx(iconFont, "U", 34.f, 0.f);
+        DrawTextEx(iconFont, "U", (Vector2){x + (w - textSize.x) * .5f, y + (h - textSize.y) * .5f - 1.f}, 34.f, 0.f, c);
+        DrawLineEx(P(.18, .88), P(.82, .88), fmaxf(1.4f, t), c);
+    } break;
     default: break;
     }
 #undef P
@@ -654,6 +669,9 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             DrawTexturePro(gWheelTex, (Rectangle){0, 0, (float)gWheelTex.width, (float)gWheelTex.height},
                            (Rectangle){roundf(c.x - dw * .5f), roundf(c.y - dw * .5f), dw, dw}, (Vector2){0, 0}, 0.f, WHITE);
         } else DrawCircleV(c, rad, (Color){40, 41, 46, 255});
+        /* Text colour wheels get the same crisp white edge as their round swatches. */
+        if (cu->i != 0)
+            DrawRing(c, fmaxf(0.f, rad - 1.0f), rad + .35f, 0.f, 360.f, 96, (Color){248, 249, 252, 245});
         /* Puck: soft shadow + white border + fill. Grows a little on hover and more while dragging. */
         Vector2 p = {c.x + cu->b.r * rad, c.y + cu->b.g * rad};
         float s = 1.f + .2f * cu->f;
@@ -802,6 +820,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                     {textBox.x + textBox.width, textBox.y + textBox.height}
                 };
                 for (int i = 0; i < 4; i++) DrawCircleV(corners[i], 3.5f, (Color){224, 235, 255, 255});
+                if (gTextInputFocused && gTextTitleSelected) PlutoDrawTextCaret();
             }
         }
         DrawRectangleLinesEx(r, 1.5f, WHITE);

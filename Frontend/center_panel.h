@@ -35,13 +35,41 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
     bool overFrame = frameValid && CheckCollisionPointRec(mouse, frame);
     if (gTimelineTool == 3 && overFrame) gCross = true;
     if (gTimelineTool == 3 && !gTextBoxDragging && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && overFrame) {
-        gTextBoxDragging = true;
-        gTextBoxDragStart = (Vector2){
-            PreviewClamp(mouse.x, frame.x, frame.x + frame.width),
-            PreviewClamp(mouse.y, frame.y, frame.y + frame.height)
-        };
-        gTextBoxDragRect = (Rectangle){gTextBoxDragStart.x, gTextBoxDragStart.y, 1.f, 1.f};
-        gTextBoxScreenRectValid = false;
+        static double lastTitleBoxClickAt;
+        static char lastTitleBoxClickId[64];
+        bool insideSelectedTitle = gTextTitleSelected && gTextBoxScreenRectValid &&
+                                   CheckCollisionPointRec(mouse, gTextBoxScreenRect);
+        if (insideSelectedTitle) {
+            const char *clipId = (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount)
+                ? gTimelineClips[gTimelineSelected].id : "";
+            double now = GetTime();
+            if (clipId[0] && strcmp(lastTitleBoxClickId, clipId) == 0 &&
+                lastTitleBoxClickAt > 0.0 && now - lastTitleBoxClickAt <= .42) {
+                /* Double-clicking an existing title enters inline text editing;
+                   the caret is drawn over the WGPU preview on the next frame. */
+                gTextInputFocused = true;
+                gTextFocusStartedAt = now;
+                gTextCaretT = now;
+                gRightTab = 3;
+                lastTitleBoxClickAt = 0.0;
+                lastTitleBoxClickId[0] = 0;
+            } else {
+                lastTitleBoxClickAt = now;
+                snprintf(lastTitleBoxClickId, sizeof(lastTitleBoxClickId), "%s", clipId);
+            }
+        } else {
+            lastTitleBoxClickAt = 0.0;
+            lastTitleBoxClickId[0] = 0;
+            gTextInputFocused = false;
+            gTextFocusStartedAt = 0.0;
+            gTextBoxDragging = true;
+            gTextBoxDragStart = (Vector2){
+                PreviewClamp(mouse.x, frame.x, frame.x + frame.width),
+                PreviewClamp(mouse.y, frame.y, frame.y + frame.height)
+            };
+            gTextBoxDragRect = (Rectangle){gTextBoxDragStart.x, gTextBoxDragStart.y, 1.f, 1.f};
+            gTextBoxScreenRectValid = false;
+        }
     }
 
     if (gTextBoxDragging) {
