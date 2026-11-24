@@ -25,3 +25,16 @@ The old decoder pool keyed its open FFmpeg decoder only by file path. It reused 
 ## Remaining performance work
 
 The WGPU compositor still performs a blocking GPU readback so the existing Raylib/OpenGL UI can upload the result as a CPU-backed texture. That path is measured separately and remains a later zero-copy presentation milestone. This patch addresses the avoidable decoder seek contention first; it does not claim the whole editor has reached real-time playback yet.
+
+## Follow-up: colour consistency, audio lanes, and inspector layout
+
+- Capture the stream-level YCbCr matrix/range when opening each decoder and use that same colourimetry for every frame from the stream. This avoids different decoder outputs applying inconsistent per-frame fallback tags to otherwise identical stacked clips. Tagged BT.709/BT.601/BT.2020 and full/limited range are preserved; untagged HD/SD uses the conventional BT.709/BT.601 fallback.
+- Expand the timeline model and frontend mapping to six audio lanes (A1-A6). Audio rows remain hidden on a fresh project, appear when audio is dragged in or separated, and reveal a continuous stack so using A3 also exposes A1/A2 as available lanes. Audio rows use distinct darker lane styling and an audio-note icon. Empty audio rows fade away when no longer needed.
+- Choose the first free audio lane when separating audio from a video clip. If A1 overlaps another audio clip at that time, separation now uses A2, then the next available lane, and reports `NoFreeTrack` if all six are occupied.
+- Restore horizontal clipping at the shared inspector content boundary. Effects sections now use full-width grow layouts matching the Colors accordion structure, without an extra manually computed width. Text controls no longer sit inside the redundant outer `TextCol` group.
+
+## Follow-up verification status
+
+- Static source checks and delimiter-balance checks passed for the touched Rust and C headers.
+- A regression test was added for separated audio selecting A2 when A1 is occupied, plus tests for A1-A6 serialization and the fresh-project V1-only visibility state.
+- Rust tests and the Windows application build were not executable in this container (`cargo`/`rustc` are unavailable and the Clay UI headers are not installed). The Windows Actions build and an actual playback check remain required before calling this runtime-verified.

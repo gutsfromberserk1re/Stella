@@ -268,14 +268,17 @@ static float PlutoReadNumber(const char *begin, const char *end, const char *pat
 }
 
 static int PlutoTrackIndex(const char *name) {
-    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2"};
-    for (int i = 0; i < 6; i++) if (strcmp(name, names[i]) == 0) return i;
+    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2", "a3", "a4", "a5", "a6"};
+    for (int i = 0; i < 4 + TIMELINE_MAX_AUDIO_TRACKS; i++)
+        if (strcmp(name, names[i]) == 0) return i;
     return 0;
 }
 
 static const char *PlutoTrackName(int track) {
-    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2"};
-    return names[track < 0 ? 0 : track > 5 ? 5 : track];
+    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2", "a3", "a4", "a5", "a6"};
+    if (track < 0) track = 0;
+    if (track >= 4 + TIMELINE_MAX_AUDIO_TRACKS) track = 4 + TIMELINE_MAX_AUDIO_TRACKS - 1;
+    return names[track];
 }
 
 static bool PlutoSyncTimeline(const char *json) {

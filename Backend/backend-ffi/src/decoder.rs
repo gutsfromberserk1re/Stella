@@ -92,6 +92,11 @@ struct FrameKey {
     path: String,
     index: i64,
     max_width: u32,
+    // Stream-level color tags are authoritative across all frames. Some codecs
+    // leave AVFrame tags unspecified (or vary them across decoded frames), which
+    // can otherwise make identical clips look warmer/cooler on different tracks.
+    stream_color_space: ffi::AVColorSpace,
+    stream_color_range: ffi::AVColorRange,
 }
 
 struct VideoDecoder {
@@ -304,7 +309,8 @@ impl VideoDecoder {
 
         let input = format::input(path)
             .map_err(|error| format!("Could not open video source '{path}': {error}"))?;
-        let (stream_index, time_base, frame_rate, decoder, hw_callback_state) = {
+        let (stream_index, time_base, frame_rate, decoder, hw_callback_state,
+             stream_color_space, stream_color_range) = {
             let stream = input
                 .streams()
                 .best(Type::Video)
@@ -318,7 +324,10 @@ impl VideoDecoder {
                 .map_err(|error| format!("Could not read video stream parameters: {error}"))?;
             // Frame-threaded decode lets FFmpeg parallelise H.264/HEVC across cores.
             context.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
-            let coded_width = unsafe { (*context.as_ptr()).width }.max(0) as u32;
+            let (coded_width, stream_color_space, stream_color_range) = unsafe {
+                let codec_context = &*context.as_ptr();
+                (codec_context.width.max(0) as u32, codec_context.colorspace, codec_context.color_range)
+            };
             let mut hw_callback_state = None;
             let hw_configured = allow_hardware
                 && hw_decode_wanted(coded_width)
@@ -339,7 +348,8 @@ impl VideoDecoder {
                 }
                 Err(error) => return Err(format!("Could not initialize video decoder: {error}")),
             };
-            (stream_index, time_base, fps, decoder, hw_callback_state)
+            (stream_index, time_base, fps, decoder, hw_callback_state,
+             stream_color_space, stream_color_range)
         };
         Ok(Self {
             path: path.to_owned(),
@@ -352,6 +362,8 @@ impl VideoDecoder {
             frame_rate,
             cursor_seconds: -1.0,
             max_width: max_width.max(2) & !1,
+            stream_color_space,
+            stream_color_range,
         })
     }
 
@@ -366,7 +378,9 @@ impl VideoDecoder {
         DECODE_TRANSFER_US.with(|value| value.set(value.get().saturating_add(transfer_started.elapsed().as_micros() as u64)));
         LAST_FRAME_HW.store(!std::ptr::eq(software, decoded), Relaxed);
         let convert_started = std::time::Instant::now();
-        let converted = convert_frame_to_rgba(software, pts_seconds, max_width);
+        let converted = convert_frame_to_rgba(
+            software, pts_seconds, max_width, self.stream_color_space, self.stream_color_range,
+        );
         DECODE_CONVERT_US.with(|value| value.set(value.get().saturating_add(convert_started.elapsed().as_micros() as u64)));
         converted
     }
@@ -653,15 +667,36 @@ impl Coef {
 
 /// Pick the YCbCr matrix the file was mastered with. Untagged HD material is BT.709,
 /// untagged SD is BT.601; the old converter always used BT.601, which shifted HD colours.
-fn matrix_and_range(source: &frame::Video, height: u32) -> (f64, f64, bool) {
-    use ffmpeg::util::color::{Range, Space};
-    let (kr, kb) = match source.color_space() {
-        Space::BT709 => (0.2126, 0.0722),
-        Space::BT470BG | Space::SMPTE170M => (0.299, 0.114),
-        Space::BT2020NCL | Space::BT2020CL => (0.2627, 0.0593),
-        _ => if height >= 720 { (0.2126, 0.0722) } else { (0.299, 0.114) },
+fn matrix_and_range(
+    source: &frame::Video,
+    height: u32,
+    stream_color_space: ffi::AVColorSpace,
+    stream_color_range: ffi::AVColorRange,
+) -> (f64, f64, bool) {
+    // Prefer the stream tags for every frame. A few decoders populate the first
+    // AVFrame with its colour metadata but leave subsequent frames unspecified;
+    // using per-frame fallbacks then produces visible hue/temperature jumps
+    // between otherwise identical copies of the same source on different tracks.
+    let stream_matrix = match stream_color_space {
+        ffi::AVColorSpace::AVCOL_SPC_BT709 => Some((0.2126, 0.0722)),
+        ffi::AVColorSpace::AVCOL_SPC_BT470BG | ffi::AVColorSpace::AVCOL_SPC_SMPTE170M => Some((0.299, 0.114)),
+        ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL | ffi::AVColorSpace::AVCOL_SPC_BT2020_CL => Some((0.2627, 0.0593)),
+        _ => None,
     };
-    (kr, kb, source.color_range() == Range::JPEG)
+    // Do not let per-frame fallback tags override the same stream's matrix:
+    // hardware and software decoder outputs can disagree about whether those
+    // frame tags were copied. That is enough to make identical stacked clips
+    // render with different colour temperatures. Use one deterministic rule
+    // for every frame from this stream when the stream-level tag is missing.
+    let (kr, kb) = stream_matrix
+        .unwrap_or_else(|| if height >= 720 { (0.2126, 0.0722) } else { (0.299, 0.114) });
+    let full_range = match stream_color_range {
+        ffi::AVColorRange::AVCOL_RANGE_JPEG => true,
+        ffi::AVColorRange::AVCOL_RANGE_MPEG => false,
+        _ => matches!(source.format(),
+            Pixel::YUVJ420P | Pixel::YUVJ422P | Pixel::YUVJ444P),
+    };
+    (kr, kb, full_range)
 }
 
 /// Split an RGBA image into row bands and fill them on all cores. Frames are converted
@@ -780,7 +815,13 @@ fn scale_packed_to_rgba(
     });
 }
 
-fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32) -> Result<DecodedFrame, String> {
+fn convert_frame_to_rgba(
+    source: &frame::Video,
+    pts_seconds: f64,
+    max_width: u32,
+    stream_color_space: ffi::AVColorSpace,
+    stream_color_range: ffi::AVColorRange,
+) -> Result<DecodedFrame, String> {
     let width = source.width();
     let height = source.height();
     if width == 0 || height == 0 { return Err("Decoder returned an empty video frame".into()); }
@@ -789,7 +830,7 @@ fn convert_frame_to_rgba(source: &frame::Video, pts_seconds: f64, max_width: u32
     let (ow, oh) = (out_width as usize, out_height as usize);
     let mut rgba = vec![0u8; ow * oh * 4];
     let pixel_format = source.format();
-    let (kr, kb, tagged_full) = matrix_and_range(source, height);
+    let (kr, kb, tagged_full) = matrix_and_range(source, height, stream_color_space, stream_color_range);
 
     match pixel_format {
         Pixel::RGBA | Pixel::BGRA | Pixel::ARGB | Pixel::ABGR => {

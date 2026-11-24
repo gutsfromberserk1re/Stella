@@ -310,7 +310,7 @@ enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
 typedef struct {
     char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
-    int track, mediaIndex; /* 0..3 = video 1..4, 4..5 = audio 1..2 */
+    int track, mediaIndex; /* 0..3 = video V1..V4, 4..9 = audio A1..A6 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
     float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
     bool hasAudio, audioFadeIn, audioFadeOut;
@@ -334,9 +334,14 @@ static bool gTimelineContextConsumedClick;
 static int gTimelineContextClip = -1;
 static Vector2 gTimelineContextPos;
 static Rectangle gTimelineContextRect;
-static int gTimelineVideoTracks = 1, gTimelineAudioTracks = 1;
-static int gTimelineVideoTrackIds[4] = {0, 0, 0, 0};
+#define TIMELINE_MAX_VIDEO_TRACKS 4
+#define TIMELINE_MAX_AUDIO_TRACKS 6
+static int gTimelineVideoTracks = 1, gTimelineAudioTracks = 0;
+static int gTimelineVideoTrackIds[TIMELINE_MAX_VIDEO_TRACKS] = {0, 0, 0, 0};
+static float gTimelineAudioTrackVis[TIMELINE_MAX_AUDIO_TRACKS] = {0};
+static bool gTimelineAudioTrackWanted[TIMELINE_MAX_AUDIO_TRACKS] = {0};
 static int gTimelinePendingVideoTrack = -1;
+static int gTimelinePendingAudioTrack = -1;
 static float TimelinePps(void);
 static float TimelineDuration(void);
 

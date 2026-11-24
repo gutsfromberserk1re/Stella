@@ -18,6 +18,14 @@ pub enum TrackId {
     A1,
     #[serde(rename = "a2")]
     A2,
+    #[serde(rename = "a3")]
+    A3,
+    #[serde(rename = "a4")]
+    A4,
+    #[serde(rename = "a5")]
+    A5,
+    #[serde(rename = "a6")]
+    A6,
 }
 
 impl TrackId {
@@ -29,7 +37,16 @@ impl TrackId {
         if self.is_video() {
             &[Self::V1, Self::V2, Self::V3, Self::V4]
         } else {
-            &[Self::A1, Self::A2]
+            &[Self::A1, Self::A2, Self::A3, Self::A4, Self::A5, Self::A6]
+        }
+    }
+
+    /// Stable lane order shared by timeline serialization, preview and export.
+    pub const fn sort_index(self) -> usize {
+        match self {
+            Self::V1 => 0, Self::V2 => 1, Self::V3 => 2, Self::V4 => 3,
+            Self::A1 => 4, Self::A2 => 5, Self::A3 => 6, Self::A4 => 7,
+            Self::A5 => 8, Self::A6 => 9,
         }
     }
 }
@@ -140,7 +157,7 @@ impl Timeline {
     }
 
     pub fn visible_tracks(&self) -> HashSet<TrackId> {
-        let mut tracks = HashSet::from([TrackId::V1, TrackId::A1]);
+        let mut tracks = HashSet::from([TrackId::V1]);
         tracks.extend(self.clips.iter().map(|clip| clip.track));
         tracks
     }
@@ -259,9 +276,8 @@ impl Timeline {
             .filter_map(|moved_id| self.clips.iter().find(|clip| clip.id == moved_id).cloned())
             .collect();
         ordered_clips.sort_by(|a, b| {
-            let rank = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
-                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
-            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
+            a.track.sort_index().cmp(&b.track.sort_index())
+                .then_with(|| a.start.total_cmp(&b.start))
         });
         for moved in ordered_clips {
             if moved.track.is_video() { self.ripple_lane_after(&moved.id)?; }
@@ -417,7 +433,7 @@ impl Timeline {
         { return Err(TimelineError::InvalidRange); }
         let mut audio = video.clone();
         audio.id = audio_id.clone();
-        audio.track = TrackId::A1;
+        audio.track = self.nearest_free_lane(&audio_id, TrackId::A1, audio.start, audio.duration)?;
         audio.label = format!("{} Audio", video.label);
         audio.linked_clip_id = Some(video.id.clone());
         audio.extra.insert("kind".into(), serde_json::json!("audio"));
@@ -618,6 +634,42 @@ mod tests {
             id: id.to_owned(), track: TrackId::V1, start, duration,
             label: id.to_owned(), linked_clip_id: None, extra: HashMap::new(),
         }
+    }
+
+
+    #[test]
+    fn timeline_starts_with_only_the_primary_video_track_visible() {
+        let timeline = Timeline::default();
+        assert_eq!(timeline.visible_tracks(), HashSet::from([TrackId::V1]));
+    }
+
+    #[test]
+    fn all_six_audio_track_ids_round_trip_through_project_json() {
+        for (name, track) in [
+            ("a1", TrackId::A1), ("a2", TrackId::A2), ("a3", TrackId::A3),
+            ("a4", TrackId::A4), ("a5", TrackId::A5), ("a6", TrackId::A6),
+        ] {
+            assert_eq!(serde_json::from_str::<TrackId>(&format!("\"{name}\"" )).unwrap(), track);
+            assert_eq!(serde_json::to_string(&track).unwrap(), format!("\"{name}\""));
+        }
+    }
+
+    #[test]
+    fn separated_audio_uses_the_next_free_audio_layer_when_a1_is_occupied() {
+        let mut video = video_clip("video", 1.0, 3.0);
+        video.extra.insert("hasAudio".into(), serde_json::json!(true));
+        let occupying_audio = Clip {
+            id: "music".into(), track: TrackId::A1, start: 1.0, duration: 3.0,
+            label: "Music".into(), linked_clip_id: None,
+            extra: HashMap::from([("kind".into(), serde_json::json!("audio"))]),
+        };
+        let mut timeline = Timeline::default();
+        timeline.clips.extend([video, occupying_audio]);
+        timeline.snapping = false;
+
+        let separated = timeline.separate_audio("video", "video-audio".into()).unwrap();
+        assert_eq!(separated.track, TrackId::A2);
+        assert_eq!(separated.linked_clip_id.as_deref(), Some("video"));
     }
 
     #[test]

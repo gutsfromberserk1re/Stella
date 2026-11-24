@@ -1414,10 +1414,10 @@ static void EffectsView(void) {
         gTransitionBodyMeasured = false;
         gEffectSectionHeight[0] = next < 0 ? 96.f : 265.f;
     }
-    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10},
-                                  .clip = {.horizontal = true}}) {
+    CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
         /* Transitions: a measured-height wrapper animates the content just
            like the Colors accordions, with the same 1px border and radius. */
+        CLAY(CLAY_ID("TransCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId transId = CLAY_ID("TransHdr");
         float transOpen = EaseIO(AnimLin(transId.id, gTransOpen ? 1.f : 0.f, 0.2f));
         float transMeasured = Clay_GetElementData(CLAY_ID("TransBody")).boundingBox.height;
@@ -1433,26 +1433,24 @@ static void EffectsView(void) {
                                  transitionModified, false)) gTransOpen = !gTransOpen;
         if (transWrapHeight >= 1.f) {
             CLAY(CLAY_ID("TransWrap"), {.layout = {COLM, .sizing = {GROW, FIX(transWrapHeight)}},
-                                        .clip = {.horizontal = true, .vertical = true}}) {
+                                        .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("TransBody"), {.layout = {COLM, .sizing = {GROW, FIT},
-                                                  .padding = {14, 14, 12, 12}, .childGap = 8}, RCARD,
-                                             .clip = {.horizontal = true}}) {
+                                                  .padding = {14, 14, 12, 12}, .childGap = 8}, RCARD}) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
                     if (next < 0) {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}, .clip = {.horizontal = true}}) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
                             TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
                         }
                     } else {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}, .clip = {.horizontal = true}}) {
+                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
                             TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
                         }
                         const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
                         const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
                         for (int row = 0; row < 3; row++) {
                             CLAY(CLAY_IDI("TransitionChoiceRow", row),
-                                 {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5},
-                                  .clip = {.horizontal = true}}) {
+                                 {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5}}) {
                                 for (int col = 0; col < 2; col++) {
                                     int i = row * 2 + col;
                                     Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
@@ -1501,8 +1499,10 @@ static void EffectsView(void) {
                 }
             }
         }
+        }
 
         /* Filters: six practical presets, no category pills or hidden rows. */
+        CLAY(CLAY_ID("FiltersCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId filtersId = CLAY_ID("FiltersHdr");
         float filtersOpen = EaseIO(AnimLin(filtersId.id, gFiltOpen ? 1.f : 0.f, 0.2f));
         float filtersMeasured = Clay_GetElementData(CLAY_ID("FiltBody")).boundingBox.height;
@@ -1512,11 +1512,10 @@ static void EffectsView(void) {
                                  gFilter != 0, false)) gFiltOpen = !gFiltOpen;
         if (filtersWrapHeight >= 1.f) {
             CLAY(CLAY_ID("FiltersWrap"), {.layout = {COLM, .sizing = {GROW, FIX(filtersWrapHeight)}},
-                                          .clip = {.horizontal = true, .vertical = true}}) {
+                                          .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("FiltBody"), {.layout = {COLM, .sizing = {GROW, FIT},
-                                                 .padding = {12, 12, 10, 10}, .childGap = 10}, RCARD,
-                                           .clip = {.horizontal = true}}) {
+                                                 .padding = {12, 12, 10, 10}, .childGap = 10}, RCARD}) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
                         Tx("Looks", 14, C_TEXT, 0);
                         HSPACE
@@ -1542,6 +1541,7 @@ static void EffectsView(void) {
                 }
             }
         }
+        }
 
         /* Video Effects: section expansion and each individual effect use
            measured-height animation. Every effect's header and controls share
@@ -1549,6 +1549,7 @@ static void EffectsView(void) {
         bool anyVideoEffect = false;
         for (int i = 0; i < 4; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
         for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
+        CLAY(CLAY_ID("VfxCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId vfxId = CLAY_ID("VfxHdr");
         float vfxOpen = EaseIO(AnimLin(vfxId.id, gVfxOpen ? 1.f : 0.f, 0.2f));
         float vfxMeasured = Clay_GetElementData(CLAY_ID("VfxBody")).boundingBox.height;
@@ -1558,11 +1559,10 @@ static void EffectsView(void) {
                                  anyVideoEffect, false)) gVfxOpen = !gVfxOpen;
         if (vfxWrapHeight >= 1.f) {
             CLAY(CLAY_ID("VfxWrap"), {.layout = {COLM, .sizing = {GROW, FIX(vfxWrapHeight)}},
-                                      .clip = {.horizontal = true, .vertical = true}}) {
+                                      .clip = {.vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("VfxBody"), {.layout = {COLM, .sizing = {GROW, FIT},
-                                               .padding = {10, 10, 10, 10}, .childGap = 8}, RCARD,
-                                          .clip = {.horizontal = true}}) {
+                                               .padding = {10, 10, 10, 10}, .childGap = 8}, RCARD}) {
                     for (int i = 0; i < 4; i++) {
                         Clay_ElementId fxId = CLAY_IDI("FxHdr", i);
                         float fxOpen = EaseIO(AnimLin(fxId.id, gFxOpen == i ? 1.f : 0.f, 0.2f));
@@ -1572,14 +1572,12 @@ static void EffectsView(void) {
                         CLAY(CLAY_IDI("FxItem", i), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 0},
                                                        .backgroundColor = C_RCARD,
                                                        .cornerRadius = CLAY_CORNER_RADIUS(18),
-                                                       .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)},
-                                                       .clip = {.horizontal = true, .vertical = true}}) {
+                                                       .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
                             if (FxHeader(i, gFxOpen == i ? 1.f : 0.f))
                                 gFxOpen = (gFxOpen == i) ? -1 : i;
                             if (fxWrapHeight >= 1.f) {
                                 CLAY(CLAY_IDI("FxBodyWrap", i),
-                                     {.layout = {COLM, .sizing = {GROW, FIX(fxWrapHeight)}},
-                                      .clip = {.horizontal = true, .vertical = true}}) {
+                                     {.layout = {COLM, .sizing = {GROW, FIX(fxWrapHeight)}}}) {
                                     FxBody(i);
                                 }
                             }
@@ -1588,6 +1586,7 @@ static void EffectsView(void) {
                     for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
                 }
             }
+        }
         }
     }
 }
@@ -2126,9 +2125,6 @@ static void TextPosGrid(void) {
 }
 
 static void TextView(void) {
-    CLAY(CLAY_ID("TextCol"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10,
-                                         .childAlignment = {.x = CLAY_ALIGN_X_CENTER}},
-                               .clip = {.horizontal = true}}) {
 
         /* ---- Content ---- */
         CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
@@ -2237,7 +2233,6 @@ static void TextView(void) {
             }
         }
         PlutoTextAutoUpdateObserve();
-    }
 }
 
 /* Tab switch: the new page slides in horizontally from the side it sits on in the tab bar
@@ -2324,7 +2319,8 @@ static void RightPanel(void) {
         }
         CLAY(CLAY_ID("InspBody"), {.layout = {.sizing = {GROW, fitBody ? FIT : GROW}}, RPANEL,
                                    .clip = {.horizontal = true, .vertical = true, .childOffset = {gTabDir * (1.f - gTabE) * TAB_SLIDE_PX, -gScroll}}}) {
-            CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10}, .clip = {.horizontal = true}}) {
+            CLAY(CLAY_ID("InspContent"), {.layout = {COLM, .sizing = {GROW, fitBody ? FIT : CLAY_SIZING_FIT(gInspViewH)}, .padding = {13, 13, 15, 13}, .childGap = 10},
+                                       .clip = {.horizontal = true}}) {
                 if (gTimelineSelected < 0 && gRightTab != 3) {
                     CLAY(CLAY_ID("NoClip"), {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C}}) {
                         CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {

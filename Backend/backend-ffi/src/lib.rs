@@ -736,7 +736,7 @@ struct RenderInput { path: String, image: bool, seek: f64 }
 fn render_inputs(timeline: &Timeline, deduplicate: bool) -> Result<(Vec<RenderInput>, HashMap<String, usize>), String> {
     let mut clips: Vec<_> = timeline.clips.iter().filter(|clip| clip.extra.get("path").and_then(Value::as_str).is_some()).collect();
     clips.sort_by(|a, b| {
-        let order = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
+        let order = |track: TrackId| track.sort_index();
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     let mut inputs: Vec<RenderInput> = Vec::with_capacity(clips.len());
@@ -810,7 +810,7 @@ fn timeline_transition_start_at(timeline: &Timeline, at: f64) -> Option<f64> {
         .filter(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"))
         .collect();
     clips.sort_by(|a, b| {
-        let rank = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
+        let rank = |track: TrackId| track.sort_index();
         rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     clips.windows(2).find_map(|pair| {
@@ -859,7 +859,7 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
     let mut graph = vec![format!("color=c=black:s={width}x{height}:r={fps}:d={duration:.5},format=rgba[base0]")];
     let mut video_clips: Vec<_> = timeline.clips.iter().filter(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio") && indices.contains_key(&clip.id)).collect();
     video_clips.sort_by(|a, b| {
-        let order = |track: TrackId| match track { TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2, TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5 };
+        let order = |track: TrackId| track.sort_index();
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
     let mut outgoing = Vec::with_capacity(video_clips.len());
@@ -1127,10 +1127,7 @@ impl PreviewEngine {
             clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
         }).collect();
         ordered_video.sort_by(|a, b| {
-            let rank = |track: TrackId| match track {
-                TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
-                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5,
-            };
+            let rank = |track: TrackId| track.sort_index();
             rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
         });
         let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
@@ -1167,10 +1164,7 @@ impl PreviewEngine {
         // Keep compositing order stable for every layer. Within one track, the
         // incoming clip must sit above the outgoing clip during its transition.
         active.sort_by(|a, b| {
-            let rank = |track: TrackId| match track {
-                TrackId::V1 => 0, TrackId::V2 => 1, TrackId::V3 => 2,
-                TrackId::V4 => 3, TrackId::A1 => 4, TrackId::A2 => 5,
-            };
+            let rank = |track: TrackId| track.sort_index();
             rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
         });
 
