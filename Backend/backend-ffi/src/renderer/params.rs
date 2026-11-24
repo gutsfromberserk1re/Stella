@@ -1,9 +1,10 @@
-//! Maps a clip's `props` JSON onto the preview shader's uniform block.
+//! Maps a clip's `props` JSON onto the shared WGPU shader uniform block.
 //!
 //! The property tree is the one the C inspector writes (`props.transform.*`,
-//! `props.colors.*`, `props.effects.*`) and that `filters.rs` reads for export,
-//! so a control only has to be wired in two places: here (preview) and there
-//! (export). Keep the key names and defaults identical to `filters.rs`.
+//! `props.colors.*`, `props.effects.*`). Preview and export both build these
+//! same uniforms and pass them through the same WGPU shader, so visual controls
+//! are mapped here once. `filters.rs` remains responsible for audio filters;
+//! active preview and final-export rendering do not use FFmpeg video filters.
 //!
 //! Layout rule: every field is a `[f32; 4]` so the Rust struct has exactly the
 //! same std140 layout as `Params` in preview.wgsl (no padding surprises).

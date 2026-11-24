@@ -14,7 +14,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     ffi::{CStr, CString},
     hash::{Hash, Hasher},
-    io::Read,
+    io::{Read, Write},
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
     process::{Child, ChildStdout, Stdio},
@@ -45,19 +45,19 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 static PREVIEW_RESTARTS: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_PROXY_CLIPS: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_ORIGINAL_CLIPS: AtomicU64 = AtomicU64::new(0);
-/// Phase 0 telemetry. PATH: 0 = none yet, 1 = native GPU compositor, 2 = FFmpeg graph fallback.
-/// A fallback frame is far slower, so F3 must say when it is happening and why.
+/// Preview telemetry. PATH: 0 = none yet, 1 = WGPU compositor.
+/// A visual decode/composite failure is reported as an error; there is no FFmpeg visual fallback.
 static PREVIEW_PATH: AtomicU64 = AtomicU64::new(0);
-/// Why the last frame left the native path: 0 none, 1 transition, 2 still image,
-/// 4 missing/empty source, 5 decoder error, 6 GPU composite error.
+/// Last WGPU preview failure reason: 0 = none, 4 = missing/empty source,
+/// 5 = decoder error, 6 = GPU composite error.
 static PREVIEW_FALLBACK_REASON: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_COMPOSITE_US: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_TRANSFER_US: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_CONVERT_US: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_PUBLISH_US: AtomicU64 = AtomicU64::new(0);
-fn note_fallback(reason: u64) -> Result<Option<(u32, u32, f64)>, String> {
+fn note_wgpu_preview_failure(reason: u64, detail: impl Into<String>) -> Result<Option<(u32, u32, f64)>, String> {
     PREVIEW_FALLBACK_REASON.store(reason, Ordering::Relaxed);
-    Ok(None)
+    Err(format!("WGPU preview failed (reason {reason}): {}. FFmpeg visual fallback is disabled to preserve preview/export consistency.", detail.into()))
 }
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
@@ -156,6 +156,8 @@ struct DecodeSource {
     /// Per-layer decode width. Small picture-in-picture layers should not
     /// force a full-resolution decode when they occupy only a fraction of the canvas.
     max_width: u32,
+    /// Still-image items are decoded once and reused for all timeline times.
+    is_still_image: bool,
 }
 
 struct DecodeTask {
@@ -219,7 +221,13 @@ fn decode_ahead_loop(
         decoder::begin_decode_timing();
         let decode_started = Instant::now();
         let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
-            .map(|source| pool.frame_at(&source.stream_key, &source.path, source.source_time, source.max_width, task.stepping))
+            .map(|source| {
+                if source.is_still_image {
+                    pool.still_frame(&source.path, source.max_width)
+                } else {
+                    pool.frame_at(&source.stream_key, &source.path, source.source_time, source.max_width, task.stepping)
+                }
+            })
             .collect();
         let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
         let (transfer_us, convert_us) = decoder::take_decode_timing();
@@ -244,6 +252,7 @@ fn decode_ahead_loop(
         'prefetch: for step in 1..=PREFETCH_FRAMES {
             if !task.prefetch { break; }
             for source in &task.sources {
+                if source.is_still_image { continue; }
                 // Step in *source* frames (Yoru's queue counts decoded frames); at a 60 fps
                 // preview over 30 fps footage, timeline-fps steps only covered half as far.
                 let source_fps = pool.frame_rate_of(&source.path).unwrap_or(task.fps).max(1.0);
@@ -839,7 +848,8 @@ fn split_source_streams(
             .map(|(ordinal, clip)| format!("{prefix}_{}_{}", clip.id.replace(|c: char| !c.is_ascii_alphanumeric(), "_"), ordinal))
             .collect();
         if labels.len() == 1 {
-            graph.push(format!("[{input}:{stream}]null[{}]", labels[0]));
+            let passthrough = if video { "null" } else { "anull" };
+            graph.push(format!("[{input}:{stream}]{passthrough}[{}]", labels[0]));
         } else {
             graph.push(format!("[{input}:{stream}]{splitter}={}[{}]", labels.len(), labels.join("][")));
         }
@@ -1024,32 +1034,375 @@ fn ensure_export_does_not_overwrite_input(output: &str, inputs: &[RenderInput]) 
     Ok(())
 }
 
+/// Every visible video-track clip is processed by the WGPU compositor.
+/// Audio-only tracks stay in FFmpeg's audio graph and never enter this renderer.
+fn is_wgpu_visual_clip(clip: &Clip) -> bool {
+    clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+}
+
+fn export_source_width(width: u32, height: u32) -> u32 {
+    width.max(height).clamp(160, 3840) & !1
+}
+
+/// Render one timeline timestamp using the exact same ordering, keyframe
+/// evaluator, transition uniforms, and WGPU compositor as native preview.
+fn render_wgpu_export_frame(
+    timeline: &Timeline,
+    frame_at: f64,
+    width: u32,
+    height: u32,
+    decoder_pool: &mut DecoderPool,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    let mut ordered_video: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
+        clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+    }).collect();
+    ordered_video.sort_by(|a, b| {
+        a.track.sort_index().cmp(&b.track.sort_index())
+            .then_with(|| a.start.total_cmp(&b.start))
+    });
+
+    let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
+    for pair in ordered_video.windows(2) {
+        let Some((kind, duration)) = transition_between(pair[0], pair[1]) else { continue; };
+        let transition_start = pair[1].start - duration;
+        if frame_at + 1e-7 >= transition_start && frame_at < pair[1].start - 1e-7 {
+            incoming_transitions.insert(pair[1].id.clone(), (kind, duration));
+        }
+    }
+
+    let mut active: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
+        clip.track.is_video()
+            && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
+            && frame_at + 1e-7 >= clip.start
+            && frame_at < clip.end() - 1e-7
+    }).collect();
+    for clip in &ordered_video {
+        if incoming_transitions.contains_key(&clip.id) && !active.iter().any(|current| current.id == clip.id) {
+            active.push(*clip);
+        }
+    }
+    active.sort_by(|a, b| {
+        a.track.sort_index().cmp(&b.track.sort_index())
+            .then_with(|| a.start.total_cmp(&b.start))
+    });
+
+    let max_source_width = export_source_width(width, height);
+    let mut decoded_frames = Vec::with_capacity(active.len());
+    let mut uniforms = Vec::with_capacity(active.len());
+    let mut source_keys = Vec::with_capacity(active.len());
+
+    for clip in &active {
+        let path = clip.extra.get("path").and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("Video clip '{}' has no source path", clip.id))?;
+        let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+        let source_time = if let Some((_, duration)) = incoming_transitions.get(&clip.id) {
+            transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+        } else {
+            (source_offset + (frame_at - clip.start)).max(0.0)
+        };
+        let props = clip.extra.get("props").unwrap_or(&Value::Null);
+        let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
+        let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
+            (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
+        });
+        let layer_uniforms = LayerUniforms::from_props_with_keyframes_and_transition(
+            props, frame_at, keyframes, transition,
+        );
+        // Match preview's resolution-aware decode policy, but use the export
+        // canvas dimensions instead of its smaller preview-quality dimensions.
+        let layer_scale = layer_uniforms.geo0[0].max(layer_uniforms.geo0[1]).clamp(0.01, 10.0);
+        let layer_max_width = ((max_source_width as f32 * layer_scale).ceil() as u32)
+            .clamp(160, max_source_width);
+        let is_still_image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
+        let frame = if is_still_image {
+            decoder_pool.still_frame(path, layer_max_width)?
+        } else {
+            decoder_pool.frame_at(&clip.id, path, source_time, layer_max_width, false)?
+        };
+        let source_key = if is_still_image {
+            format!("still:{}:{}x{}", path, frame.width, frame.height)
+        } else {
+            format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
+        };
+        source_keys.push(source_key);
+        uniforms.push(layer_uniforms);
+        decoded_frames.push(frame);
+    }
+
+    let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
+        let frame = &decoded_frames[index];
+        GpuLayerFrame {
+            key: clip.id.as_str(),
+            source_key: source_keys[index].as_str(),
+            pixels: frame.rgba.as_slice(),
+            width: frame.width,
+            height: frame.height,
+            uniforms: uniforms[index],
+        }
+    }).collect();
+
+    GpuPreviewRenderer::composite_rgba_into(&layers, width, height, output)
+}
+
+/// Keep only source files that actually contribute audio to the final mux.
+/// Source paths are deduplicated by `render_inputs`; this remaps those original
+/// indices to a compact FFmpeg input list after raw WGPU video has claimed input 0.
+fn export_audio_inputs(
+    timeline: &Timeline,
+    inputs: &[RenderInput],
+    source_indices: &HashMap<String, usize>,
+) -> (Vec<RenderInput>, HashMap<String, usize>) {
+    let mut audio_inputs = Vec::new();
+    let mut remapped_sources = HashMap::<usize, usize>::new();
+    let mut audio_indices = HashMap::new();
+
+    for clip in &timeline.clips {
+        let is_audio = !clip.track.is_video()
+            || clip.extra.get("hasAudio").and_then(Value::as_bool).unwrap_or(false);
+        if !is_audio || clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
+            continue;
+        }
+        let Some(&source_index) = source_indices.get(&clip.id) else { continue; };
+        let compact_index = if let Some(&existing) = remapped_sources.get(&source_index) {
+            existing
+        } else {
+            let next = audio_inputs.len();
+            let Some(input) = inputs.get(source_index) else { continue; };
+            audio_inputs.push(input.clone());
+            remapped_sources.insert(source_index, next);
+            next
+        };
+        audio_indices.insert(clip.id.clone(), compact_index);
+    }
+    (audio_inputs, audio_indices)
+}
+
+/// The video input is raw RGBA from WGPU (input 0). Audio-only source media
+/// follow it and are addressed through the compacted `audio_indices` map.
+fn export_audio_filter_graph(
+    timeline: &Timeline,
+    indices: &HashMap<String, usize>,
+    input_offset: usize,
+) -> (String, bool) {
+    let duration = project_duration(timeline);
+    let mut graph = Vec::new();
+    let audio_clips: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
+        let is_audio = !clip.track.is_video()
+            || clip.extra.get("hasAudio").and_then(Value::as_bool).unwrap_or(false);
+        is_audio
+            && clip.extra.get("kind").and_then(Value::as_str) != Some("image")
+            && indices.contains_key(&clip.id)
+    }).collect();
+
+    // A media input can feed more than one timeline clip. Split its audio
+    // stream once so each independently trimmed/positioned clip has its own
+    // consumer, matching the established FFmpeg export graph's behavior.
+    let shifted_indices: HashMap<String, usize> = indices.iter()
+        .map(|(clip_id, input)| (clip_id.clone(), *input + input_offset))
+        .collect();
+    let audio_streams = split_source_streams(
+        &mut graph, &audio_clips, &shifted_indices, false, "wgpu_asrc",
+    );
+    let mut audio_labels = Vec::new();
+    for clip in &audio_clips {
+        let Some(source) = audio_streams.get(&clip.id) else { continue; };
+        let value = serde_json::to_value(clip).unwrap_or_default();
+        let audio = filters::audio_filters(&value, clip.duration, duration);
+        let label = format!("a{}", audio_labels.len());
+        graph.push(format!("[{source}]{audio}[{label}]"));
+        audio_labels.push(label);
+    }
+
+    if audio_labels.len() == 1 {
+        graph.push(format!(
+            "[{}]atrim=duration={duration:.5},asetpts=PTS-STARTPTS,alimiter=limit=0.95:attack=5:release=50[aout]",
+            audio_labels[0]
+        ));
+    } else if !audio_labels.is_empty() {
+        let inputs = audio_labels.iter().map(|label| format!("[{label}]")).collect::<String>();
+        graph.push(format!(
+            "{inputs}amix=inputs={}:duration=longest:normalize=0,atrim=duration={duration:.5},asetpts=PTS-STARTPTS,alimiter=limit=0.95:attack=5:release=50[aout]",
+            audio_labels.len()
+        ));
+    }
+    (graph.join(";"), !audio_labels.is_empty())
+}
+
+fn preflight_wgpu_export(
+    timeline: &Timeline,
+    width: u32,
+    height: u32,
+) -> Result<(Vec<u8>, DecoderPool), String> {
+    // Validate every visual source before creating the output file. Use a
+    // throwaway pool: pre-decoding a 2px frame advances a sequential decoder,
+    // and reusing that decoder for the full-resolution first frame can skip to
+    // the next source frame when its conversion width changes.
+    {
+        let mut validation_pool = DecoderPool::default();
+        for clip in timeline.clips.iter().filter(|clip| is_wgpu_visual_clip(clip)) {
+            let path = clip.extra.get("path").and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| format!("Visual clip '{}' has no source path", clip.id))?;
+            let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+            if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
+                validation_pool.still_frame(path, 2)?;
+            } else {
+                validation_pool.frame_at(&clip.id, path, source_offset, 2, false)?;
+            }
+        }
+    }
+
+    // Render frame zero with a fresh pool at the actual export sampling size.
+    // Keep that pool for the remaining frames so sequential decode continues
+    // from the correct first-frame position without decoding it twice.
+    let mut decoder_pool = DecoderPool::default();
+    let mut first_frame = Vec::new();
+    render_wgpu_export_frame(timeline, 0.0, width, height, &mut decoder_pool, &mut first_frame)?;
+    Ok((first_frame, decoder_pool))
+}
+
+fn export_project_wgpu(
+    timeline: &Timeline,
+    output_path: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    id: u64,
+    inputs: &[RenderInput],
+    indices: &HashMap<String, usize>,
+    duration: f64,
+    decoder_pool: &mut DecoderPool,
+    mut frame_pixels: Vec<u8>,
+) -> Result<Value, String> {
+    let (audio_inputs, audio_indices) = export_audio_inputs(timeline, inputs, indices);
+    let (audio_graph, has_audio) = export_audio_filter_graph(timeline, &audio_indices, 1);
+    let ffmpeg = multimedia_binary("ffmpeg");
+    let audio_script = if has_audio { Some(filter_script(id, &audio_graph)?) } else { None };
+    let mut command = media_command(&ffmpeg);
+    command.args([
+        "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgba",
+        "-video_size", &format!("{width}x{height}"),
+        "-framerate", &fps.to_string(), "-i", "pipe:0",
+    ]);
+    for input in &audio_inputs {
+        command.arg("-i").arg(&input.path);
+    }
+    if let Some(script) = audio_script.as_ref() {
+        append_filter_graph_arg(&mut command, &ffmpeg, script);
+    }
+    command.args(["-map", "0:v:0"]);
+    if has_audio {
+        command.args(["-map", "[aout]"]);
+    }
+    command.args([
+        "-t", &format!("{duration:.5}"), "-r", &fps.to_string(),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    ]);
+    if has_audio {
+        command.args(["-c:a", "aac", "-b:a", "192k"]);
+    } else {
+        command.arg("-an");
+    }
+    command.args(["-movflags", "+faststart", "-y"]).arg(output_path)
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| {
+        if let Some(script) = audio_script.as_ref() { let _ = std::fs::remove_file(script); }
+        format!("Could not start FFmpeg encoder: {error}")
+    })?;
+    let stderr_reader = child.stderr.take().map(|mut stderr| thread::spawn(move || {
+        // Drain stderr while frames are being written so a verbose encoder can
+        // never fill the OS pipe and stall the render worker. Retain only a
+        // bounded diagnostic tail.
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if captured.len() < 1024 * 1024 {
+                        let keep = read.min(1024 * 1024 - captured.len());
+                        captured.extend_from_slice(&chunk[..keep]);
+                    }
+                }
+            }
+        }
+        captured
+    }));
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.and_then(|reader| reader.join().ok());
+        if let Some(script) = audio_script.as_ref() { let _ = std::fs::remove_file(script); }
+        return Err("FFmpeg encoder did not expose its frame input".into());
+    };
+    let frame_count = (duration * fps as f64).ceil().max(1.0) as u64;
+    let render_result = (|| -> Result<(), String> {
+        for frame_index in 0..frame_count {
+            if frame_index > 0 {
+                let frame_at = frame_index as f64 / fps as f64;
+                render_wgpu_export_frame(timeline, frame_at, width, height, decoder_pool, &mut frame_pixels)?;
+            }
+            stdin.write_all(&frame_pixels)
+                .map_err(|error| format!("FFmpeg stopped accepting WGPU-rendered frames: {error}"))?;
+        }
+        Ok(())
+    })();
+    drop(stdin);
+    if render_result.is_err() {
+        let _ = child.kill();
+    }
+    let status_result = child.wait();
+    let stderr = stderr_reader.and_then(|reader| reader.join().ok()).unwrap_or_default();
+    if let Some(script) = audio_script.as_ref() { let _ = std::fs::remove_file(script); }
+    if let Err(error) = render_result {
+        let _ = std::fs::remove_file(output_path);
+        return Err(error);
+    }
+    let status = status_result.map_err(|error| format!("Could not wait for FFmpeg encoder: {error}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(output_path);
+        let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            "FFmpeg could not encode the WGPU-rendered export".into()
+        } else {
+            detail.chars().take(320).collect()
+        });
+    }
+    Ok(json!({
+        "outputPath": output_path, "duration": duration, "width": width, "height": height,
+        "fps": fps, "renderBackend": "wgpu"
+    }))
+}
+
 fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     let timeline: Timeline = serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?;
     let output_path = request["path"].as_str().ok_or("Export path is required")?;
-    let width = request["width"].as_u64().unwrap_or(1920).clamp(320, 3840) as u32;
-    let height = request["height"].as_u64().unwrap_or(1080).clamp(180, 2160) as u32;
+    // H.264 4:2:0 output needs even dimensions. Normalize once so WGPU's
+    // render target and FFmpeg's encoder always receive the same valid size.
+    let width = (request["width"].as_u64().unwrap_or(1920).clamp(320, 3840) as u32) & !1;
+    let height = (request["height"].as_u64().unwrap_or(1080).clamp(180, 2160) as u32) & !1;
     let fps = request["fps"].as_u64().unwrap_or(30).clamp(1, 120) as u32;
-    let (graph, inputs, duration, has_audio) = export_filter_graph(&timeline, width, height, fps)?;
+    let duration = project_duration(&timeline);
+    if duration <= 0.0 { return Err("Add at least one clip before exporting".into()); }
+
+    let (inputs, indices) = render_inputs(&timeline, true)?;
     ensure_export_does_not_overwrite_input(output_path, &inputs)?;
-    let script = filter_script(id, &graph)?;
-    let ffmpeg = multimedia_binary("ffmpeg");
-    let mut command = media_command(&ffmpeg);
-    command.args(["-hide_banner", "-loglevel", "error"]);
-    append_filter_graph_arg(&mut command, &ffmpeg, &script);
-    for input in inputs {
-        if input.image { command.args(["-loop", "1", "-framerate", &fps.to_string()]); }
-        command.arg("-i").arg(input.path);
-    }
-    command.args(["-map", "[vout]"]);
-    if has_audio { command.args(["-map", "[aout]"]); }
-    command.args(["-t", &format!("{duration:.5}"), "-r", &fps.to_string(), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]);
-    if has_audio { command.args(["-c:a", "aac", "-b:a", "192k"]); } else { command.arg("-an"); }
-    command.args(["-movflags", "+faststart", "-y"]).arg(output_path);
-    let result = command.output().map_err(|e| format!("Could not start FFmpeg: {e}"))?;
-    let _ = std::fs::remove_file(script);
-    if !result.status.success() { return Err(ffmpeg_error(result)); }
-    Ok(json!({"outputPath": output_path, "duration": duration, "width": width, "height": height, "fps": fps}))
+
+    // WGPU is the sole video renderer for export. FFmpeg receives already
+    // composited RGBA frames and handles audio filtering, encoding, and muxing.
+    // A source WGPU cannot decode/render is reported before output starts;
+    // never silently switch to a second visual implementation.
+    let (first_frame, mut decoder_pool) = preflight_wgpu_export(&timeline, width, height)
+        .map_err(|error| format!("WGPU export preflight failed: {error}"))?;
+    export_project_wgpu(
+        &timeline, output_path, width, height, fps, id,
+        &inputs, &indices, duration, &mut decoder_pool, first_frame,
+    )
 }
 
 fn preview_signature(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<u64, String> {
@@ -1103,9 +1456,9 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
 }
 
 impl PreviewEngine {
-    /// Fast path for video playback, transform keyframes and transitions: reuse
-    /// in-process FFmpeg decoders, then evaluate every active layer in WGPU.
-    /// Still images and unsupported media retain the FFmpeg graph fallback.
+    /// Sole visual preview path: decode video/still-image frames in-process,
+    /// then evaluate all active transforms, colors, effects and transitions in WGPU.
+    /// Unsupported sources fail visibly rather than using a second visual engine.
     fn render_native(
         &mut self,
         timeline: &Timeline,
@@ -1168,15 +1521,12 @@ impl PreviewEngine {
             rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
         });
 
-        // Video keyframes are evaluated into the same WGPU uniforms as static
-        // transforms, so animated clips stay on the low-latency native path.
+        // Video keyframes and still-image layers both use the same WGPU
+        // uniforms/compositor. Still images are loaded once by the decode worker.
         for clip in &active {
-            if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
-                return note_fallback(2);
-            }
             let source = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             if source.is_empty() {
-                return note_fallback(4);
+                return note_wgpu_preview_failure(4, format!("visual clip '{}' has no source path", clip.id));
             }
         }
 
@@ -1202,10 +1552,9 @@ impl PreviewEngine {
         let mut layer_uniforms = Vec::with_capacity(active.len());
         let mut source_lookup: HashMap<(String, i64), usize> = HashMap::new();
         for clip in &active {
-            let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
             let source = preview_source_path(clip);
             if !std::path::Path::new(&source).is_file() {
-                return note_fallback(4);
+                return note_wgpu_preview_failure(4, format!("source media is missing: {source}"));
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
             let source_time = if let Some((_, duration)) = incoming_transitions.get(&clip.id) {
@@ -1228,13 +1577,14 @@ impl PreviewEngine {
                 .clamp(160, max_source_width);
             layer_uniforms.push(uniforms);
             if source.is_empty() {
-                eprintln!("Stella native preview fallback for '{}': empty source path", original);
-                return note_fallback(4);
+                return note_wgpu_preview_failure(4, format!("visual clip '{}' has an empty source path", clip.id));
             }
             // Microsecond identity is deliberately finer than a video frame:
             // it merges duplicate layer requests without merging neighbouring
             // source frames from high-frame-rate footage.
-            let lookup_key = (source.clone(), (source_time * 1_000_000.0).round() as i64);
+            let is_still_image = clip.extra.get("kind").and_then(Value::as_str) == Some("image");
+            let source_time_key = if is_still_image { 0 } else { (source_time * 1_000_000.0).round() as i64 };
+            let lookup_key = (source.clone(), source_time_key);
             if let Some(&index) = source_lookup.get(&lookup_key) {
                 sources[index].remaining = sources[index].remaining.max(remaining);
                 sources[index].max_width = sources[index].max_width.max(layer_max_width);
@@ -1242,7 +1592,10 @@ impl PreviewEngine {
             } else {
                 let index = sources.len();
                 source_lookup.insert(lookup_key, index);
-                sources.push(DecodeSource { stream_key: clip.id.clone(), path: source, source_time, remaining, max_width: layer_max_width });
+                sources.push(DecodeSource {
+                    stream_key: clip.id.clone(), path: source, source_time, remaining,
+                    max_width: layer_max_width, is_still_image,
+                });
                 source_indices.push(index);
             }
         }
@@ -1256,8 +1609,7 @@ impl PreviewEngine {
         }) {
             Ok(batch) => batch,
             Err(error) => {
-                eprintln!("Stella native preview fallback: {error}");
-                return note_fallback(5);
+                return note_wgpu_preview_failure(5, format!("source decoding failed: {error}"));
             }
         };
         *decode_ms = batch.decode_ms;
@@ -1267,10 +1619,14 @@ impl PreviewEngine {
         *ring_depth = batch.prefetched_frames;
         // Stable source-frame keys let the GPU keep one uploaded texture for
         // identical source frames shared by multiple clip layers.
-        let source_keys: Vec<String> = active.iter().zip(source_indices.iter()).map(|(_clip, &source_index)| {
+        let source_keys: Vec<String> = active.iter().zip(source_indices.iter()).map(|(clip, &source_index)| {
             let frame = &decoded[source_index];
             let path = &source_paths[source_index];
-            format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
+            if clip.extra.get("kind").and_then(Value::as_str) == Some("image") {
+                format!("still:{}:{}x{}", path, frame.width, frame.height)
+            } else {
+                format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
+            }
         }).collect();
         let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
             let frame = &decoded[source_indices[index]];
@@ -1288,8 +1644,7 @@ impl PreviewEngine {
         let mut pixels = match GpuPreviewRenderer::composite_rgba(&layers, width, height) {
             Ok(pixels) => pixels,
             Err(error) => {
-                eprintln!("Stella native GPU preview fallback: {error}");
-                return note_fallback(6);
+                return note_wgpu_preview_failure(6, format!("GPU compositing failed: {error}"));
             }
         };
         PREVIEW_COMPOSITE_US.store(composite_started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1326,114 +1681,15 @@ impl PreviewEngine {
             let target_index = (at * fps as f64).round() as u64;
             let frame_at = target_index as f64 / fps as f64;
 
-            // Most playback frames now use persistent in-process decoders and
-            // Stella's GPU compositor. Complex/unsupported cases retain the
-            // old FFmpeg graph path as a correctness fallback.
-            if let Some(native) = self.render_native(&timeline, frame_at, width, height, id, fps, playing, stepping, &mut decode_ms, &mut ring_depth)? {
-                return Ok(native);
-            }
-            PREVIEW_PATH.store(2, Ordering::Relaxed);
-
-            let mut preview_timeline = (*timeline).clone();
-            preview_timeline.clips.retain(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"));
-            let (mut proxied, mut originals) = (0u64, 0u64);
-            for clip in &mut preview_timeline.clips {
-                let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
-                let source = preview_source_path(clip);
-                if source != original { proxied += 1; } else { originals += 1; }
-                if !std::path::Path::new(&source).is_file() { return Err(format!("Media file is missing: {source}")); }
-                clip.extra.insert("path".into(), Value::String(source));
-                clip.extra.insert("hasAudio".into(), Value::Bool(false));
-                if original.is_empty() { return Err("Video clip has no source path".into()); }
-            }
-            PREVIEW_PROXY_CLIPS.store(proxied, Ordering::Relaxed);
-            PREVIEW_ORIGINAL_CLIPS.store(originals, Ordering::Relaxed);
-            if preview_timeline.clips.is_empty() {
-                self.stream = None;
-                publish_black_frame(id, width, height, frame_at)?;
-                return Ok((width, height, frame_at));
-            }
-            if frame_at >= project_duration(&preview_timeline) {
-                self.stream = None;
-                publish_black_frame(id, width, height, frame_at)?;
-                return Ok((width, height, frame_at));
-            }
-            let signature = preview_signature(&preview_timeline, width, height, fps)?;
-            let transition_start = timeline_transition_start_at(&preview_timeline, frame_at);
-            let restart = self.stream.as_ref().is_none_or(|stream| stream.signature != signature ||
-                stream.width != width || stream.height != height || stream.fps != fps ||
-                (target_index < stream.origin_index + stream.next_index &&
-                    stream.last_index.map(|index| stream.origin_index + index) != Some(target_index)));
-            if restart {
-                self.stream = None;
-                let setup_started = Instant::now();
-                /* Rebuild at the beginning of the active transition. Starting at
-                   timeline zero made a seek into a late transition decode the
-                   entire project again. */
-                let origin_index = transition_start
-                    .map(|start| (start * fps as f64).floor().max(0.0) as u64)
-                    .unwrap_or(target_index);
-                let origin_time = origin_index as f64 / fps as f64;
-                let mut shifted = preview_timeline.clone();
-                shifted.clips.retain(|clip| clip.end() > origin_time);
-                for clip in &mut shifted.clips {
-                    let old_start = clip.start;
-                    let old_end = clip.end();
-                    let old_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
-                    let elapsed = (origin_time - old_start).max(0.0);
-                    let seek = old_offset + elapsed;
-                    clip.start = (old_start - origin_time).max(0.0);
-                    clip.duration = old_end - old_start.max(origin_time);
-                    clip.extra.insert("previewSeek".into(), json!(seek));
-                    clip.extra.insert("sourceOffset".into(), json!(0.0));
-                    if origin_time > 0.0 { clip.extra.insert("previewSeekAdjusted".into(), json!(true)); }
-                    else { clip.extra.remove("previewSeekAdjusted"); }
-                }
-                PREVIEW_RESTARTS.fetch_add(1, Ordering::Relaxed);
-                self.stream = Some(start_preview_stream(&shifted, width, height, fps, id, signature, origin_index)?);
-                setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
-            }
-            let stream = self.stream.as_mut().ok_or("Preview stream is unavailable")?;
-            let local_target_index = target_index.saturating_sub(stream.origin_index);
-            let decode_started = Instant::now();
-            let ring = Arc::clone(&stream.ring);
-            let mut frame: Option<Vec<u8>> = None;
-            {
-                let mut st = ring.state.lock().map_err(|_| "Preview ring lock failed".to_string())?;
-                if stream.last_index != Some(local_target_index) {
-                    loop {
-                        /* Frames behind the target are dropped, never shown. */
-                        while st.frames.front().is_some_and(|(index, _)| *index < local_target_index) {
-                            if let Some((_, old)) = st.frames.pop_front() { st.free.push(old); }
-                            ring.changed.notify_all();
-                        }
-                        if st.frames.front().is_some_and(|(index, _)| *index == local_target_index) {
-                            frame = st.frames.pop_front().map(|(_, buf)| buf);
-                            ring.changed.notify_all();
-                            break;
-                        }
-                        if st.ended {
-                            let status = stream.child.try_wait().ok().flatten().map(|status| status.to_string());
-                            return Err(match status {
-                                Some(status) => format!("FFmpeg preview stream ended before frame {local_target_index} ({status})"),
-                                None => format!("FFmpeg preview stream ended before frame {local_target_index}"),
-                            });
-                        }
-                        st = ring.changed.wait(st).map_err(|_| "Preview ring lock failed".to_string())?;
-                    }
-                }
-                ring_depth = st.frames.len();
-            }
-            decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-            if let Some(mut buf) = frame {
-                stream.last_index = Some(local_target_index);
-                stream.next_index = local_target_index + 1;
-                publish_preview_buffer(id, width, height, frame_at, &mut buf, false)?;
-                if let Ok(mut st) = ring.state.lock() { st.free.push(buf); }
-            } else {
-                publish_preview_buffer(id, width, height, frame_at, &mut Vec::new(), true)?;
-            }
-            Ok((width, height, frame_at))
+            // Both preview and export use the same in-process decoder and WGPU
+            // compositor. There is deliberately no FFmpeg video-filter fallback:
+            // a source WGPU cannot process fails visibly instead of rendering with
+            // a second, visually different implementation.
+            let native = self.render_native(
+                &timeline, frame_at, width, height, id, fps, playing, stepping,
+                &mut decode_ms, &mut ring_depth,
+            )?;
+            native.ok_or_else(|| "WGPU preview did not produce a frame; FFmpeg visual fallback is disabled".to_owned())
         })();
         if result.is_err() { self.stream = None; }
         (result, setup_ms, decode_ms, ring_depth)
@@ -2001,6 +2257,81 @@ mod tests {
             linked_clip_id: None,
             extra: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn wgpu_preview_reports_errors_instead_of_using_ffmpeg_visual_fallback() {
+        let error = note_wgpu_preview_failure(5, "unsupported test pixel format").unwrap_err();
+        assert!(error.contains("FFmpeg visual fallback is disabled"));
+        assert!(error.contains("unsupported test pixel format"));
+    }
+
+    #[test]
+    fn wgpu_is_the_visual_renderer_for_video_and_still_image_clips() {
+        let mut video = test_clip("wgpu-video");
+        video.extra.insert("path".into(), json!("video.mp4"));
+        let mut image = test_clip("wgpu-image");
+        image.extra.insert("kind".into(), json!("image"));
+        image.extra.insert("path".into(), json!("still.png"));
+        assert!(is_wgpu_visual_clip(&video));
+        assert!(is_wgpu_visual_clip(&image));
+
+        let mut audio = test_clip("wgpu-audio");
+        audio.track = TrackId::A1;
+        assert!(!is_wgpu_visual_clip(&audio));
+    }
+
+    #[test]
+    fn wgpu_export_passes_only_audio_sources_to_ffmpeg() {
+        let mut video = test_clip("video");
+        video.extra.insert("path".into(), json!("video.mp4"));
+        let mut image = test_clip("image");
+        image.extra.insert("kind".into(), json!("image"));
+        image.extra.insert("path".into(), json!("still.png"));
+        let mut audio = test_clip("audio");
+        audio.track = TrackId::A1;
+        audio.extra.insert("path".into(), json!("music.wav"));
+
+        let timeline = Timeline { clips: vec![video, image, audio], ..Timeline::default() };
+        let inputs = vec![
+            RenderInput { path: "video.mp4".into(), image: false, seek: 0.0 },
+            RenderInput { path: "still.png".into(), image: true, seek: 0.0 },
+            RenderInput { path: "music.wav".into(), image: false, seek: 0.0 },
+        ];
+        let indices = HashMap::from([
+            ("video".to_owned(), 0),
+            ("image".to_owned(), 1),
+            ("audio".to_owned(), 2),
+        ]);
+        let (audio_inputs, audio_indices) = export_audio_inputs(&timeline, &inputs, &indices);
+        assert_eq!(audio_inputs.len(), 1);
+        assert_eq!(audio_inputs[0].path, "music.wav");
+        assert_eq!(audio_indices.get("audio"), Some(&0));
+        assert!(!audio_indices.contains_key("video"));
+        assert!(!audio_indices.contains_key("image"));
+    }
+
+    #[test]
+    fn wgpu_audio_graph_accounts_for_raw_video_input_zero() {
+        let mut clip = test_clip("audio-lane");
+        clip.track = TrackId::A1;
+        clip.extra.insert("path".into(), json!("music.wav"));
+        let mut timeline = Timeline::default();
+        timeline.clips.push(clip);
+        let mut indices = HashMap::new();
+        indices.insert("audio-lane".into(), 0);
+
+        let mut second = test_clip("audio-lane-second");
+        second.track = TrackId::A2;
+        second.start = 1.0;
+        second.extra.insert("path".into(), json!("music.wav"));
+        timeline.clips.push(second);
+        indices.insert("audio-lane-second".into(), 0);
+
+        let (graph, has_audio) = export_audio_filter_graph(&timeline, &indices, 1);
+        assert!(has_audio);
+        assert!(graph.contains("[1:a]asplit=2"), "reused audio inputs need a split before independent clip filters: {graph}");
+        assert!(graph.contains("[aout]"));
     }
 
     #[test]

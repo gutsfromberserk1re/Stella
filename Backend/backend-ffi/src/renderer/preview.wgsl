@@ -62,9 +62,13 @@ fn sat3(c: vec3<f32>) -> vec3<f32> {
     return clamp(c, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));
 }
 
-fn fetch(uv: vec2<f32>) -> vec3<f32> {
+fn fetch_sample(uv: vec2<f32>) -> vec4<f32> {
     let c = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-    return textureSampleLevel(source_texture, source_sampler, c, 0.0).rgb;
+    return textureSampleLevel(source_texture, source_sampler, c, 0.0);
+}
+
+fn fetch(uv: vec2<f32>) -> vec3<f32> {
+    return fetch_sample(uv).rgb;
 }
 
 // Gaussian-weighted Vogel-disk blur. `ruv` = source-uv per reference pixel.
@@ -343,6 +347,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             transition_progress > 0.0
         );
     }
-    let alpha = coverage * crop_coverage * clamp(u.geo0.w, 0.0, 1.0) * transition_alpha;
+    // Preserve source alpha (notably transparent PNG layers) as well as the
+    // geometric, crop, opacity and transition coverage.
+    let source_alpha = fetch_sample(suv).a;
+    let alpha = source_alpha * coverage * crop_coverage * clamp(u.geo0.w, 0.0, 1.0) * transition_alpha;
     return vec4<f32>(col, alpha);
 }

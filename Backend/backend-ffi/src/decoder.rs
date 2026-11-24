@@ -957,6 +957,26 @@ impl DecoderPool {
         }
     }
 
+    /// Load and cache the first frame of a still image for WGPU compositing.
+    /// Still images are decoded once per path/size and reused for every timeline
+    /// timestamp; they must not be passed through the sequential video seek path.
+    pub fn still_frame(&mut self, path: &str, max_width: u32) -> Result<DecodedFrame, String> {
+        let max_width = max_width.max(2) & !1;
+        let key = FrameKey { path: path.to_owned(), index: i64::MIN, max_width };
+        if let Some(frame) = self.frames.get(&key).cloned() {
+            if let Some(index) = self.frame_order.iter().position(|item| item == &key) {
+                self.frame_order.remove(index);
+            }
+            self.frame_order.push_back(key);
+            return Ok(frame);
+        }
+
+        let mut decoder = VideoDecoder::open_with(path, max_width, false)?;
+        let frame = decoder.decode_first_frame()?;
+        self.cache_insert(key, &frame);
+        Ok(frame)
+    }
+
     /// `stream_key` is normally the timeline clip ID. It keeps the decoder's
     /// read head aligned with that clip's own source-time progression. The
     /// pixel cache is still global to the underlying file, so exact duplicate
@@ -1109,5 +1129,30 @@ mod scaler_tests {
         let mut out = vec![0u8; 4];
         scale_packed_to_rgba(&mut out, &src, 8, 4, [0, 1, 2, 3], 2, 1, 1, 1);
         assert_eq!(out, vec![128u8, 0, 128, 255]);
+    }
+}
+
+#[cfg(test)]
+mod still_image_tests {
+    use super::*;
+
+    #[test]
+    fn still_image_frames_are_cached_and_reused() {
+        let path = std::env::temp_dir().join(format!(
+            "stella-still-frame-{}.bmp", std::process::id()
+        ));
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255,
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        write_bmp24(&path, 2, 2, &rgba).expect("write still-image fixture");
+
+        let mut pool = DecoderPool::default();
+        let first = pool.still_frame(path.to_str().unwrap(), 2).expect("decode still image");
+        let second = pool.still_frame(path.to_str().unwrap(), 2).expect("reuse still image");
+        assert_eq!((first.width, first.height), (2, 2));
+        assert!(Arc::ptr_eq(&first.rgba, &second.rgba));
+
+        let _ = std::fs::remove_file(path);
     }
 }
