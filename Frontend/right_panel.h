@@ -2423,7 +2423,7 @@ static void TextColorRow(int index, const char *label, float editorT) {
         CLAY(swatch, {.layout = {.sizing = {FIX(30), FIX(30)}},
                       .backgroundColor = (Clay_Color){color.r, color.g, color.b, color.a},
                       .cornerRadius = CLAY_CORNER_RADIUS(15),
-                      .border = {.color = Mix(RGB(244, 246, 250), WHITE, b.hover * .12f),
+                      .border = {.color = Mix(RGB(244, 246, 250), RGB(255, 255, 255), b.hover * .12f),
                                  .width = CLAY_BORDER_OUTSIDE(2.f)}}) {}
     }
     if (gTextColorEditIndex == index && editorT > .004f) {
