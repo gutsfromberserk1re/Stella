@@ -77,7 +77,7 @@ static void PlutoTextWheelApplyPosition(int index, Vector2 position) {
     float hue = 0.f, ignored = 0.f;
     WheelInfo(position, &hue, &ignored);
     Color selected = ColorFromHSV(hue, fminf(1.f, .30f + .70f * amount), 1.f);
-    selected.a = gTextAppearanceDefaults[index].a;
+    selected.a = gTextAppearance[index].a;
     gTextAppearance[index] = selected;
 }
 
@@ -1431,18 +1431,24 @@ static void EffectsView(void) {
                                  transitionModified, false)) gTransOpen = !gTransOpen;
         if (transWrapHeight >= 1.f) {
             CLAY(CLAY_ID("TransWrap"), {.layout = {COLM, .sizing = {GROW, FIX(transWrapHeight)}},
-                                        .clip = {.vertical = true}}) {
+                                        .clip = {.horizontal = true, .vertical = true}}) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("TransBody"), {.layout = {COLM, .sizing = {GROW, FIT},
-                                                  .padding = {14, 14, 12, 12}, .childGap = 8}, RCARD}) {
+                                                  .padding = {14, 14, 12, 12}, .childGap = 8},
+                                                  .clip = {.horizontal = true}, RCARD}) {
                     CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
                     if (next < 0) {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
-                            TxWrap("Place a second video clip directly after the selected clip, then use the plus at their join.", 14, C_MUTED, 0);
+                        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 2}}) {
+                            /* Keep the hint deliberately short and split into lines so its
+                               intrinsic text width cannot expand the entire Effects column. */
+                            Tx("Add a second video clip.", 14, C_MUTED, 0);
+                            Tx("Place it after this clip.", 14, C_MUTED, 0);
+                            Tx("Use the plus at their join.", 14, C_MUTED, 0);
                         }
                     } else {
-                        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}}}) {
-                            TxWrap(Fmt("%s to %s", gTimelineClips[from].label, gTimelineClips[next].label), 13, C_MUTED, 0);
+                        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 1}}) {
+                            TxWrap(Fmt("%.26s", gTimelineClips[from].label), 13, C_MUTED, 0);
+                            TxWrap(Fmt("to %.26s", gTimelineClips[next].label), 13, C_MUTED, 0);
                         }
                         const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
                         const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
@@ -2014,54 +2020,209 @@ static void TextWheelLogic(int index, Clay_ElementId id) {
     }
 }
 
-static void TextWheelItem(int index, const char *label) {
-    CLAY(CLAY_IDI("TextWheelCol", index), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6,
-                                                        .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-        Clay_ElementId id = CLAY_IDI("TextWheel", index);
-        Bs b = Interact(id);
-        TextWheelLogic(index, id);
-        Vector2 puck = gTextWheelPuck[index];
-        Color color = gTextAppearance[index];
-        CLAY(id, {.layout = {.sizing = {FIX(96), FIX(96)}},
-                  .custom = {.customData = NC(K_WHEEL, C_CARD,
-                      (Clay_Color){puck.x, puck.y, 0, 0},
-                      (Clay_Color){color.r, color.g, color.b, color.a},
-                      1.f, fmaxf(b.hover * .6f, gTextWheelDrag[index] ? 1.f : 0.f), 0)}}) {}
-        Tx(label, 14.5f, C_TEXT, 1);
+static int gTextColorEditIndex = -1;
+static bool gTextColorHexFocused;
+static bool gTextColorHexReplaceOnType;
+static bool gTextColorHexInvalid;
+static char gTextColorHex[10] = "#F5F6F9";
+
+static void TextColorHexLoad(int index) {
+    if (index < 0 || index >= 4) return;
+    Color c = gTextAppearance[index];
+    snprintf(gTextColorHex, sizeof(gTextColorHex), "#%02X%02X%02X",
+             (unsigned)c.r, (unsigned)c.g, (unsigned)c.b);
+    gTextWheelPuck[index] = gTextWheelPuckT[index] = PlutoTextColorToWheel(c);
+    gTextColorHexInvalid = false;
+}
+
+static int TextColorHexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool TextColorHexParse(const char *text, int index, Color *out) {
+    if (!text || !out || index < 0 || index >= 4) return false;
+    const char *hex = text;
+    if (*hex == '#') hex++;
+    size_t length = strlen(hex);
+    if (length != 6 && length != 8) return false;
+    unsigned channels[4] = {0, 0, 0, gTextAppearance[index].a};
+    for (size_t i = 0; i < length / 2; i++) {
+        int hi = TextColorHexNibble(hex[i * 2]);
+        int lo = TextColorHexNibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        channels[i] = (unsigned)(hi * 16 + lo);
+    }
+    *out = (Color){(unsigned char)channels[0], (unsigned char)channels[1],
+                   (unsigned char)channels[2], (unsigned char)channels[3]};
+    return true;
+}
+
+static void TextColorHexApply(int index) {
+    Color parsed;
+    if (TextColorHexParse(gTextColorHex, index, &parsed)) {
+        gTextAppearance[index] = parsed;
+        gTextWheelPuck[index] = gTextWheelPuckT[index] = PlutoTextColorToWheel(parsed);
+        gTextColorEditIndex = -1;
+        gTextColorHexFocused = false;
+        gTextColorHexInvalid = false;
+    } else {
+        gTextColorHexInvalid = true;
     }
 }
 
-/* Toggle / segmented button: same field surface as the number fields. */
+static void TextColorHexEditor(int index) {
+    Clay_ElementId field = CLAY_ID("TextColorHexField");
+    Bs fb = Interact(field);
+    if (fb.clicked) {
+        gTextColorHexFocused = true;
+        gTextColorHexReplaceOnType = true;
+        gTextInputFocused = false;
+    }
+    if (gTextColorHexFocused) {
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            gTextColorHexFocused = false;
+            gTextColorHexInvalid = false;
+        }
+        if (IsKeyPressed(KEY_BACKSPACE)) {
+            if (gTextColorHexReplaceOnType) {
+                gTextColorHex[0] = 0;
+                gTextColorHexReplaceOnType = false;
+            } else {
+                size_t n = strlen(gTextColorHex);
+                if (n > 0) gTextColorHex[n - 1] = 0;
+            }
+            gTextColorHexInvalid = false;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            char ch = (char)cp;
+            bool isHex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                         (ch >= 'A' && ch <= 'F');
+            bool isHash = ch == '#' && (gTextColorHex[0] == 0 || gTextColorHexReplaceOnType);
+            if (!isHex && !isHash) continue;
+            if (gTextColorHexReplaceOnType) {
+                gTextColorHex[0] = 0;
+                gTextColorHexReplaceOnType = false;
+            }
+            size_t n = strlen(gTextColorHex);
+            if (n + 1 < sizeof(gTextColorHex)) {
+                gTextColorHex[n] = ch;
+                gTextColorHex[n + 1] = 0;
+                gTextColorHexInvalid = false;
+            }
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) TextColorHexApply(index);
+    }
+
+    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(96)}, .childGap = 10, .childAlignment = AL_Y}}) {
+        Clay_ElementId wheel = CLAY_ID("TextColorEditorWheel");
+        Bs wb = Interact(wheel);
+        TextWheelLogic(index, wheel);
+        if (gTextWheelDrag[index]) {
+            Color c = gTextAppearance[index];
+            snprintf(gTextColorHex, sizeof(gTextColorHex), "#%02X%02X%02X",
+                     (unsigned)c.r, (unsigned)c.g, (unsigned)c.b);
+            gTextColorHexInvalid = false;
+        }
+        Vector2 puck = gTextWheelPuck[index];
+        Color color = gTextAppearance[index];
+        CLAY(wheel, {.layout = {.sizing = {FIX(82), FIX(82)}},
+                     .custom = {.customData = NC(K_WHEEL, C_CARD,
+                         (Clay_Color){puck.x, puck.y, 0, 0},
+                         (Clay_Color){color.r, color.g, color.b, color.a},
+                         1.f, fmaxf(wb.hover * .6f, gTextWheelDrag[index] ? 1.f : 0.f), 0)}}) {}
+
+        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
+            Tx("Hex color", 13, C_MUTED, 0);
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 7, .childAlignment = AL_Y}}) {
+                CLAY(field, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {9, 5, 0, 0}, .childAlignment = AL_Y},
+                             .backgroundColor = C_RFIELD,
+                             .cornerRadius = CLAY_CORNER_RADIUS(9),
+                             .border = {.color = gTextColorHexInvalid ? RGB(190, 78, 83) :
+                                        Mix(C_RCARDB, RGB(100, 104, 114), (fb.hover + (gTextColorHexFocused ? .7f : 0.f)) * .4f),
+                                        .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    Tx(gTextColorHex[0] ? gTextColorHex : "#RRGGBB", 14,
+                       gTextColorHexInvalid ? RGB(238, 126, 130) : C_TEXT, 0);
+                }
+                Clay_ElementId applyId = CLAY_ID("TextColorHexApply");
+                Bs ab = Interact(applyId);
+                CLAY(applyId, {.layout = {.sizing = {FIX(58), FIX(34)}, .childAlignment = AL_C},
+                               .backgroundColor = BtnBg(C_CARD, RGB(48, 50, 57), ab),
+                               .cornerRadius = CLAY_CORNER_RADIUS(9)}) {
+                    Tx("Apply", 13, C_TEXT, 0);
+                }
+                if (ab.clicked) TextColorHexApply(index);
+            }
+            Tx(gTextColorHexInvalid ? "Use #RRGGBB or #RRGGBBAA" : "Drag the wheel or enter a hex code",
+               11.5f, gTextColorHexInvalid ? RGB(210, 118, 122) : C_MUTED, 0);
+        }
+    }
+}
+
+static void TextColorRow(int index, const char *label) {
+    Clay_ElementId row = CLAY_IDI("TextColorLabel", index);
+    CLAY(row, {.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
+        Tx(label, 15, C_DIM, 0);
+        HSPACE
+        Clay_ElementId swatch = CLAY_IDI("TextColorSwatch", index);
+        Bs b = Interact(swatch);
+        if (b.clicked) {
+            if (gTextColorEditIndex == index) {
+                gTextColorEditIndex = -1;
+                gTextColorHexFocused = false;
+                gTextColorHexInvalid = false;
+            } else {
+                gTextColorEditIndex = index;
+                TextColorHexLoad(index);
+                gTextColorHexFocused = false;
+                gTextColorHexReplaceOnType = false;
+            }
+            gTextInputFocused = false;
+        }
+        Color color = gTextAppearance[index];
+        CLAY(swatch, {.layout = {.sizing = {FIX(30), FIX(30)}},
+                      .backgroundColor = (Clay_Color){color.r, color.g, color.b, color.a},
+                      .cornerRadius = CLAY_CORNER_RADIUS(15),
+                      .border = {.color = Mix(RGB(76, 79, 88), RGB(164, 168, 178), b.hover * .55f),
+                                 .width = CLAY_BORDER_OUTSIDE(1)}}) {}
+    }
+    if (gTextColorEditIndex == index) TextColorHexEditor(index);
+}
+
+/* Compact segmented control retained for text alignment. */
 static bool TextChoiceButton(Clay_ElementId id, const char *label, bool on, bool dot) {
     Bs b = Interact(id);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(36)}, .padding = {10, 10, 0, 0}, .childGap = 7, .childAlignment = AL_C},
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .padding = {8, 8, 0, 0},
+                          .childGap = 7, .childAlignment = AL_C},
               .backgroundColor = on ? RGB(52, 54, 62) : BtnBg(C_RFIELD, RGB(46, 47, 54), b),
-              .cornerRadius = CLAY_CORNER_RADIUS(11),
-              .border = {.color = Mix(on ? RGB(92, 96, 106) : C_RCARDB, RGB(84, 87, 96), b.hover * .5f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+              .cornerRadius = CLAY_CORNER_RADIUS(10),
+              .border = {.color = Mix(on ? RGB(92, 96, 106) : C_RCARDB,
+                                      RGB(84, 87, 96), b.hover * .5f),
+                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
         if (dot)
             CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}},
-                          .backgroundColor = on ? C_TEXT : RGB(74, 77, 85), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
-        Tx(label, 14.5f, on ? C_TEXT : C_DIM, 0);
+                          .backgroundColor = on ? C_TEXT : RGB(74, 77, 85),
+                          .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+        Tx(label, 14, on ? C_TEXT : C_DIM, 0);
     }
     return b.clicked;
 }
 
+/* Unboxed inspector row: descriptive label on the left, switch on the right. */
 static void TextStyleToggle(const char *idName, const char *label, bool *value) {
     Clay_ElementId id = TextDynamicElementId(idName);
     Bs b = Interact(id);
     if (b.clicked) *value = !*value;
     float on = Anim(id.id + 0x5a31u, *value ? 1.f : 0.f, 22.f);
-    CLAY(id, {.layout = {.sizing = {GROW, FIX(40)}, .childAlignment = AL_C},
-              .backgroundColor = BtnBg(C_RFIELD, RGB(46, 47, 54), b),
-              .cornerRadius = CLAY_CORNER_RADIUS(10),
-              .border = {.color = Mix(C_RCARDB, RGB(83, 86, 96), b.hover * .45f),
-                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .childGap = 8, .childAlignment = AL_Y}}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {FIX(42), FIX(24)}},
-                          .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on,
-                                                      b.hover * .8f - b.press * 1.2f, 0)}}) {}
-            Tx(label, 14.5f, *value ? C_TEXT : C_DIM, 0);
-        }
+    CLAY(id, {.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
+        Tx(label, 15, *value ? C_TEXT : C_DIM, 0);
+        HSPACE
+        CLAY_AUTO_ID({.layout = {.sizing = {FIX(42), FIX(24)}},
+                      .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, on,
+                                                  b.hover * .55f, 0)}}) {}
     }
 }
 
@@ -2123,114 +2284,114 @@ static void TextPosGrid(void) {
 }
 
 static void TextView(void) {
-
-        /* ---- Content ---- */
-        CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .padding = {3, 0, 0, 0}, .childGap = 10, .childAlignment = AL_Y}}) {
-                Icon(I_TEXT, 20, C_ICON);
-                Tx("Content", 19, C_TEXT, 1);
-                HSPACE
-                if (gTextTitleSelected) Tx("Editing title", 13, C_MUTED, 0);
-            }
-            Clay_ElementId field = CLAY_ID("TextContentField");
-            bool over = Clay_PointerOver(field);
-            Bs fb = Interact(field);
-            if (fb.clicked) gTextInputFocused = true;
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over && gTextInputFocused) gTextInputFocused = false;
-            if (gTextInputFocused) {
-                if (IsKeyPressed(KEY_ESCAPE)) gTextInputFocused = false;
-                if (IsKeyPressed(KEY_BACKSPACE)) PlutoTextBackspace();
-                if (IsKeyPressed(KEY_ENTER)) PlutoTextAppendCodepoint('\n');
-                int cp;
-                while ((cp = GetCharPressed()) != 0) PlutoTextAppendCodepoint(cp);
-            }
-            CLAY(field, {.layout = {COLM, .sizing = {GROW, FIX(104)}, .padding = {12, 12, 10, 10}},
-                         .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), gTextInputFocused ? .45f : fb.hover * .3f),
-                         .cornerRadius = CLAY_CORNER_RADIUS(11),
-                         .border = {.color = gTextInputFocused ? RGB(104, 108, 120) : Mix(C_RFIELD, RGB(76, 79, 88), fb.hover),
-                                    .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 16, gTextContent[0] ? C_TEXT : C_MUTED, 0);
-            }
-            if (!gTextTitleSelected)
-                TxWrap("Choose the Text tool, then drag on the preview to create a text box.", 13, C_MUTED, 0);
+    /* Content: keep only the actual editable field surfaced, not another card. */
+    CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .childAlignment = AL_Y}}) {
+            Tx("Content", 18, C_TEXT, 1);
+            HSPACE
+            if (gTextTitleSelected) Tx("Editing title", 13, C_MUTED, 0);
         }
+        Clay_ElementId field = CLAY_ID("TextContentField");
+        bool over = Clay_PointerOver(field);
+        Bs fb = Interact(field);
+        if (fb.clicked) {
+            gTextInputFocused = true;
+            gTextColorEditIndex = -1;
+            gTextColorHexFocused = false;
+        }
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !over && gTextInputFocused) gTextInputFocused = false;
+        if (gTextInputFocused) {
+            if (IsKeyPressed(KEY_ESCAPE)) gTextInputFocused = false;
+            if (IsKeyPressed(KEY_BACKSPACE)) PlutoTextBackspace();
+            if (IsKeyPressed(KEY_ENTER)) PlutoTextAppendCodepoint('\n');
+            int cp;
+            while ((cp = GetCharPressed()) != 0) PlutoTextAppendCodepoint(cp);
+        }
+        CLAY(field, {.layout = {COLM, .sizing = {GROW, FIX(92)}, .padding = {11, 11, 9, 9}},
+                     .backgroundColor = Mix(C_RFIELD, RGB(46, 47, 54), gTextInputFocused ? .45f : fb.hover * .3f),
+                     .cornerRadius = CLAY_CORNER_RADIUS(10),
+                     .border = {.color = gTextInputFocused ? RGB(104, 108, 120) : Mix(C_RFIELD, RGB(76, 79, 88), fb.hover),
+                                .width = CLAY_BORDER_OUTSIDE(1)}}) {
+            TxWrap(gTextContent[0] ? gTextContent : "Click here and type your title", 16,
+                   gTextContent[0] ? C_TEXT : C_MUTED, 0);
+        }
+        if (!gTextTitleSelected)
+            TxWrap("Choose the Text tool, then drag on the preview to create a text box.", 12.5f, C_MUTED, 0);
+    }
 
-        /* ---- Position (where the title sits in the frame) ---- */
-        CLAY(CLAY_ID("TextPosCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .padding = {3, 0, 0, 0}, .childGap = 10, .childAlignment = AL_Y}}) {
-                Icon(I_POS, 20, C_ICON);
-                Tx("Position", 19, C_TEXT, 1);
-                HSPACE
-                if (IconBtn(CLAY_ID("TxtPosReset"), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) {
-                    gTextPosX = .5f; gTextPosY = .78f;
-                }
-            }
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
-                TextPosGrid();
-                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
-                    TextPosField(0, "X", &gTextPosX, .03f, .97f);
-                    TextPosField(1, "Y", &gTextPosY, .04f, .96f);
-                }
+    GAPY(6)
+    /* Position: section title plus controls, without an outer card border. */
+    CLAY(CLAY_ID("TextPosCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .childAlignment = AL_Y}}) {
+            Tx("Position", 18, C_TEXT, 1);
+            HSPACE
+            if (IconBtn(CLAY_ID("TxtPosReset"), I_RESET, 24, 13, RGB(104, 105, 112), false, 6)) {
+                gTextPosX = .5f; gTextPosY = .78f;
             }
         }
-
-        /* ---- Font ---- */
-        CLAY(CLAY_ID("TextFontCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
-                Tx("Font size", 18, C_TEXT, 0);
-                HSPACE
-                float sizeValue = (float)gTextFontSize;
-                if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 27, 16, 13, 8, 8.f, 180.f, 0)) {
-                    gTextFontSize = (int)roundf(sizeValue);
-                    gTextAutoFit = false;
-                }
-            }
-            {
-                static bool sizeDrag;
-                Clay_ElementId sid = CLAY_ID("TextSizeSlider");
-                Bs sb = Interact(sid);
-                float t = ((float)gTextFontSize - 8.f) / 172.f;
-                float before = t;
-                FxSliderLogic(sid, &t, &sizeDrag, 7.f);
-                if (fabsf(t - before) > .0001f) {
-                    gTextFontSize = (int)roundf(8.f + t * 172.f);
-                    gTextAutoFit = false;
-                }
-                CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
-                           .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD,
-                                                       ((float)gTextFontSize - 8.f) / 172.f,
-                                                       (sb.hover + (sizeDrag ? 1.f : 0.f)) * 1.5f, 0)}}) {}
-            }
-            Tx("Alignment", 16, C_DIM, 0);
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                static const char *alignNames[3] = {"Left", "Center", "Right"};
-                for (int i = 0; i < 3; i++)
-                    if (TextChoiceButton(CLAY_IDI("TextAlign", i), alignNames[i], gTextAlign == i, false)) gTextAlign = i;
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 12, .childAlignment = AL_Y}}) {
+            TextPosGrid();
+            CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+                TextPosField(0, "X", &gTextPosX, .03f, .97f);
+                TextPosField(1, "Y", &gTextPosY, .04f, .96f);
             }
         }
+    }
 
-        /* ---- Appearance ---- */
-        CLAY(CLAY_ID("TextLookCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {13, 13, 12, 13}, .childGap = 10}, RCARD}) {
-            Tx("Color", 18, C_TEXT, 0);
-            for (int row = 0; row < 2; row++) {
-                CLAY(CLAY_IDI("TextColorRow", row), {.layout = {.sizing = {GROW, FIT}, .childGap = 8}}) {
-                    TextWheelItem(row * 2, row == 0 ? "Text color" : "Shadow color");
-                    TextWheelItem(row * 2 + 1, row == 0 ? "Outline color" : "Background color");
-                }
-            }
-            Tx("Double-click a wheel puck to reset", 12.5f, C_MUTED, 0);
-            GAPY(2)
-            Tx("Style", 18, C_TEXT, 0);
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                TextStyleToggle("TextBold", "Bold", &gTextBold);
-                TextStyleToggle("TextOutline", "Outline", &gTextOutline);
-            }
-            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
-                TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
-                TextStyleToggle("TextBackground", "Background", &gTextBackground);
+    GAPY(6)
+    /* Typography: size and alignment share one simple, unboxed section. */
+    CLAY(CLAY_ID("TextFontCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
+        Tx("Typography", 18, C_TEXT, 1);
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(27)}, .childAlignment = AL_Y}}) {
+            Tx("Font size", 15, C_DIM, 0);
+            HSPACE
+            float sizeValue = (float)gTextFontSize;
+            if (ValBoxEditable(CLAY_ID("TextFontSize"), &sizeValue, "px", 82, 27, 16, 13, 8, 8.f, 180.f, 0)) {
+                gTextFontSize = (int)roundf(sizeValue);
+                gTextAutoFit = false;
             }
         }
-        PlutoTextAutoUpdateObserve();
+        {
+            static bool sizeDrag;
+            Clay_ElementId sid = CLAY_ID("TextSizeSlider");
+            Bs sb = Interact(sid);
+            float t = ((float)gTextFontSize - 8.f) / 172.f;
+            float before = t;
+            FxSliderLogic(sid, &t, &sizeDrag, 7.f);
+            if (fabsf(t - before) > .0001f) {
+                gTextFontSize = (int)roundf(8.f + t * 172.f);
+                gTextAutoFit = false;
+            }
+            CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
+                       .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD,
+                                                   ((float)gTextFontSize - 8.f) / 172.f,
+                                                   (sb.hover + (sizeDrag ? 1.f : 0.f)) * 1.5f, 0)}}) {}
+        }
+        Tx("Alignment", 15, C_DIM, 0);
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
+            static const char *alignNames[3] = {"Left", "Center", "Right"};
+            for (int i = 0; i < 3; i++)
+                if (TextChoiceButton(CLAY_IDI("TextAlign", i), alignNames[i], gTextAlign == i, false))
+                    gTextAlign = i;
+        }
+    }
+
+    GAPY(6)
+    /* Appearance: color swatches open a compact hex editor; style rows stay flat. */
+    CLAY(CLAY_ID("TextLookCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 7}}) {
+        Tx("Appearance", 18, C_TEXT, 1);
+        Tx("Colors", 13, C_MUTED, 0);
+        TextColorRow(0, "Text color");
+        TextColorRow(1, "Outline color");
+        TextColorRow(2, "Shadow color");
+        TextColorRow(3, "Background color");
+        GAPY(5)
+        Tx("Style", 13, C_MUTED, 0);
+        TextStyleToggle("TextOutline", "Outline", &gTextOutline);
+        TextStyleToggle("TextShadow", "Shadow", &gTextShadow);
+        TextStyleToggle("TextBackground", "Background", &gTextBackground);
+    }
+    PlutoTextAutoUpdateObserve();
 }
 
 /* Tab switch: the new page slides in horizontally from the side it sits on in the tab bar
@@ -2308,6 +2469,9 @@ static void RightPanel(void) {
                             PlutoTextAutoUpdateFlush();
                             PlutoTimelineEndPropertyEdit();
                             gTextInputFocused = false;
+                            gTextColorEditIndex = -1;
+                            gTextColorHexFocused = false;
+                            gTextColorHexInvalid = false;
                             gTabDir = (i > gRightTab) ? 1 : -1;
                             gRightTab = i; gScroll = gScrollT = 0.f;
                             gFollow = false; gTabT = 0.f; gTabE = 0.f;
