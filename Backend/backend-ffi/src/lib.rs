@@ -149,12 +149,14 @@ struct DecodeSource {
     path: String,
     source_time: f64,
     remaining: f64,
+    /// Per-layer decode width. Small picture-in-picture layers should not
+    /// force a full-resolution decode when they occupy only a fraction of the canvas.
+    max_width: u32,
 }
 
 struct DecodeTask {
     sources: Vec<DecodeSource>,
     fps: f64,
-    max_width: u32,
     /// Decode ahead only while the transport is playing (Yoru's worker idles
     /// when paused/scrubbing); look-ahead during a scrub only delays the next seek.
     prefetch: bool,
@@ -210,7 +212,7 @@ fn decode_ahead_loop(
 
         let decode_started = Instant::now();
         let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
-            .map(|source| pool.frame_at(&source.path, source.source_time, task.max_width, task.stepping))
+            .map(|source| pool.frame_at(&source.path, source.source_time, source.max_width, task.stepping))
             .collect();
         let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
         let Ok(frames) = current else {
@@ -243,7 +245,7 @@ fn decode_ahead_loop(
                     Err(TryRecvError::Empty) => {}
                 }
                 if ahead_seconds >= source.remaining { continue; }
-                if pool.frame_at(&source.path, source.source_time + ahead_seconds, task.max_width, false).is_ok() {
+                if pool.frame_at(&source.path, source.source_time + ahead_seconds, source.max_width, false).is_ok() {
                     prefetched += 1;
                 }
             }
@@ -956,10 +958,14 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         audio_labels.push(label);
     }
     if audio_labels.len() == 1 {
-        graph.push(format!("[{}]atrim=duration={duration:.5},asetpts=PTS-STARTPTS[aout]", audio_labels[0]));
+        // The master limiter is also applied to a single source so export has
+        // the same predictable ceiling regardless of how many clips overlap.
+        graph.push(format!("[{}]atrim=duration={duration:.5},asetpts=PTS-STARTPTS,alimiter=limit=0.95:attack=5:release=50[aout]", audio_labels[0]));
     } else if !audio_labels.is_empty() {
         let inputs = audio_labels.iter().map(|label| format!("[{label}]")).collect::<String>();
-        graph.push(format!("{inputs}amix=inputs={}:duration=longest:normalize=0,atrim=duration={duration:.5},asetpts=PTS-STARTPTS[aout]", audio_labels.len()));
+        // Mix every active timeline lane first, then protect the master bus from
+        // clipping when several full-level clips overlap.
+        graph.push(format!("{inputs}amix=inputs={}:duration=longest:normalize=0,atrim=duration={duration:.5},asetpts=PTS-STARTPTS,alimiter=limit=0.95:attack=5:release=50[aout]", audio_labels.len()));
     }
     Ok((graph.join(";"), inputs, duration, !audio_labels.is_empty()))
 }
@@ -1170,6 +1176,18 @@ impl PreviewEngine {
             }
         }
 
+        // Resolution-aware source sizing. Decode enough pixels to keep the
+        // selected preview crisp without paying 1080p conversion/upload costs
+        // when the user deliberately chooses a smaller preview quality.
+        // The caps are 4:2:0 friendly and retain modest oversampling before the
+        // GPU compositor scales to the exact selected output size.
+        let max_source_width = match height {
+            0..=240 => 640,   // 240p output: 426x240
+            241..=480 => 960, // 480p output: 854x480
+            481..=720 => 1440,// 720p output: 1280x720
+            _ => 1920,        // 1080p output: 1920x1080
+        };
+
         // Several timeline layers may intentionally reference the same source
         // frame (for example, stacked copies with different transforms/opacity).
         // Decode that source/time only once, then fan the shared Arc pixel buffer
@@ -1177,6 +1195,7 @@ impl PreviewEngine {
         // and per-layer uniforms remain unchanged.
         let mut sources: Vec<DecodeSource> = Vec::with_capacity(active.len());
         let mut source_indices = Vec::with_capacity(active.len());
+        let mut layer_uniforms = Vec::with_capacity(active.len());
         let mut source_lookup: HashMap<(String, i64), usize> = HashMap::new();
         for clip in &active {
             let original = clip.extra.get("path").and_then(Value::as_str).unwrap_or_default();
@@ -1191,6 +1210,19 @@ impl PreviewEngine {
                 (source_offset + (frame_at - clip.start)).max(0.0)
             };
             let remaining = (clip.end() - frame_at).max(0.0);
+            let props = clip.extra.get("props").unwrap_or(&Value::Null);
+            let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
+            let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
+                (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
+            });
+            let uniforms = LayerUniforms::from_props_with_keyframes_and_transition(props, frame_at, keyframes, transition);
+            // Decode close to the layer's displayed pixel size. A 15% picture-in-picture
+            // clip needs far fewer source pixels than a full-canvas background. Keep a
+            // 160px floor for motion/detail and use the largest scale axis for rotation.
+            let layer_scale = uniforms.geo0[0].max(uniforms.geo0[1]).clamp(0.01, 10.0);
+            let layer_max_width = ((max_source_width as f32 * layer_scale).ceil() as u32)
+                .clamp(160, max_source_width);
+            layer_uniforms.push(uniforms);
             if source.is_empty() {
                 eprintln!("Stella native preview fallback for '{}': empty source path", original);
                 return note_fallback(4);
@@ -1201,31 +1233,20 @@ impl PreviewEngine {
             let lookup_key = (source.clone(), (source_time * 1_000_000.0).round() as i64);
             if let Some(&index) = source_lookup.get(&lookup_key) {
                 sources[index].remaining = sources[index].remaining.max(remaining);
+                sources[index].max_width = sources[index].max_width.max(layer_max_width);
                 source_indices.push(index);
             } else {
                 let index = sources.len();
                 source_lookup.insert(lookup_key, index);
-                sources.push(DecodeSource { path: source, source_time, remaining });
+                sources.push(DecodeSource { path: source, source_time, remaining, max_width: layer_max_width });
                 source_indices.push(index);
             }
         }
 
-        // Resolution-aware source sizing. Decode enough pixels to keep the
-        // selected preview crisp without paying 1080p conversion/upload costs
-        // when the user deliberately chooses a smaller preview quality.
-        // The caps are 4:2:0 friendly and retain modest oversampling before the
-        // GPU compositor scales to the exact selected output size.
-        let max_source_width = match height {
-            0..=240 => 640,   // 240p output: 426x240
-            241..=480 => 960, // 480p output: 854x480
-            481..=720 => 1440,// 720p output: 1280x720
-            _ => 1920,        // 1080p output: 1920x1080
-        };
         let source_paths: Vec<String> = sources.iter().map(|source| source.path.clone()).collect();
         let batch = match self.decoder_worker.decode(DecodeTask {
             sources,
             fps: fps as f64,
-            max_width: max_source_width,
             prefetch: playing,
             stepping,
         }) {
@@ -1238,7 +1259,6 @@ impl PreviewEngine {
         *decode_ms = batch.decode_ms;
         let decoded = batch.frames;
         *ring_depth = batch.prefetched_frames;
-        let null_props = Value::Null;
         // Stable source-frame keys let the GPU keep one uploaded texture for
         // identical source frames shared by multiple clip layers.
         let source_keys: Vec<String> = active.iter().zip(source_indices.iter()).map(|(_clip, &source_index)| {
@@ -1246,22 +1266,15 @@ impl PreviewEngine {
             let path = &source_paths[source_index];
             format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
         }).collect();
-        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
+        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, _clip)| {
             let frame = &decoded[source_indices[index]];
-            let props = clip.extra.get("props").unwrap_or(&null_props);
-            let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
             GpuLayerFrame {
                 key: clip.id.as_str(),
                 source_key: source_keys[index].as_str(),
                 pixels: frame.rgba.as_slice(),
                 width: frame.width,
                 height: frame.height,
-                uniforms: {
-                    let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
-                        (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
-                    });
-                    LayerUniforms::from_props_with_keyframes_and_transition(props, frame_at, keyframes, transition)
-                },
+                uniforms: layer_uniforms[index],
             }
         }).collect();
 

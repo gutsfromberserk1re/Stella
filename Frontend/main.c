@@ -151,7 +151,7 @@ static void TimelineHistoryAction(bool redo) {
 /* Native multi-clip audio clock. Media inspection creates one cached OGG
    playback proxy per source, so MP4/MOV and detached audio clips all use the
    same Raylib streaming path. Streams are reused across play/pause/scrub. */
-#define STELLA_AUDIO_VOICES 12
+#define STELLA_AUDIO_VOICES 32
 #if defined(_WIN32)
 #define STELLA_AUDIO_PATH_COPY(dst, src) strncpy((dst), (src), sizeof(dst) - 1)
 #else
@@ -167,6 +167,7 @@ typedef struct {
 } StellaAudioVoice;
 static StellaAudioVoice gAudioVoices[STELLA_AUDIO_VOICES];
 static bool gAudioReady;
+static float gAudioMixHeadroom = 1.f;
 
 static void AudioVoiceRelease(StellaAudioVoice *voice) {
     if (!voice) return;
@@ -232,6 +233,7 @@ static StellaAudioVoice *AudioVoiceForClip(const TimelineClipUi *clip) {
 static void AudioPlaybackTick(bool playing) {
     if (!gAudioReady || !IsAudioDeviceReady()) return;
     bool active[STELLA_AUDIO_VOICES] = {false};
+    float mixGainTotal = 0.f;
     for (int i = 0; i < gTimelineClipCount; i++) {
         TimelineClipUi *clip = &gTimelineClips[i];
         if (!(clip->track >= 4 || clip->hasAudio) || clip->duration <= 0.f ||
@@ -250,8 +252,9 @@ static void AudioPlaybackTick(bool playing) {
         float remaining = clip->start + clip->duration - gPlayhead;
         if (clip->audioFadeOut && clip->audioFadeOutDuration > .001f)
             fade = fminf(fade, fmaxf(0.f, remaining / clip->audioFadeOutDuration));
-        float volume = fmaxf(0.f, fminf(1.f, clip->audioVolume / 100.f)) * fade;
+        float volume = fmaxf(0.f, fminf(2.f, clip->audioVolume / 100.f)) * fade;
         float pan = fmaxf(-1.f, fminf(1.f, clip->audioPan / 100.f));
+        mixGainTotal += volume;
         SetMusicVolume(voice->music, volume);
         SetMusicPan(voice->music, pan);
 
@@ -265,13 +268,24 @@ static void AudioPlaybackTick(bool playing) {
                that PlayMusicStream starts, then once per UI frame thereafter. */
             UpdateMusicStream(voice->music);
             float actual = GetMusicTimePlayed(voice->music);
-            if (fabsf(actual - sourceTime) > .22f) SeekMusicStream(voice->music, sourceTime);
+            /* Keep audio aligned with the timeline clock; a 220ms tolerance was
+               visibly late on cuts and after scrubbing. Avoid tiny seeks that
+               can cause audible zippering, but correct meaningful drift. */
+            if (fabsf(actual - sourceTime) > .10f) SeekMusicStream(voice->music, sourceTime);
         } else {
             if (streamPlaying) PauseMusicStream(voice->music);
             float actual = GetMusicTimePlayed(voice->music);
             if (fabsf(actual - sourceTime) > .04f) SeekMusicStream(voice->music, sourceTime);
         }
     }
+    /* A simple master-bus gain stage keeps overlapping full-level clips from
+       summing into hard digital clipping. Smooth the gain so track entrances
+       do not cause an audible volume jump. */
+    float targetHeadroom = 1.f / fmaxf(1.f, mixGainTotal);
+    float mixFollow = 1.f - expf(-8.f * fmaxf(0.f, gDt));
+    gAudioMixHeadroom += (targetHeadroom - gAudioMixHeadroom) * mixFollow;
+    SetMasterVolume(.92f * gAudioMixHeadroom);
+
     for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
         StellaAudioVoice *voice = &gAudioVoices[i];
         if (!voice->loaded && !voice->failed) continue;
