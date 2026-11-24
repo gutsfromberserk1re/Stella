@@ -428,7 +428,7 @@ mod tests {
             "lightLeak": {"enabled": true, "amount": 40.0, "warmth": 70.0, "position": 35.0},
             "mirror": {"enabled": true}
         }}});
-        let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        let (graph, overlay_x, overlay_y) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
         assert!(graph.contains("gblur=sigma="));
         assert!(graph.contains("rgbashift="));
         assert!(graph.contains("geq=r='r(X,Y)+("));
@@ -437,8 +437,8 @@ mod tests {
         assert!(graph.contains("hflip"));
         assert!(graph.contains("lutrgb"));
         assert!(graph.contains("min(255,r(X,Y)+"));
-        assert!(x.contains("sin(2*PI*t"));
-        assert!(y.contains("cos(2*PI*t"));
+        assert!(overlay_x.contains("sin(2*PI*t"));
+        assert!(overlay_y.contains("cos(2*PI*t"));
     }
 
     #[test]
