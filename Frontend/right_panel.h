@@ -21,12 +21,14 @@ static float SlDefault(int gi) {
     return .5f;
 }
 
-static float gFxV[4][2];
-static float gFxSent[4][2];
-static bool gFxOn[4];
-static const char *gExtraFxNames[] = {"Blur", "Film Grain", "Vignette", "Sharpen", "Lens Distortion", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Fisheye", "Light Leak", "Mirror"};
-static const char *gExtraFxKeys[] = {"blur", "grain", "vignette", "sharpen", "lens", "scanlines", "shake", "filmBurn", "halftone", "posterize", "fisheye", "lightLeak", "mirror"};
-#define EXTRA_FX_COUNT 13
+/* Only effects with a reliable preview/export implementation are exposed. */
+#define VIDEO_FX_COUNT 2
+static float gFxV[VIDEO_FX_COUNT][2];
+static float gFxSent[VIDEO_FX_COUNT][2];
+static bool gFxOn[VIDEO_FX_COUNT];
+static const char *gExtraFxNames[] = {"Gaussian Blur", "Vignette", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror"};
+static const char *gExtraFxKeys[] = {"blur", "vignette", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror"};
+#define EXTRA_FX_COUNT 10
 static bool gExtraFxOn[EXTRA_FX_COUNT];
 static int gFilter;
 
@@ -126,7 +128,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     };
     static const char *wheelNames[3] = {"shadows", "tint", "highlights"};
     static const char *presetNames[6] = {"none", "vivid", "noir", "fade", "warm", "cool"};
-    static const char *effectNames[4] = {"chromatic", "glow", "glitch", "pixelate"};
+    static const char *effectNames[2] = {"chromatic", "pixelate"};
     static const char *audioPaths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
 
     gNum[0] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.position.x", 0.f);
@@ -180,20 +182,20 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         gWh[i] = gWhT[i] = (Vector2){cosf(angle) * amount, sinf(angle) * amount};
     }
 
-    for (int i = 0; i < 4; i++) {
-        float defaults[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
+    for (int i = 0; i < 2; i++) {
+        float defaults[2][2] = {{.3f, .5f}, {.3f, .5f}};
         bool enabled = false;
         char path[128];
         snprintf(path, sizeof(path), "props.effects.%s.enabled", effectNames[i]);
         PlutoJsonBoolPath(clipBegin, clipEnd, path, &enabled);
         gFxOn[i] = enabled;
         snprintf(path, sizeof(path), "props.effects.%s.amount", effectNames[i]);
-        if (i != 3) defaults[i][0] = PlutoReadNumber(clipBegin, clipEnd, path, defaults[i][0] * 100.f) / 100.f;
+        if (i == 0) defaults[i][0] = PlutoReadNumber(clipBegin, clipEnd, path, defaults[i][0] * 100.f) / 100.f;
         else {
             snprintf(path, sizeof(path), "props.effects.%s.size", effectNames[i]);
             defaults[i][0] = PlutoReadNumber(clipBegin, clipEnd, path, defaults[i][0] * 100.f) / 100.f;
         }
-        snprintf(path, sizeof(path), "props.effects.%s.%s", effectNames[i], i == 0 ? "angle" : i == 1 ? "radius" : i == 2 ? "speed" : "blend");
+        snprintf(path, sizeof(path), "props.effects.%s.%s", effectNames[i], i == 0 ? "angle" : "blend");
         float second = PlutoReadNumber(clipBegin, clipEnd, path, i == 0 ? 0.f : defaults[i][1] * 100.f);
         defaults[i][1] = i == 0 ? second / 360.f + .5f : second / 100.f;
         for (int p = 0; p < 2; p++) gFxV[i][p] = gFxSent[i][p] = fmaxf(0.f, fminf(1.f, defaults[i][p]));
@@ -1133,23 +1135,19 @@ static void FilterThumb(int i) {
 
 /* ---- video effects (accordion: one effect open at a time) ---- */
 typedef struct { const char *name; const char *p1, *p2; bool angle; } FxDef;
-static const FxDef kFx[4] = {
-    {"Chromatic aberration", "Amount",    "Angle", true},
-    {"Glow",                 "Intensity", "Radius", false},
-    {"Glitch",               "Amount",    "Speed", false},
-    {"Pixelate",             "Size",      "Blend", false},
+static const FxDef kFx[VIDEO_FX_COUNT] = {
+    {"Chromatic aberration", "Amount", "Angle", true},
+    {"Pixelate", "Size", "Blend", false},
 };
-static float gFxV[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
-static float gFxSent[4][2] = {{.3f, .5f}, {.5f, .5f}, {.4f, .5f}, {.3f, .5f}};
-static const char *gFxProp[4][2] = {
+static float gFxV[VIDEO_FX_COUNT][2] = {{.3f, .5f}, {.3f, .5f}};
+static float gFxSent[VIDEO_FX_COUNT][2] = {{.3f, .5f}, {.3f, .5f}};
+static const char *gFxProp[VIDEO_FX_COUNT][2] = {
     {"props.effects.chromatic.amount", "props.effects.chromatic.angle"},
-    {"props.effects.glow.amount", "props.effects.glow.radius"},
-    {"props.effects.glitch.amount", "props.effects.glitch.speed"},
     {"props.effects.pixelate.size", "props.effects.pixelate.blend"}
 };
-static const char *gFxToggle[4] = {"props.effects.chromatic.enabled", "props.effects.glow.enabled", "props.effects.glitch.enabled", "props.effects.pixelate.enabled"};
-static bool  gFxOn[4];
-static bool  gFxSlDrag[4][2];
+static const char *gFxToggle[VIDEO_FX_COUNT] = {"props.effects.chromatic.enabled", "props.effects.pixelate.enabled"};
+static bool  gFxOn[VIDEO_FX_COUNT];
+static bool  gFxSlDrag[VIDEO_FX_COUNT][2];
 static int   gFxOpen = -1;
 static bool  gVfxOpen = false, gFiltOpen = false;
 
@@ -1235,7 +1233,7 @@ static void FxBody(int i) {
                 Tx("Reset", 14, rc, 0);
             }
             if (rb.clicked) {
-                gFxV[i][0] = gFxSent[i][0] = (i == 0) ? .3f : i == 2 ? .4f : i == 3 ? .3f : .5f;
+                gFxV[i][0] = gFxSent[i][0] = .3f;
                 gFxV[i][1] = gFxSent[i][1] = .5f;
                 gFxOn[i] = false;
                 char updates[512];
@@ -1259,10 +1257,10 @@ static void ExtraFxRow(int i) {
         char path[96]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
         if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "blur") == 0) {
             PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.blur.enabled\",\"value\":true},{\"path\":\"props.effects.blur.amount\",\"value\":22},{\"path\":\"props.effects.blur.mode\",\"value\":\"gaussian\"}]");
-        } else if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "grain") == 0) {
-            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.grain.enabled\",\"value\":true},{\"path\":\"props.effects.grain.amount\",\"value\":28},{\"path\":\"props.effects.grain.roughness\",\"value\":50},{\"path\":\"props.effects.grain.size\",\"value\":30}]");
         } else if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "vignette") == 0) {
             PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.vignette.enabled\",\"value\":true},{\"path\":\"props.effects.vignette.amount\",\"value\":50},{\"path\":\"props.effects.vignette.midpoint\",\"value\":50},{\"path\":\"props.effects.vignette.roundness\",\"value\":0},{\"path\":\"props.effects.vignette.feather\",\"value\":65}]");
+        } else if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "filmBurn") == 0) {
+            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.filmBurn.enabled\",\"value\":true},{\"path\":\"props.effects.filmBurn.amount\",\"value\":42},{\"path\":\"props.effects.filmBurn.warmth\",\"value\":70},{\"path\":\"props.effects.filmBurn.edge\",\"value\":38},{\"path\":\"props.effects.filmBurn.flicker\",\"value\":12}]");
         } else {
             PlutoTimelineSetBoolProperty(path, gExtraFxOn[i]);
         }
@@ -1301,7 +1299,7 @@ static bool FxHeader(int i, float open) {
 }
 
 static float gEffectSectionHeight[3] = {96.f, 286.f, 1005.f};
-static float gFxBodyHeight[4] = {180.f, 180.f, 180.f, 180.f};
+static float gFxBodyHeight[VIDEO_FX_COUNT] = {180.f, 180.f};
 static bool gTransitionBodyMeasured;
 
 static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected) {
@@ -1547,7 +1545,7 @@ static void EffectsView(void) {
            measured-height animation. Every effect's header and controls share
            one bordered card so the expanded rows stay visually connected. */
         bool anyVideoEffect = false;
-        for (int i = 0; i < 4; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
+        for (int i = 0; i < VIDEO_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
         for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
         CLAY(CLAY_ID("VfxCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId vfxId = CLAY_ID("VfxHdr");
@@ -1563,7 +1561,7 @@ static void EffectsView(void) {
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(10)}}}) {}
                 CLAY(CLAY_ID("VfxBody"), {.layout = {COLM, .sizing = {GROW, FIT},
                                                .padding = {10, 10, 10, 10}, .childGap = 8}, RCARD}) {
-                    for (int i = 0; i < 4; i++) {
+                    for (int i = 0; i < VIDEO_FX_COUNT; i++) {
                         Clay_ElementId fxId = CLAY_IDI("FxHdr", i);
                         float fxOpen = EaseIO(AnimLin(fxId.id, gFxOpen == i ? 1.f : 0.f, 0.2f));
                         float fxMeasured = Clay_GetElementData(CLAY_IDI("FxBody", i)).boundingBox.height;

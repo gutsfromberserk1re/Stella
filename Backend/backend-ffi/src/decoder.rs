@@ -48,9 +48,9 @@ static LAST_FRAME_HW: AtomicBool = AtomicBool::new(false);
 
 pub fn last_frame_was_hardware() -> bool { LAST_FRAME_HW.load(Relaxed) }
 
-/// Request-scoped timing: microseconds spent moving decoded frames to system
-/// memory and in the fused convert+scale kernel. These are included in
-/// `decodeWaitMs`; totals are collected across all source layers in the batch.
+// Request-scoped timing: microseconds spent moving decoded frames to system
+// memory and in the fused convert+scale kernel. These are included in
+// `decodeWaitMs`; totals are collected across all source layers in the batch.
 thread_local! {
     // Per-thread counters keep thumbnail/media work from contaminating preview
     // telemetry. The preview worker resets and snapshots its own counters around
@@ -92,11 +92,6 @@ struct FrameKey {
     path: String,
     index: i64,
     max_width: u32,
-    // Stream-level color tags are authoritative across all frames. Some codecs
-    // leave AVFrame tags unspecified (or vary them across decoded frames), which
-    // can otherwise make identical clips look warmer/cooler on different tracks.
-    stream_color_space: ffi::AVColorSpace,
-    stream_color_range: ffi::AVColorRange,
 }
 
 struct VideoDecoder {
@@ -116,6 +111,10 @@ struct VideoDecoder {
     // effective resolution avoids uploading full 1080p/4K frames for a small
     // preview surface.
     max_width: u32,
+    // Stream-level color tags are authoritative across all frames. Keep them
+    // with the decoder because AVFrame tags may be unset or inconsistent.
+    stream_color_space: ffi::AVColorSpace,
+    stream_color_range: ffi::AVColorRange,
 }
 
 // ---- Hardware decode (ported from Yoru) ------------------------------------

@@ -25,11 +25,11 @@ pub struct LayerUniforms {
     pub hsl: [f32; 4],   // hue_deg, sat, lightness, range_index
     pub fx0: [f32; 4],   // sharpen_amount, sharpen_radius_px, blur_value, blur_mode
     pub fx1: [f32; 4],   // blur_angle, vignette_amount, vignette_mid, vignette_feather
-    pub fx2: [f32; 4],   // vignette_aspect, grain_amount, grain_block_px, chroma_px
-    pub fx3: [f32; 4],   // chroma_angle, glow_sigma, glow_brightness, glow_contrast
+    pub fx2: [f32; 4],   // vignette_aspect, reserved, reserved, chroma_px
+    pub fx3: [f32; 4],   // chroma_angle, reserved, reserved, reserved
     pub fx4: [f32; 4],   // pixelate_px, posterize_levels, posterize_blend, unused
-    pub fx5: [f32; 4],   // lens_k, lens_zoom, scan_spacing, scan_amount
-    pub fx6: [f32; 4],   // glitch_px, glitch_speed, halftone_size, halftone_contrast
+    pub fx5: [f32; 4],   // reserved, reserved, scan_spacing, scan_amount
+    pub fx6: [f32; 4],   // reserved, reserved, halftone_size, halftone_contrast
     pub fx7: [f32; 4],   // halftone_angle, burn_amount, burn_warmth, burn_spread
     pub fx8: [f32; 4],   // burn_flicker, leak_amount, leak_warmth, leak_position
 }
@@ -228,14 +228,11 @@ impl LayerUniforms {
         let mut contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
         let mut saturation = (1.0 + n(color, "saturation", 0.0) / 100.0).clamp(0.0, 3.0);
         let vibrance = (n(color, "vibrance", 0.0) / 100.0).clamp(-1.0, 1.0);
-        let mut grain_levels = 0.0_f64; // noise strength in 0..255 levels
-
         match preset {
             "vivid" => { saturation *= 1.0 + 0.7 * preset_intensity; contrast *= 1.08; }
             "noir" => { saturation *= 1.0 - preset_intensity; contrast *= 1.0 + 0.2 * preset_intensity; brightness -= 0.02 * preset_intensity; }
             "fade" => { contrast *= 1.0 - 0.16 * preset_intensity; brightness += 0.08 * preset_intensity; saturation *= 1.0 - 0.2 * preset_intensity; }
             "cinema" => { contrast *= 1.0 + 0.15 * preset_intensity; saturation *= 1.0 - 0.15 * preset_intensity; }
-            "retro" => { grain_levels += 12.0 * preset_intensity; }
             "teal_orange" => { saturation *= 1.0 + 0.12 * preset_intensity; contrast *= 1.0 + 0.05 * preset_intensity; }
             "sepia" => { saturation *= 1.0 - 0.62 * preset_intensity; }
             "bleach" => { contrast *= 1.0 + 0.30 * preset_intensity; saturation *= 1.0 - 0.55 * preset_intensity; }
@@ -281,7 +278,6 @@ impl LayerUniforms {
         match preset {
             "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * preset_intensity; balance[band + 2] -= 0.10 * preset_intensity; },
             "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * preset_intensity; balance[band + 2] += 0.12 * preset_intensity; },
-            "retro" => for band in [0usize, 3, 6] { balance[band] += 0.15 * preset_intensity; balance[band + 2] -= 0.12 * preset_intensity; },
             "teal_orange" => {
                 balance[0] -= 0.08 * preset_intensity; balance[1] += 0.025 * preset_intensity; balance[2] += 0.15 * preset_intensity;
                 balance[3] += 0.025 * preset_intensity; balance[4] += 0.02 * preset_intensity;
@@ -310,17 +306,14 @@ impl LayerUniforms {
         // ----------------------------------------------------------------- blur
         let mut blur_mode = 0.0_f64;
         let mut blur_value = 0.0_f64;
-        let mut blur_angle = 0.0_f64;
+        let blur_angle = 0.0_f64;
         if on(effects, "blur") {
             let b = &effects["blur"];
-            // Same scaling as filters.rs (it multiplies by the preset intensity).
-            let amount = n(b, "amount", 0.0) * preset_intensity.max(0.01);
-            blur_angle = n(b, "angle", 0.0).to_radians();
-            match b["mode"].as_str().unwrap_or("gaussian") {
-                "motion" => { blur_mode = 2.0; blur_value = amount * 0.15; }
-                "zoom" => { blur_mode = 3.0; blur_value = (amount / 800.0).clamp(0.0, 0.15); }
-                _ => { blur_mode = 1.0; blur_value = (amount * 0.08).max(0.1); }
-            }
+            // Gaussian blur is the single supported mode so preview and export
+            // use the same kernel family and the same strength mapping.
+            let amount = n(b, "amount", 0.0);
+            blur_mode = 1.0;
+            blur_value = (amount * 0.08).max(0.1);
         }
         u.fx0 = [sharpen.min(3.0) as f32, sharpen_radius as f32, blur_value as f32, blur_mode as f32];
 
@@ -336,14 +329,6 @@ impl LayerUniforms {
         }
         u.fx1 = [blur_angle as f32, vig_amount.clamp(-1.0, 1.0) as f32, vig_mid as f32, vig_feather as f32];
 
-        // ---------------------------------------------------------------- grain
-        let mut grain_block = 1.0_f64;
-        if on(effects, "grain") {
-            let g = &effects["grain"];
-            grain_levels += n(g, "amount", 0.0) * n(g, "roughness", 50.0) / 50.0 * (0.6 + n(g, "size", 30.0) / 250.0);
-            grain_block = (n(g, "size", 30.0) / 30.0).clamp(1.0, 4.0);
-        }
-
         // ------------------------------------------------------------- chromatic
         let mut chroma_px = 0.0_f64;
         let mut chroma_angle = 0.0_f64;
@@ -351,18 +336,9 @@ impl LayerUniforms {
             chroma_px = n(&effects["chromatic"], "amount", 0.0) * 0.06;
             chroma_angle = n(&effects["chromatic"], "angle", 0.0).to_radians();
         }
-        u.fx2 = [vig_aspect as f32, (grain_levels.clamp(0.0, 80.0) / 255.0) as f32, grain_block as f32, chroma_px as f32];
+        u.fx2 = [vig_aspect as f32, 0.0, 1.0, chroma_px as f32];
 
-        // ----------------------------------------------------------------- glow
-        let (mut glow_sigma, mut glow_brightness, mut glow_contrast) = (0.0_f64, 0.0_f64, 1.0_f64);
-        if on(effects, "glow") {
-            let g = &effects["glow"];
-            let threshold = n(g, "threshold", 70.0) / 100.0;
-            glow_sigma = (n(g, "radius", 0.0) * 0.04).max(0.1);
-            glow_brightness = n(g, "amount", 0.0) / 100.0 * (0.2 - threshold * 0.08);
-            glow_contrast = 1.0 + threshold * 0.12;
-        }
-        u.fx3 = [chroma_angle as f32, glow_sigma as f32, glow_brightness as f32, glow_contrast as f32];
+        u.fx3 = [chroma_angle as f32, 0.0, 0.0, 1.0];
 
         // ------------------------------------------------- pixelate / posterize
         let mut pixelate = 0.0_f64;
@@ -381,31 +357,16 @@ impl LayerUniforms {
         }
         u.fx4 = [pixelate as f32, post_levels as f32, post_blend as f32, 0.0];
 
-        // ------------------------------------------------ lens / fisheye / scan
-        let (mut lens_k, mut lens_zoom) = (0.0_f64, 1.0_f64);
-        for key in ["lens", "fisheye"] {
-            if on(effects, key) {
-                let fallback = if key == "lens" { 55.0 } else { 40.0 };
-                let e = &effects[key];
-                lens_k += n(e, "amount", fallback) / 100.0 * 0.22 * n(e, "blend", 100.0) / 100.0;
-                lens_zoom *= (n(e, "scale", 100.0) / 100.0).clamp(0.5, 1.5);
-            }
-        }
+        // -------------------------------------------------------- scanlines
         let (mut scan_spacing, mut scan_amount) = (0.0_f64, 0.0_f64);
         if on(effects, "scanlines") {
             let s = &effects["scanlines"];
             scan_spacing = n(s, "spacing", 4.0).max(1.0);
             scan_amount = (n(s, "amount", 32.0) / 100.0).clamp(0.0, 1.0);
         }
-        u.fx5 = [lens_k as f32, lens_zoom as f32, scan_spacing as f32, scan_amount as f32];
+        u.fx5 = [0.0, 1.0, scan_spacing as f32, scan_amount as f32];
 
-        // ------------------------------------------------- glitch / halftone
-        let (mut glitch_px, mut glitch_speed) = (0.0_f64, 1.0_f64);
-        if on(effects, "glitch") {
-            let g = &effects["glitch"];
-            glitch_speed = (n(g, "speed", 50.0) / 50.0).max(0.1);
-            glitch_px = n(g, "amount", 0.0) * 0.1 * (0.4 + n(g, "blocks", 25.0) / 40.0) * glitch_speed;
-        }
+        // ------------------------------------------------------ halftone
         let (mut half_size, mut half_contrast, mut half_angle) = (0.0_f64, 0.5_f64, 0.0_f64);
         if on(effects, "halftone") {
             let h = &effects["halftone"];
@@ -413,14 +374,14 @@ impl LayerUniforms {
             half_angle = n(h, "angle", 45.0).to_radians();
             half_contrast = n(h, "contrast", 48.0).clamp(0.0, 100.0) / 100.0;
         }
-        u.fx6 = [glitch_px as f32, glitch_speed as f32, half_size as f32, half_contrast as f32];
+        u.fx6 = [0.0, 1.0, half_size as f32, half_contrast as f32];
 
         // ------------------------------------------------- film burn / light leak
         let (mut burn_amount, mut burn_warmth, mut burn_spread, mut burn_flicker) = (0.0_f64, 0.0_f64, 0.5_f64, 0.0_f64);
         if on(effects, "filmBurn") {
             let b = &effects["filmBurn"];
             burn_amount = n(b, "amount", 42.0) / 100.0 * 0.34;
-            burn_warmth = n(b, "warmth", 0.0) / 100.0;
+            burn_warmth = n(b, "warmth", 70.0) / 100.0;
             burn_spread = (0.12 + n(b, "edge", 38.0) / 100.0 * 0.72).clamp(0.12, 0.84);
             burn_flicker = n(b, "flicker", 12.0) / 100.0 * 0.45;
         }
@@ -556,6 +517,54 @@ mod tests {
         assert!((u.fx0[2] - 8.0).abs() < 1e-5);
         assert_eq!(u.fx4[0], 20.0);
         assert_eq!(u.geo1[2], 1.0);
+    }
+
+    #[test]
+    fn retained_effects_reach_the_preview_uniforms() {
+        let props = json!({"effects": {
+            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0},
+            "pixelate": {"enabled": true, "size": 20.0, "blend": 50.0},
+            "sharpen": {"enabled": true, "amount": 45.0, "radius": 5.0, "threshold": 10.0},
+            "vignette": {"enabled": true, "amount": 50.0, "midpoint": 50.0, "roundness": 0.0, "feather": 65.0},
+            "posterize": {"enabled": true, "levels": 6.0, "blend": 75.0},
+            "scanlines": {"enabled": true, "spacing": 4.0, "amount": 32.0},
+            "halftone": {"enabled": true, "size": 5.0, "angle": 45.0, "contrast": 48.0},
+            "filmBurn": {"enabled": true, "amount": 42.0, "warmth": 70.0, "edge": 38.0, "flicker": 12.0},
+            "lightLeak": {"enabled": true, "amount": 40.0, "warmth": 70.0, "position": 35.0},
+            "mirror": {"enabled": true},
+            "shake": {"enabled": true, "amount": 18.0, "frequency": 8.0, "smoothness": 35.0}
+        }});
+        let u = LayerUniforms::from_props(&props, 0.25);
+        assert!((u.fx2[3] - 3.0).abs() < 1e-5);
+        assert!((u.fx3[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((u.fx4[0] - 10.0).abs() < 1e-5);
+        assert!((u.fx4[1] - 6.0).abs() < 1e-5);
+        assert!((u.fx5[2] - 4.0).abs() < 1e-5);
+        assert!((u.fx6[2] - 10.0).abs() < 1e-5);
+        assert!(u.fx7[1] > 0.0);
+        assert!(u.fx8[1] > 0.0);
+        assert_eq!(u.geo1[2], 1.0);
+        assert_ne!(u.geo1[0], 0.0);
+        assert!(u.fx0[0] > 0.0);
+        assert!(u.fx1[1] > 0.0);
+    }
+
+    #[test]
+    fn retired_effects_do_not_change_preview_uniforms() {
+        let neutral = LayerUniforms::from_props(&Value::Null, 0.5);
+        let legacy = json!({"effects": {
+            "grain": {"enabled": true, "amount": 80.0},
+            "lens": {"enabled": true, "amount": 100.0},
+            "fisheye": {"enabled": true, "amount": 100.0},
+            "glitch": {"enabled": true, "amount": 100.0},
+            "glow": {"enabled": true, "amount": 100.0, "radius": 100.0}
+        }});
+        let actual = LayerUniforms::from_props(&legacy, 0.5);
+        assert_eq!(actual.fx2[1], neutral.fx2[1]);
+        assert_eq!(actual.fx3[1], neutral.fx3[1]);
+        assert_eq!(actual.fx3[2], neutral.fx3[2]);
+        assert_eq!(actual.fx5, neutral.fx5);
+        assert_eq!(actual.fx6[0..2], neutral.fx6[0..2]);
     }
 
     #[test]

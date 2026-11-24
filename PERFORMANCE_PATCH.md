@@ -38,3 +38,20 @@ The WGPU compositor still performs a blocking GPU readback so the existing Rayli
 - Static source checks and delimiter-balance checks passed for the touched Rust and C headers.
 - A regression test was added for separated audio selecting A2 when A1 is occupied, plus tests for A1-A6 serialization and the fresh-project V1-only visibility state.
 - Rust tests and the Windows application build were not executable in this container (`cargo`/`rustc` are unavailable and the Clay UI headers are not installed). The Windows Actions build and an actual playback check remain required before calling this runtime-verified.
+
+
+## Follow-up: effect parity and CI compile repair
+
+- Fixed the colorimetry compile regression: stream-level color space/range live on `VideoDecoder`; they are not fields on `FrameKey`. The frame cache key remains path + frame index + output width, because colorimetry is a stable property of the source stream.
+- Replaced the rustdoc comment above `thread_local!` with a normal source comment to remove the unused-doc-comment warning.
+- Removed the old `Glow` control. It was not a true highlight bloom; it blurred the whole frame and applied a tone shift, and its export path was not perceptually equivalent to the preview. Existing projects that contain `props.effects.glow` now ignore that legacy property instead of applying a misleading look.
+- Kept only effects with an implementation on both paths: Chromatic Aberration, Pixelate, Blur, Vignette, Sharpen, Scanlines, Camera Shake, Film Burn, Halftone, Posterize, Light Leak, and Mirror. The renderer and FFmpeg export paths share the same parameter ranges and effect equations where applicable.
+- Added a preview-uniform regression test that verifies the retained effect parameters are actually mapped into renderer uniforms. Export-graph tests cover the retained filter operations and verify removed legacy effects stay disabled.
+- FFmpeg smoke-tested the combined export filter chain (Gaussian blur, pixelation, chromatic shift, sharpen, vignette, posterize, halftone, scanlines, film burn, and light leak); the generated one-frame chain ran successfully.
+- Moved the export `detail` property lookup before its first use in the sharpen pass.
+
+## Verification status (follow-up)
+
+- Corrected the exact missing-field and misplaced-field issues from the reported `cargo test` failure.
+- Static checks confirm `FrameKey` has only its intended three key fields and `VideoDecoder` owns the two stream color fields.
+- Cargo is not installed in this execution environment, so the Rust tests still need to be rerun in Windows GitHub Actions. No successful compile is being claimed here.

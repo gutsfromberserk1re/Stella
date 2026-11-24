@@ -19,11 +19,11 @@ struct Params {
     hsl:   vec4<f32>, // hue_deg, sat(-1..1), lightness, range_index(0=all,1..8)
     fx0:   vec4<f32>, // sharpen_amount, sharpen_radius_px, blur_value, blur_mode(0 off,1 gauss,2 motion,3 zoom)
     fx1:   vec4<f32>, // blur_angle_rad, vignette_amount(-1..1), vignette_mid, vignette_feather
-    fx2:   vec4<f32>, // vignette_aspect, grain_amount(0..1), grain_block_px, chroma_px
-    fx3:   vec4<f32>, // chroma_angle_rad, glow_sigma_px(0=off), glow_brightness, glow_contrast
+    fx2:   vec4<f32>, // vignette_aspect, reserved, reserved, chroma_px
+    fx3:   vec4<f32>, // chroma_angle_rad, reserved, reserved, reserved
     fx4:   vec4<f32>, // pixelate_px(0=off), posterize_levels(0=off), posterize_blend, unused
-    fx5:   vec4<f32>, // lens_k, lens_zoom, scan_spacing_px(0=off), scan_amount
-    fx6:   vec4<f32>, // glitch_px(0=off), glitch_speed, halftone_size_px(0=off), halftone_contrast
+    fx5:   vec4<f32>, // reserved, reserved, scan_spacing_px(0=off), scan_amount
+    fx6:   vec4<f32>, // reserved, reserved, halftone_size_px(0=off), halftone_contrast
     fx7:   vec4<f32>, // halftone_angle_rad, burn_amount, burn_warmth, burn_spread
     fx8:   vec4<f32>, // burn_flicker, leak_amount, leak_warmth, leak_position
 };
@@ -60,10 +60,6 @@ fn luma(c: vec3<f32>) -> f32 {
 
 fn sat3(c: vec3<f32>) -> vec3<f32> {
     return clamp(c, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));
-}
-
-fn hash21(p: vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
 }
 
 fn fetch(uv: vec2<f32>) -> vec3<f32> {
@@ -175,13 +171,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let distort_bottom = mix(u.distort.w, u.distort.z, l.x);
     l.y = l.y + mix(distort_top, distort_bottom, l.y) * 0.001;
 
-    // lens / fisheye warp (and its zoom)
-    if (abs(u.fx5.x) > 0.0001 || abs(u.fx5.y - 1.0) > 0.0001) {
-        let pc = l - vec2<f32>(0.5, 0.5);
-        let r2 = dot(pc, pc) * 2.0;
-        l = vec2<f32>(0.5, 0.5) + pc * (1.0 + u.fx5.x * r2) / max(u.fx5.y, 0.01);
-    }
-
     // pixelate (block size in reference px)
     let ref_px = base_px / k; // layer size in reference px
     if (u.fx4.x > 1.0) {
@@ -205,7 +194,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let blur_mode = i32(u.fx0.w + 0.5);
     var sigma = 0.0;
     if (blur_mode == 1) { sigma = u.fx0.z; }
-    sigma = sqrt(sigma * sigma + u.fx3.y * u.fx3.y); // glow's blur joins the gaussian
     if (sigma > 0.25) {
         col = blur_gauss(suv, sigma, ruv);
     } else if (blur_mode == 2) {
@@ -218,12 +206,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var shift = vec2<f32>(0.0, 0.0);
     if (u.fx2.w > 0.01) {
         shift = vec2<f32>(cos(u.fx3.x), sin(u.fx3.x)) * u.fx2.w;
-    }
-    if (u.fx6.x > 0.01) {
-        let band = floor(l.y * 24.0);
-        let tick = floor(u.geo1.w * (4.0 + u.fx6.y * 8.0));
-        let rnd = hash21(vec2<f32>(band, tick));
-        shift.x = shift.x + u.fx6.x * (0.5 + step(0.75, rnd) * (rnd - 0.5) * 8.0);
     }
     if (abs(shift.x) + abs(shift.y) > 0.01) {
         let off = shift * ruv;
@@ -284,18 +266,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     col = sat3(col + u.bal_s.xyz * w_s + u.bal_m.xyz * w_m + u.bal_h.xyz * w_h);
 
     // ---------------------------------------------------------------- effects
-    // glow (export = blur then brightness/contrast)
-    if (u.fx3.y > 0.0) {
-        col = sat3((col - vec3<f32>(0.5, 0.5, 0.5)) * u.fx3.w + vec3<f32>(0.5, 0.5, 0.5) + vec3<f32>(u.fx3.z, u.fx3.z, u.fx3.z));
-    }
-
-    // grain
-    if (u.fx2.y > 0.0001) {
-        let cell = floor(l * ref_px / max(u.fx2.z, 1.0));
-        let n = hash21(cell + vec2<f32>(floor(u.geo1.w * 24.0) * 17.0, 3.0)) - 0.5;
-        col = sat3(col + vec3<f32>(n, n, n) * 2.0 * u.fx2.y);
-    }
-
     // vignette (negative = lightens the edges)
     if (abs(u.fx1.y) > 0.001) {
         let pv = (lin - vec2<f32>(0.5, 0.5)) * vec2<f32>(u.fx2.x, 1.0) * 2.0;

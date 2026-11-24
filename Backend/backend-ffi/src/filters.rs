@@ -43,6 +43,7 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let transform = &props["transform"];
     let effects = &props["effects"];
     let colors = &props["colors"];
+    let detail = &colors["detail"];
     let source_start = n(clip, "sourceOffset", 0.0).max(0.0);
     let mut filters = vec![format!("trim=start={source_start:.5}:duration={length:.5}"), format!("setpts=PTS-STARTPTS+{start:.5}/TB"),
         format!("scale={width}:{height}:force_original_aspect_ratio=decrease"), "setsar=1".into(), "format=rgba".into()];
@@ -66,9 +67,44 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         filters.push(format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
     }
 
+    // Pre-grade image effects: same order and reference-pixel units as WGSL preview.
+    if enabled(effects, "mirror") { filters.push("hflip".into()); }
+    let blur_sigma = if enabled(effects, "blur") { (n(&effects["blur"], "amount", 0.0) * 0.08).max(0.1) } else { 0.0 };
+    if blur_sigma > 0.25 { filters.push(format!("gblur=sigma={blur_sigma:.4}:steps=2")); }
+
+    if enabled(effects, "pixelate") {
+        let pixel = &effects["pixelate"];
+        let block = (n(pixel, "size", 12.0) * n(pixel, "blend", 100.0) / 100.0).clamp(1.0, 80.0) * (height as f64 / 1080.0);
+        filters.push(format!("scale={}:{}:flags=neighbor,scale={width}:{height}:flags=neighbor", (width as f64 / block).max(1.0) as u32, (height as f64 / block).max(1.0) as u32));
+    }
+    if enabled(effects, "chromatic") {
+        let amount = n(&effects["chromatic"], "amount", 0.0) * 0.06 * (height as f64 / 1080.0);
+        let angle = n(&effects["chromatic"], "angle", 0.0).to_radians();
+        filters.push(format!("rgbashift=rh={:.3}:rv={:.3}:bh={:.3}:bv={:.3}", amount * angle.cos(), amount * angle.sin(), -amount * angle.cos(), -amount * angle.sin()));
+    }
+    let mut sharpen_amount = (n(detail, "sharpness", 0.0) / 100.0).clamp(0.0, 1.0);
+    let mut sharpen_radius = 2.5;
+    if enabled(effects, "sharpen") {
+        let sh = &effects["sharpen"];
+        let radius = (n(sh, "radius", 5.0).round() as i32).clamp(3, 23) | 1;
+        let threshold = 1.0 - n(sh, "threshold", 10.0).clamp(0.0, 100.0) / 125.0;
+        sharpen_amount += n(sh, "amount", 45.0) / 100.0 * threshold;
+        sharpen_radius = radius as f64 * 0.5;
+    }
+    sharpen_amount = sharpen_amount.clamp(0.0, 3.0);
+    if sharpen_amount > 0.001 {
+        let rad = sharpen_radius * height as f64 / 1080.0;
+        let blur = format!("({a}+{b}+{c}+{d})/4",
+            a=format!("r(min(max(X+{rad:.4},0),W-1),Y)"),
+            b=format!("r(min(max(X-{rad:.4},0),W-1),Y)"),
+            c=format!("r(X,min(max(Y+{rad:.4},0),H-1))"),
+            d=format!("r(X,min(max(Y-{rad:.4},0),H-1))"));
+        let ch = |name: &str| format!("{name}(X,Y)+({name}(X,Y)-{})*{sharpen_amount:.5}", blur.replace("r(", &format!("{name}(")));
+        filters.push(format!("geq=r='{}':g='{}':b='{}':a='alpha(X,Y)'", ch("r"), ch("g"), ch("b")));
+    }
+
     let light = &colors["light"];
     let color = &colors["color"];
-    let detail = &colors["detail"];
     let brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
     let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
     let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0).clamp(0.0, 3.0);
@@ -119,7 +155,6 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     match preset {
         "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * intensity; balance[band + 2] -= 0.10 * intensity; },
         "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * intensity; balance[band + 2] += 0.12 * intensity; },
-        "retro" => for band in [0usize, 3, 6] { balance[band] += 0.15 * intensity; balance[band + 2] -= 0.12 * intensity; },
         "teal_orange" => {
             balance[0] -= 0.08 * intensity; balance[1] += 0.025 * intensity; balance[2] += 0.15 * intensity;
             balance[3] += 0.025 * intensity; balance[4] += 0.02 * intensity;
@@ -135,130 +170,30 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
             balance[0], balance[1], balance[2], balance[3], balance[4], balance[5], balance[6], balance[7], balance[8]));
     }
 
-    let sharpness = (n(detail, "sharpness", 0.0) / 100.0).clamp(0.0, 1.0);
-    if sharpness > 0.001 { filters.push(format!("unsharp=5:5:{sharpness:.4}:5:5:0")); }
-    let color_vignette = n(detail, "vignette", 0.0);
-    if color_vignette.abs() > 1.0 {
-        let mode = if color_vignette < 0.0 { "backward" } else { "forward" };
-        filters.push(format!("vignette=angle={:.5}:mode={mode}", (0.35 + color_vignette.abs() / 100.0 * 0.55).clamp(0.1, 1.2)));
+    // The vignette uses the same radial smoothstep as preview.wgsl.
+    let mut vignette_amount = (n(detail, "vignette", 0.0) / 100.0 * 0.8).clamp(-1.0, 1.0);
+    let (mut vignette_mid, mut vignette_feather, mut vignette_aspect) = (0.55_f64, 0.5_f64, 1.0_f64);
+    if enabled(effects, "vignette") {
+        let v = &effects["vignette"];
+        vignette_amount += n(v, "amount", 0.0) / 100.0;
+        vignette_mid = (n(v, "midpoint", 50.0) / 100.0).clamp(0.0, 1.0);
+        vignette_feather = (n(v, "feather", 50.0) / 100.0).clamp(0.01, 1.0);
+        vignette_aspect = (1.0 + n(v, "roundness", 0.0) / 100.0 * 0.8).clamp(0.2, 2.0);
+    }
+    vignette_amount = vignette_amount.clamp(-1.0, 1.0);
+    if vignette_amount.abs() > 0.001 {
+        let radial = format!("sqrt(pow(((X/max(W-1,1))-0.5)*{:.6}*2,2)+pow(((Y/max(H-1,1))-0.5)*2,2))*0.7071", vignette_aspect);
+        let t = format!("max(0,min(1,(({radial}-({:.6}*0.9))/(max({:.6},0.01)*0.8))))", vignette_mid, vignette_feather);
+        let mask = format!("(({t})*({t})*(3-2*({t})))");
+        let apply = |c: &str| if vignette_amount > 0.0 {
+            format!("{c}(X,Y)*(1-{:.6}*{mask})", vignette_amount)
+        } else {
+            format!("{c}(X,Y)+(255-{c}(X,Y))*{:.6}*{mask}", -vignette_amount)
+        };
+        filters.push(format!("geq=r='{}':g='{}':b='{}':a='alpha(X,Y)'", apply("r"), apply("g"), apply("b")));
     }
 
-    match preset {
-        "vivid" => filters.push(format!("eq=saturation={:.3}:contrast=1.08", 1.0 + 0.7 * intensity)),
-        "noir" => { filters.push(format!("hue=s={:.3}", 1.0 - intensity)); filters.push(format!("eq=contrast={:.3}:brightness={:.3}", 1.0 + 0.2 * intensity, -0.02 * intensity)); },
-        "fade" => filters.push(format!("eq=contrast={:.3}:brightness={:.3}:saturation={:.3}", 1.0 - 0.16 * intensity, 0.08 * intensity, 1.0 - 0.2 * intensity)),
-        "cinema" => filters.push(format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.15 * intensity, 1.0 - 0.15 * intensity)),
-        "retro" => filters.push(format!("noise=alls={:.2}:allf=t+u", 12.0 * intensity)),
-        "teal_orange" => filters.push(format!("eq=saturation={:.3}:contrast={:.3}", 1.0 + 0.12 * intensity, 1.0 + 0.05 * intensity)),
-        "sepia" => filters.push(format!("eq=saturation={:.3}", 1.0 - 0.62 * intensity)),
-        "bleach" => filters.push(format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.30 * intensity, 1.0 - 0.55 * intensity)),
-        "pastel" => filters.push(format!("eq=brightness={:.3}:contrast={:.3}:saturation={:.3}", 0.045 * intensity, 1.0 - 0.12 * intensity, 1.0 - 0.10 * intensity)),
-        _ => {}
-    }
-    if enabled(effects, "blur") {
-        let blur = &effects["blur"];
-        let amount = n(blur, "amount", 0.0) * intensity.max(0.01);
-        let sigma = (amount * 0.08).max(0.1);
-        match blur["mode"].as_str().unwrap_or("gaussian") {
-            "motion" => {
-                let frames = (2.0 + amount / 14.0).clamp(2.0, 9.0) as u32;
-                filters.push(format!("tmix=frames={frames}"));
-                let distance = amount * 0.015;
-                let angle = n(blur, "angle", 0.0).to_radians();
-                filters.push(format!("rgbashift=rh={:.3}:rv={:.3}:bh={:.3}:bv={:.3}", distance * angle.cos(), distance * angle.sin(), -distance * angle.cos(), -distance * angle.sin()));
-            }
-            "zoom" => {
-                filters.push(format!("gblur=sigma={:.3}:steps=2", sigma * 0.7));
-                let zoom = (1.0 + amount / 1600.0).clamp(1.0, 1.08);
-                filters.push(format!("scale=iw*{zoom:.4}:ih*{zoom:.4}"));
-            }
-            _ => filters.push(format!("gblur=sigma={sigma:.3}:steps=2")),
-        }
-    }
-    if enabled(effects, "grain") {
-        let grain = &effects["grain"];
-        let amount = n(grain, "amount", 0.0) * n(grain, "roughness", 50.0) / 50.0 * (0.6 + n(grain, "size", 30.0) / 250.0);
-        filters.push(format!("noise=alls={:.2}:allf=t+u", amount.clamp(0.0, 80.0)));
-    }
-    if enabled(effects, "vignette") {
-        let vignette = &effects["vignette"];
-        let angle = (0.12 + n(vignette, "midpoint", 50.0) / 100.0 * 1.08 + n(vignette, "amount", 0.0).abs() / 100.0 * 0.35).clamp(0.05, 1.5);
-        let aspect = (1.0 + n(vignette, "roundness", 0.0) / 100.0 * 0.8).clamp(0.2, 2.0);
-        let softness = (0.75 + n(vignette, "feather", 50.0) / 100.0 * 0.5).clamp(0.5, 1.5);
-        filters.push(format!("vignette=angle={angle:.4}:aspect={aspect:.3}:eval=frame"));
-        if (softness - 1.0).abs() > 0.01 { filters.push(format!("gblur=sigma={:.3}:steps=1", (softness - 1.0).abs() * 0.7)); }
-    }
-    if enabled(effects, "chromatic") {
-        let a = n(&effects["chromatic"], "amount", 0.0) * 0.06;
-        let angle = n(&effects["chromatic"], "angle", 0.0).to_radians();
-        filters.push(format!("rgbashift=rh={:.2}:rv={:.2}:bh={:.2}:bv={:.2}", a * angle.cos(), a * angle.sin(), -a * angle.cos(), -a * angle.sin()));
-    }
-    if enabled(effects, "glow") {
-        let radius = (n(&effects["glow"], "radius", 0.0) * 0.04).max(0.1);
-        let amount = n(&effects["glow"], "amount", 0.0) / 100.0;
-        let threshold = n(&effects["glow"], "threshold", 70.0) / 100.0;
-        filters.push(format!("gblur=sigma={radius:.3}:steps=1"));
-        filters.push(format!("eq=brightness={:.4}:contrast={:.4}", amount * (0.2 - threshold * 0.08), 1.0 + threshold * 0.12));
-    }
-    if enabled(effects, "glitch") {
-        let speed = n(&effects["glitch"], "speed", 50.0) / 50.0;
-        let a = n(&effects["glitch"], "amount", 0.0) * 0.1 * (0.4 + n(&effects["glitch"], "blocks", 25.0) / 40.0) * speed.max(0.1);
-        filters.push(format!("rgbashift=rh={a:.2}:bh={:.2}", -a));
-        filters.push(format!("noise=alls={:.2}:allf=t", a * 2.0));
-    }
-    if enabled(effects, "pixelate") {
-        let size = (n(&effects["pixelate"], "size", 12.0) * n(&effects["pixelate"], "blend", 100.0) / 100.0).clamp(1.0, 80.0);
-        filters.push(format!("scale={}:{}:flags=neighbor,scale={width}:{height}:flags=neighbor", (width as f64 / size).max(1.0) as u32, (height as f64 / size).max(1.0) as u32));
-    }
-    if enabled(effects, "sharpen") {
-        let sharpen = &effects["sharpen"];
-        let radius = (n(sharpen, "radius", 5.0).round() as i32).clamp(3, 23) | 1;
-        let threshold = 1.0 - n(sharpen, "threshold", 10.0).clamp(0.0, 100.0) / 125.0;
-        let amount = n(sharpen, "amount", 45.0) / 100.0 * threshold;
-        filters.push(format!("unsharp={radius}:{radius}:{amount:.3}:5:5:0"));
-    }
-    for key in ["lens", "fisheye"] {
-        if enabled(effects, key) {
-            let fallback = if key == "lens" { 55.0 } else { 40.0 };
-            let amount = n(&effects[key], "amount", fallback) / 100.0 * 0.22 * n(&effects[key], "blend", 100.0) / 100.0;
-            filters.push(format!("lenscorrection=cx=0.5:cy=0.5:k1={amount:.4}:k2=0"));
-            let zoom = (n(&effects[key], "scale", 100.0) / 100.0).clamp(0.5, 1.5);
-            if (zoom - 1.0).abs() > 0.001 { filters.push(format!("scale=iw*{zoom:.4}:ih*{zoom:.4}")); }
-        }
-    }
-    if enabled(effects, "scanlines") { filters.push(format!("drawgrid=width=iw:height={}:thickness=1:color=black@{:.3}", n(&effects["scanlines"], "spacing", 4.0).max(1.0), (n(&effects["scanlines"], "amount", 32.0) / 100.0).clamp(0.0, 1.0))); }
-    if enabled(effects, "shake") {
-        // Motion is added to the overlay coordinates below, based on this enabled value.
-    }
-    if enabled(effects, "filmBurn") {
-        let burn = &effects["filmBurn"];
-        let amount = n(burn, "amount", 42.0) / 100.0 * 0.34;
-        let warmth = n(burn, "warmth", 0.0) / 100.0;
-        let spread = (0.12 + n(burn, "edge", 38.0) / 100.0 * 0.72).clamp(0.12, 0.84);
-        let flicker = n(burn, "flicker", 12.0) / 100.0 * 0.45;
-        let edge = format!("(max(0,(abs(X-W/2)/(W/2)-{:.4})/{spread:.4})*(1+sin(T*8*PI)*{flicker:.4}))", 1.0 - spread);
-        filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{edge})':g='min(255,g(X,Y)+255*{:.4}*{edge})':b='min(255,b(X,Y)+255*{:.4}*{edge})'", amount * warmth, amount * 0.28, amount * 0.06));
-    }
-    if enabled(effects, "lightLeak") {
-        let leak = &effects["lightLeak"];
-        let amount = n(leak, "amount", 40.0) / 100.0 * 0.5;
-        let warmth = n(leak, "warmth", 70.0) / 100.0;
-        let position = n(leak, "position", 35.0) / 100.0;
-        let radius = (0.14 + warmth * 0.38).clamp(0.14, 0.52);
-        let hotspot = format!("max(0,1-abs(X/W-{position:.4})/{radius:.4})");
-        filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{hotspot})':g='min(255,g(X,Y)+255*{:.4}*{hotspot})':b='min(255,b(X,Y)+255*{:.4}*{hotspot})'", amount, amount * (0.25 + warmth * 0.2), amount * (1.0 - warmth) * 0.25));
-    }
-    if enabled(effects, "halftone") {
-        let halftone = &effects["halftone"];
-        let size = n(halftone, "size", 5.0).clamp(1.0, 24.0) * 2.0;
-        let angle = n(halftone, "angle", 45.0).to_radians();
-        let contrast = n(halftone, "contrast", 48.0).clamp(0.0, 100.0) / 100.0;
-        let px = format!("mod(X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.cos(), angle.sin(), size / 2.0, size / 2.0);
-        let py = format!("mod(-X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.sin(), angle.cos(), size / 2.0, size / 2.0);
-        /* geq's lum(X,Y) accessor is invalid for RGB formats; derive luma from the RGB planes. */
-        let radius = format!("(1-(0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))/255)*{:.3}*{contrast:.3}", size / 2.0);
-        filters.push(format!("geq=r='if(lt(hypot({px},{py}),{radius}),0,r(X,Y))':g='if(lt(hypot({px},{py}),{radius}),0,g(X,Y))':b='if(lt(hypot({px},{py}),{radius}),0,b(X,Y))'"));
-    }
+    // Posterize and halftone use the same quantization / dot-grid equations as preview.
     if enabled(effects, "posterize") {
         let posterize = &effects["posterize"];
         let blend = n(posterize, "blend", 100.0).clamp(0.0, 100.0) / 100.0;
@@ -269,7 +204,44 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
             filters.push(format!("lutrgb=r='{quantize}':g='{quantize}':b='{quantize}'"));
         }
     }
-    if enabled(effects, "mirror") { filters.push("hflip".into()); }
+    if enabled(effects, "halftone") {
+        let halftone = &effects["halftone"];
+        let size = n(halftone, "size", 5.0).clamp(1.0, 24.0) * 2.0;
+        let angle = n(halftone, "angle", 45.0).to_radians();
+        let contrast = n(halftone, "contrast", 48.0).clamp(0.0, 100.0) / 100.0;
+        let px = format!("mod(X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.cos(), angle.sin(), size / 2.0, size / 2.0);
+        let py = format!("mod(-X*{:.5}+Y*{:.5}+{:.3},{size:.3})-{:.3}", angle.sin(), angle.cos(), size / 2.0, size / 2.0);
+        let radius = format!("(1-(0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))/255)*{:.3}*{contrast:.3}", size / 2.0);
+        filters.push(format!("geq=r='if(lt(hypot({px},{py}),{radius}),0,r(X,Y))':g='if(lt(hypot({px},{py}),{radius}),0,g(X,Y))':b='if(lt(hypot({px},{py}),{radius}),0,b(X,Y))':a='alpha(X,Y)'"));
+    }
+    if enabled(effects, "scanlines") {
+        let scan = &effects["scanlines"];
+        let scale = height as f64 / 1080.0;
+        let spacing = n(scan, "spacing", 4.0).max(1.0);
+        let amount = (n(scan, "amount", 32.0) / 100.0).clamp(0.0, 1.0);
+        let row = format!("floor(Y/{scale:.6})");
+        let remainder = format!("(({row})-{spacing:.5}*floor(({row})/{spacing:.5}))");
+        let apply = |channel: &str| format!("if(lt({remainder},1),{channel}(X,Y)*{:.5},{channel}(X,Y))", 1.0 - amount);
+        filters.push(format!("geq=r='{}':g='{}':b='{}':a='alpha(X,Y)'", apply("r"), apply("g"), apply("b")));
+    }
+    if enabled(effects, "filmBurn") {
+        let burn = &effects["filmBurn"];
+        let amount = n(burn, "amount", 42.0) / 100.0 * 0.34;
+        let warmth = n(burn, "warmth", 70.0) / 100.0;
+        let spread = (0.12 + n(burn, "edge", 38.0) / 100.0 * 0.72).clamp(0.12, 0.84);
+        let flicker = n(burn, "flicker", 12.0) / 100.0 * 0.45;
+        let edge = format!("(max(0,(abs(X-W/2)/(W/2)-{:.4})/{spread:.4})*(1+sin(T*8*PI)*{flicker:.4}))", 1.0 - spread);
+        filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{edge})':g='min(255,g(X,Y)+255*{:.4}*{edge})':b='min(255,b(X,Y)+255*{:.4}*{edge})':a='alpha(X,Y)'", amount * warmth, amount * 0.28, amount * 0.06));
+    }
+    if enabled(effects, "lightLeak") {
+        let leak = &effects["lightLeak"];
+        let amount = n(leak, "amount", 40.0) / 100.0 * 0.5;
+        let warmth = n(leak, "warmth", 70.0) / 100.0;
+        let position = n(leak, "position", 35.0) / 100.0;
+        let radius = (0.14 + warmth * 0.38).clamp(0.14, 0.52);
+        let hotspot = format!("max(0,1-abs(X/max(W-1,1)-{position:.4})/{radius:.4})");
+        filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{hotspot})':g='min(255,g(X,Y)+255*{:.4}*{hotspot})':b='min(255,b(X,Y)+255*{:.4}*{hotspot})':a='alpha(X,Y)'", amount, amount * (0.25 + warmth * 0.2), amount * (1.0 - warmth) * 0.25));
+    }
 
     if let Some((kind, transition_duration)) = transition_in {
         let d = transition_duration.clamp(0.05, length.max(0.05));
@@ -439,6 +411,50 @@ mod tests {
             let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
             assert!(graph.contains(expected), "missing {preset} export filter in {graph}");
         }
+    }
+
+    #[test]
+    fn curated_effects_generate_matching_export_operations() {
+        let clip = json!({"start": 0.0, "props": {"effects": {
+            "blur": {"enabled": true, "amount": 22.0},
+            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0},
+            "shake": {"enabled": true, "amount": 18.0, "frequency": 8.0, "smoothness": 35.0},
+            "sharpen": {"enabled": true, "amount": 45.0, "radius": 5.0, "threshold": 10.0},
+            "vignette": {"enabled": true, "amount": 50.0, "midpoint": 50.0, "roundness": 0.0, "feather": 65.0},
+            "scanlines": {"enabled": true, "spacing": 4.0, "amount": 32.0},
+            "filmBurn": {"enabled": true, "amount": 42.0, "warmth": 70.0, "edge": 38.0, "flicker": 12.0},
+            "halftone": {"enabled": true, "size": 5.0, "angle": 45.0, "contrast": 48.0},
+            "posterize": {"enabled": true, "levels": 6.0, "blend": 100.0},
+            "lightLeak": {"enabled": true, "amount": 40.0, "warmth": 70.0, "position": 35.0},
+            "mirror": {"enabled": true}
+        }}});
+        let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        assert!(graph.contains("gblur=sigma="));
+        assert!(graph.contains("rgbashift="));
+        assert!(graph.contains("geq=r='r(X,Y)+("));
+        assert!(graph.contains("sqrt(pow("));
+        assert!(graph.contains("floor(Y/"));
+        assert!(graph.contains("hflip"));
+        assert!(graph.contains("lutrgb"));
+        assert!(graph.contains("min(255,r(X,Y)+"));
+        assert!(x.contains("sin(2*PI*t"));
+        assert!(y.contains("cos(2*PI*t"));
+    }
+
+    #[test]
+    fn retired_effects_are_ignored_in_export_graph() {
+        let clip = json!({"start": 0.0, "props": {"effects": {
+            "grain": {"enabled": true, "amount": 100.0},
+            "lens": {"enabled": true, "amount": 100.0},
+            "fisheye": {"enabled": true, "amount": 100.0},
+            "glitch": {"enabled": true, "amount": 100.0},
+            "glow": {"enabled": true, "amount": 100.0, "radius": 100.0}
+        }}});
+        let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        assert!(!graph.contains("noise="));
+        assert!(!graph.contains("lenscorrection"));
+        assert!(!graph.contains("rgbashift"));
+        assert!(!graph.contains("gblur="));
     }
 
     #[test]
