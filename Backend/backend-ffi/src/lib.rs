@@ -1266,7 +1266,7 @@ impl PreviewEngine {
             let path = &source_paths[source_index];
             format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
         }).collect();
-        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, _clip)| {
+        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
             let frame = &decoded[source_indices[index]];
             GpuLayerFrame {
                 key: clip.id.as_str(),
