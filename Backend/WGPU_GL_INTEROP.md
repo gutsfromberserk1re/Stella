@@ -25,3 +25,11 @@ The script creates `Backend/.interop/wgpu-0.19.4` and root `.cargo/config.toml`;
 - WGL sharing may still fail if the hidden window resolves to a different display device, the host pixel format cannot be applied to the hidden DC, the driver lacks the required WGL context-creation sharing support, or the driver rejects the share group. The host verifies that the returned texture name is visible in Raylib's GL namespace; if not, Stella disables interop for the rest of that run and requests another frame through asynchronous readback. Set `STELLA_DISABLE_WGPU_GL_INTEROP=1` to force the readback path for diagnosis.
 - Non-Windows builds use the readback route. Final export also remains CPU-backed because FFmpeg currently consumes host RGBA frames. Source video decode still produces CPU RGBA that is uploaded to WGPU; this change removes only the final WGPU-output → CPU → OpenGL round trip.
 - The F3 overlay's final row identifies the last successfully displayed output as `WGPU-GL ZERO-COPY`, `WGPU CPU readback`, or `FFmpeg fallback`. Confirm the first label with a real Windows run before treating this path as validated.
+
+### Vendored WGPU warning hygiene
+
+The preparation script registers WGPU 0.19.4's legacy custom cfg names with
+`check-cfg` and limits style-lint allowances (`unused_qualifications` and
+`mismatched_lifetime_syntaxes`) to the two locally patched upstream crates.
+This keeps build output useful without changing WGPU behavior or removing any
+platform/backend code. Warnings in Stella's own crates remain enabled.

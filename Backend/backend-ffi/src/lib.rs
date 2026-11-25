@@ -346,7 +346,7 @@ impl DecodeAheadWorker {
         }
 
         let mut frames_by_key = HashMap::with_capacity(dispatched.len());
-        let mut decode_ms = 0.0;
+        let mut decode_ms = 0.0f64;
         let mut transfer_us = 0u64;
         let mut convert_us = 0u64;
         let mut prefetched_frames = 0usize;
@@ -379,6 +379,7 @@ struct PreviewEngine {
     stream: Option<PreviewStream>,
 }
 
+#[derive(Debug)]
 enum PreviewRenderResult {
     Published { width: u32, height: u32, at: f64, decode_ms: f64, ring_depth: usize },
     SharedGl { width: u32, height: u32, at: f64, decode_ms: f64, ring_depth: usize, frame: SharedGlPreviewFrame },
@@ -2755,7 +2756,7 @@ pub unsafe extern "C" fn pluto_backend_take_preview_frame(
         *height = frame.height;
         *at = frame.at;
         *byte_len = frame.pixels.len();
-        let mut buffer = frame.pixels;
+        let buffer = frame.pixels;
         *pixels = buffer.as_ptr();
         let boxed = Box::new(buffer);
         *owner = Box::into_raw(boxed) as *mut std::ffi::c_void;

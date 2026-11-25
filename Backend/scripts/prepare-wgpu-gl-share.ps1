@@ -37,6 +37,36 @@ function Set-StandaloneCfgAliases([string]$manifestPath, [string]$crateName) {
 Set-StandaloneCfgAliases (Join-Path $halRoot 'Cargo.toml') 'wgpu-hal'
 Set-StandaloneCfgAliases (Join-Path $coreRoot 'Cargo.toml') 'wgpu-core'
 
+# Keep upstream WGPU warning output useful without changing its implementation.
+# These are narrowly scoped legacy-source lints: explicit custom cfg names are
+# registered with rustc, while style-only qualifications/lifetime spelling
+# warnings are suppressed for the vendored 0.19.4 crates only.
+function Set-UpstreamLintHygiene([string]$manifestPath, [string]$crateName) {
+    $manifestText = Get-Content -Raw $manifestPath
+    $lintTable = @'
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dx12)", "cfg(gles)", "cfg(metal)", "cfg(vulkan)", "cfg(webgl)", "cfg(send_sync)"] }
+unused_qualifications = "allow"
+mismatched_lifetime_syntaxes = "allow"
+'@
+    if ($manifestText -notmatch '(?m)^\[lints\.rust\]\s*$') {
+        $manifestText = $manifestText.TrimEnd() + $lintTable
+        Set-Content -Path $manifestPath -Value $manifestText -NoNewline
+    } else {
+        # Do not silently override upstream lint policy if the pinned source
+        # later grows its own table; require an intentional update instead.
+        foreach ($requiredLint in @('unexpected_cfgs', 'unused_qualifications', 'mismatched_lifetime_syntaxes')) {
+            if ($manifestText -notmatch "(?m)^$requiredLint\s*=") {
+                throw "$crateName already defines [lints.rust] but is missing $requiredLint; update the interop patch explicitly."
+            }
+        }
+    }
+}
+
+Set-UpstreamLintHygiene (Join-Path $halRoot 'Cargo.toml') 'wgpu-hal'
+Set-UpstreamLintHygiene (Join-Path $coreRoot 'Cargo.toml') 'wgpu-core'
+
 # These three packages are one tightly-coupled WGPU ABI family. The patched
 # wgpu-hal depends on the sibling wgpu-types by path; wgpu-core must also come
 # from this checkout so it uses those same sibling types and HAL. Finally,

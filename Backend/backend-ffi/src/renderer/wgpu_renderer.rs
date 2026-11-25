@@ -265,7 +265,7 @@ fn init_state() -> Result<RendererState, String> {
         let shared_gl_context = if wants_shared_gl && initial_info.backend == wgpu::Backend::Gl {
             let mut shared = None;
             unsafe {
-                adapter.as_hal::<wgpu::hal::api::Gles>(|hal_adapter| {
+                adapter.as_hal::<wgpu::hal::api::Gles, _, _>(|hal_adapter| {
                     if let Some(hal_adapter) = hal_adapter {
                         shared = Some(hal_adapter.adapter_context());
                     }
@@ -780,7 +780,7 @@ impl GpuPreviewRenderer {
             });
             let mut gl_name = None;
             unsafe {
-                texture.as_hal::<wgpu::hal::api::Gles>(|hal_texture| {
+                texture.as_hal::<wgpu::hal::api::Gles, _>(|hal_texture| {
                     if let Some(hal_texture) = hal_texture {
                         if let wgpu::hal::gles::TextureInner::Texture { raw, target } = &hal_texture.inner {
                             if *target == glow::TEXTURE_2D {
@@ -886,7 +886,7 @@ impl GpuPreviewRenderer {
             let gl = context.lock();
             unsafe {
                 gl.finish();
-                if fence != 0 { gl.delete_fence(glow::NativeFence(fence as *mut _)); }
+                if fence != 0 { gl.delete_sync(glow::NativeFence(fence as *mut _)); }
             }
         }
         let slot = &mut guard.shared_gl_targets[slot_index];
@@ -910,7 +910,7 @@ impl GpuPreviewRenderer {
             let gl = context.lock();
             unsafe {
                 gl.finish();
-                if fence != 0 { gl.delete_fence(glow::NativeFence(fence as *mut _)); }
+                if fence != 0 { gl.delete_sync(glow::NativeFence(fence as *mut _)); }
             }
         } else {
             return Err("WGPU/OpenGL shared context is unavailable".to_owned());
@@ -940,11 +940,11 @@ impl GpuPreviewRenderer {
         }
         unsafe {
             gl.wait_sync(ui_sync, 0, glow::TIMEOUT_IGNORED);
-            gl.delete_fence(ui_sync);
+            gl.delete_sync(ui_sync);
         }
         let producer_fence = guard.shared_gl_targets[slot_index].ready_fence;
         if producer_fence != 0 {
-            unsafe { gl.delete_fence(glow::NativeFence(producer_fence as *mut _)); }
+            unsafe { gl.delete_sync(glow::NativeFence(producer_fence as *mut _)); }
         }
         drop(gl);
         let slot = &mut guard.shared_gl_targets[slot_index];
@@ -966,7 +966,7 @@ impl GpuPreviewRenderer {
             #[cfg(windows)]
             if let Some(context) = guard.shared_gl_context.as_ref().cloned() {
                 let gl = context.lock();
-                unsafe { gl.delete_fence(glow::NativeFence(fence as *mut _)) };
+                unsafe { gl.delete_sync(glow::NativeFence(fence as *mut _)) };
             }
         }
         let slot = &mut guard.shared_gl_targets[slot_index];
