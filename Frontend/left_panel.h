@@ -205,10 +205,10 @@ static void AudioView(void) {
                                             .clip = {.horizontal = true}}) {
                 Icon(I_NOTE, 30, C_MUTED);
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-                    Tx("Select a media with audio", 16, C_TEXT, 1);
+                    TxWrap("Select a media with audio", 16, C_TEXT, 1);
                 }
                 CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childAlignment = {.x = CLAY_ALIGN_X_CENTER}}}) {
-                    TxWrap("Audio controls are available for video clips with audio or audio clips.", 13, C_MUTED, 1);
+                    TxWrap("Audio controls work with video clips containing audio and dedicated audio clips.", 13, C_MUTED, 1);
                 }
             }
         } else {

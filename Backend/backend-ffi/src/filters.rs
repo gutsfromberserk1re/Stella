@@ -395,23 +395,9 @@ mod tests {
         assert!(scale_at < crop_at && crop_at < pad_at, "crop must be applied to fitted source before the transparent canvas pad");
     }
 
-    #[test]
-    fn expanded_filter_looks_generate_real_export_filters() {
-        let cases = [
-            ("teal_orange", "eq=saturation=1.120:contrast=1.050"),
-            ("sepia", "eq=saturation=0.380"),
-            ("bleach", "eq=contrast=1.300:saturation=0.450"),
-            ("pastel", "eq=brightness=0.045:contrast=0.880:saturation=0.900"),
-        ];
-        for (preset, expected) in cases {
-            let clip = json!({
-                "start": 0.0,
-                "props": {"effects": {"preset": {"id": preset, "intensity": 100.0}}}
-            });
-            let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
-            assert!(graph.contains(expected), "missing {preset} export filter in {graph}");
-        }
-    }
+    // Preset looks are rendered by the shared WGPU shader for both preview
+    // and export. Do not assert for FFmpeg visual-filter equivalents here;
+    // renderer::params tests verify these presets reach the WGPU uniforms.
 
     #[test]
     fn curated_effects_generate_matching_export_operations() {

@@ -613,6 +613,7 @@ int main(void) {
                 if (IsKeyPressed(KEY_H)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_C)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_T)) { gTimelineTool = 3; gRightTab = 3; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+                if (IsKeyPressed(KEY_S)) PlutoTimelineSnap(!gTimelineSnap);
             }
         }
         if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_K) &&

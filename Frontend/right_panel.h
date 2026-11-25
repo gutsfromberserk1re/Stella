@@ -1,3 +1,8 @@
+/* Cache auto-fit metrics separately from the raster. Keep these declarations
+   above PlutoTextWriteImage because this header is compiled as C. */
+static uint64_t gTextFitCacheSignature;
+static int gTextFitCacheSize;
+
 /* Right panel: inspector, controls and inspector scrolling. */
 /* ------------------------------------------------------------------ */
 /* UI: inspector (right) - interaction helpers                         */
@@ -1433,7 +1438,7 @@ static void EffectsView(void) {
         measuredFrom = from;
         measuredNext = next;
         gTransitionBodyMeasured = false;
-        gEffectSectionHeight[0] = next < 0 ? 96.f : 265.f;
+        gEffectSectionHeight[0] = next < 0 ? 96.f : 355.f;
     }
     CLAY(CLAY_ID("EffectsRoot"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 10}}) {
         /* Transitions: a measured-height wrapper animates the content just
@@ -1446,7 +1451,7 @@ static void EffectsView(void) {
             gEffectSectionHeight[0] = transMeasured;
             gTransitionBodyMeasured = true;
         } else if (!gTransitionBodyMeasured) {
-            gEffectSectionHeight[0] = next < 0 ? 96.f : 265.f;
+            gEffectSectionHeight[0] = next < 0 ? 96.f : 355.f;
         }
         float transWrapHeight = roundf(transOpen * (gEffectSectionHeight[0] + 10.f));
         bool transitionModified = strcmp(gTransitionType, "none") != 0;
@@ -1473,13 +1478,14 @@ static void EffectsView(void) {
                             TxWrap(Fmt("%.26s", gTimelineClips[from].label), 13, C_MUTED, 0);
                             TxWrap(Fmt("to %.26s", gTimelineClips[next].label), 13, C_MUTED, 0);
                         }
-                        const char *names[6] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide"};
-                        const char *keys[6] = {"none", "crossfade", "dip", "wipe", "iris", "slide"};
-                        for (int row = 0; row < 3; row++) {
+                        const char *names[10] = {"None", "Cross dissolve", "Dip to black", "Wipe", "Iris", "Slide", "Zoom", "Spin", "Blur", "Checkerboard"};
+                        const char *keys[10] = {"none", "crossfade", "dip", "wipe", "iris", "slide", "zoom", "spin", "blur", "checker"};
+                        for (int row = 0; row < 5; row++) {
                             CLAY(CLAY_IDI("TransitionChoiceRow", row),
                                  {.layout = {.sizing = {GROW, FIX(42)}, .childGap = 5}}) {
                                 for (int col = 0; col < 2; col++) {
                                     int i = row * 2 + col;
+                                    if (i >= 10) continue;
                                     Clay_ElementId cid = CLAY_IDI("TransitionChoice", i);
                                     Bs cb = Interact(cid);
                                     bool selected = strcmp(gTransitionType, keys[i]) == 0;
@@ -2251,11 +2257,6 @@ static bool gTextColorHexFocused;
 static bool gTextColorHexReplaceOnType;
 static bool gTextColorHexInvalid;
 static char gTextColorHex[10] = "#F5F6F9";
-/* Cache auto-fit metrics separately from the raster. Colour-only edits should
-   not repeat the binary-search measurement pass for an unchanged text frame. */
-static uint64_t gTextFitCacheSignature;
-static int gTextFitCacheSize;
-
 static void TextColorHexLoad(int index) {
     if (index < 0 || index >= 4) return;
     Color c = gTextAppearance[index];
@@ -2423,7 +2424,7 @@ static void TextColorRow(int index, const char *label, float editorT) {
         CLAY(swatch, {.layout = {.sizing = {FIX(30), FIX(30)}},
                       .backgroundColor = (Clay_Color){color.r, color.g, color.b, color.a},
                       .cornerRadius = CLAY_CORNER_RADIUS(15),
-                      .border = {.color = Mix(RGB(244, 246, 250), WHITE, b.hover * .12f),
+                      .border = {.color = Mix(RGB(244, 246, 250), RGB(255, 255, 255), b.hover * .12f),
                                  .width = CLAY_BORDER_OUTSIDE(2.f)}}) {}
     }
     if (gTextColorEditIndex == index && editorT > .004f) {

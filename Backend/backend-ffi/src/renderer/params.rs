@@ -17,7 +17,7 @@ pub struct LayerUniforms {
     pub geo0: [f32; 4],  // scale_x, scale_y, rotation_rad, opacity
     pub geo1: [f32; 4],  // pos_x, pos_y (fractions of target), mirror, time_sec
     pub crop: [f32; 4],  // left, right, top, bottom
-    pub transition: [f32; 4], // axis_x, axis_y, progress, kind (0 none, 1 fade, 2 wipe, 3 iris, 4 slide, 5 dip)
+    pub transition: [f32; 4], // axis_x, axis_y, progress, kind (0 none, 1 crossfade, 2 wipe, 3 iris, 4 slide, 5 dip-in, 6 zoom, 7 spin, 8 blur, 9 checker, 10 dip-out)
     pub distort: [f32; 4], // top-left, top-right, bottom-right, bottom-left
     pub light: [f32; 4], // brightness, contrast, saturation, vibrance
     pub bal_s: [f32; 4],
@@ -144,8 +144,20 @@ impl LayerUniforms {
         keyframes: &Value,
         transition_in: Option<(&str, f32)>,
     ) -> Self {
+        Self::from_props_with_keyframes_and_transitions(props, time, keyframes, transition_in, None)
+    }
+
+    /// Resolves keyframes and applies incoming and outgoing transition state in
+    /// one uniform update. Outgoing state is currently used for dip-to-black.
+    pub fn from_props_with_keyframes_and_transitions(
+        props: &Value,
+        time: f64,
+        keyframes: &Value,
+        transition_in: Option<(&str, f32)>,
+        transition_out: Option<(&str, f32)>,
+    ) -> Self {
         let resolved = resolve_keyframed_props(props, keyframes, time);
-        Self::from_props_with_transition(&resolved, time, transition_in)
+        Self::from_props_with_transitions(&resolved, time, transition_in, transition_out)
     }
 
     /// Maps the active incoming transition along with the clip's visual properties.
@@ -153,6 +165,17 @@ impl LayerUniforms {
         props: &Value,
         time: f64,
         transition_in: Option<(&str, f32)>,
+    ) -> Self {
+        Self::from_props_with_transitions(props, time, transition_in, None)
+    }
+
+    /// Maps both sides of a transition. Kind 10 is an outgoing dip-to-black;
+    /// it remains opaque while its RGB values are driven to black.
+    pub fn from_props_with_transitions(
+        props: &Value,
+        time: f64,
+        transition_in: Option<(&str, f32)>,
+        transition_out: Option<(&str, f32)>,
     ) -> Self {
         let mut u = Self::identity();
         let transform = &props["transform"];
@@ -212,12 +235,16 @@ impl LayerUniforms {
 
         if let Some((kind, progress)) = transition_in {
             let transition_kind = match kind {
-                "fade" | "crossfade" | "dissolve" | "fadeblack" | "fadewhite" => 1.0,
+                "fade" | "crossfade" | "dissolve" => 1.0,
                 "wipe" | "wipeleft" | "wiperight" | "wipeup" | "wipedown"
                 | "diagtl" | "diagtr" | "diagbl" | "diagbr" => 2.0,
                 "iris" | "circleopen" | "circleclose" | "radial" => 3.0,
                 "slide" | "slideleft" | "slideright" | "slideup" | "slidedown" => 4.0,
-                "dip" => 5.0,
+                "dip" | "fadeblack" => 5.0,
+                "zoom" | "zoomin" => 6.0,
+                "spin" => 7.0,
+                "blur" | "hblur" => 8.0,
+                "checker" | "pixelize" => 9.0,
                 _ => 1.0,
             };
             let axis = match kind {
@@ -231,6 +258,8 @@ impl LayerUniforms {
                 _ => [1.0, 0.0],
             };
             u.transition = [axis[0], axis[1], progress.clamp(0.0, 1.0), transition_kind];
+        } else if let Some(("dip", progress)) = transition_out {
+            u.transition = [1.0, 0.0, progress.clamp(0.0, 1.0), 10.0];
         }
 
         // ---------------------------------------------------------------- light
@@ -602,6 +631,27 @@ mod tests {
         assert_eq!(actual.fx3[2], neutral.fx3[2]);
         assert_eq!(actual.fx5, neutral.fx5);
         assert_eq!(actual.fx6[0..2], neutral.fx6[0..2]);
+    }
+
+
+    #[test]
+    fn new_transition_kinds_map_to_distinct_gpu_modes() {
+        let props = serde_json::json!({});
+        let expected = [("zoom", 6.0), ("spin", 7.0), ("blur", 8.0), ("checker", 9.0)];
+        for (name, mode) in expected {
+            let uniforms = LayerUniforms::from_props_with_transition(&props, 0.0, Some((name, 0.4)));
+            assert_eq!(uniforms.transition[2], 0.4);
+            assert_eq!(uniforms.transition[3], mode, "unexpected transition mode for {name}");
+        }
+    }
+
+    #[test]
+    fn dip_to_black_has_separate_incoming_and_outgoing_shader_modes() {
+        let props = serde_json::json!({});
+        let incoming = LayerUniforms::from_props_with_transition(&props, 0.0, Some(("dip", 0.6)));
+        let outgoing = LayerUniforms::from_props_with_transitions(&props, 0.0, None, Some(("dip", 0.4)));
+        assert_eq!(incoming.transition[3], 5.0);
+        assert_eq!(outgoing.transition[3], 10.0);
     }
 
     #[test]

@@ -151,7 +151,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // target pixel -> layer space: undo position, then rotation, then scale
     var p = (in.uv - vec2<f32>(0.5, 0.5)) * tgt - vec2<f32>(u.geo1.x, u.geo1.y) * tgt;
     let transition_progress = clamp(u.transition.z, 0.0, 1.0);
-    if (u.transition.w > 3.5 && u.transition.w < 4.5) {
+    let transition_kind = i32(u.transition.w + 0.5);
+    // Zoom and spin are distinct spatial reveals rather than directional slides.
+    if (transition_kind == 6) {
+        p = p / mix(0.32, 1.0, transition_progress);
+    } else if (transition_kind == 7) {
+        let spin_scale = mix(0.48, 1.0, transition_progress);
+        let spin_angle = (1.0 - transition_progress) * 1.35 * PI;
+        let spin_cs = cos(spin_angle);
+        let spin_sn = sin(spin_angle);
+        p = vec2<f32>(spin_cs * p.x + spin_sn * p.y, -spin_sn * p.x + spin_cs * p.y) / spin_scale;
+    }
+    if (transition_kind == 4) {
         let slide_axis = normalize(u.transition.xy + vec2<f32>(0.0001, 0.0001));
         p = p + slide_axis * (1.0 - transition_progress) * max(tgt.x, tgt.y) * 1.25;
     }
@@ -198,7 +209,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let blur_mode = i32(u.fx0.w + 0.5);
     var sigma = 0.0;
     if (blur_mode == 1) { sigma = u.fx0.z; }
-    if (sigma > 0.25) {
+    if (transition_kind == 8) {
+        let transition_blur = (1.0 - transition_progress) * 8.0;
+        if (transition_blur > 0.25) {
+            col = blur_gauss(suv, transition_blur, ruv);
+        }
+    } else if (sigma > 0.25) {
         col = blur_gauss(suv, sigma, ruv);
     } else if (blur_mode == 2) {
         col = blur_motion(suv, u.fx0.z, u.fx1.x, ruv);
@@ -331,21 +347,37 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Incoming transition masks are evaluated on the GPU with the same
     // direction/progress metadata the timeline supplies to the old compositor.
     var transition_alpha = 1.0;
-    let transition_kind = i32(u.transition.w + 0.5);
-    if (transition_kind == 1 || transition_kind == 5) {
+    if (transition_kind == 1 || transition_kind == 6 || transition_kind == 7 || transition_kind == 8) {
         transition_alpha = transition_progress;
+    } else if (transition_kind == 5) {
+        // Dip to black: hold the incoming shot hidden until the outgoing shot
+        // has completed its fade to black, then reveal it from black.
+        transition_alpha = smoothstep(0.5, 1.0, transition_progress);
     } else if (transition_kind == 2) {
         let axis = normalize(u.transition.xy + vec2<f32>(0.0001, 0.0001));
         let wipe_coord = clamp(0.5 + dot(l - vec2<f32>(0.5, 0.5), axis) * 0.70710678, 0.0, 1.0);
         transition_alpha = 1.0 - smoothstep(transition_progress - 0.015, transition_progress + 0.015, wipe_coord);
     } else if (transition_kind == 3) {
-        let radius = transition_progress * 0.70710678;
+        // The normalized corner distance is 1.0. Expanding beyond that value
+        // ensures the iris reaches every corner instead of remaining clipped.
+        let radius = transition_progress * 1.05;
         let radial_distance = distance(l, vec2<f32>(0.5, 0.5)) * 1.41421356;
         transition_alpha = select(
             0.0,
             1.0 - smoothstep(radius - 0.015, radius + 0.015, radial_distance),
             transition_progress > 0.0
         );
+    } else if (transition_kind == 9) {
+        let checker_cell = floor(l * vec2<f32>(12.0, 8.0));
+        let checker_index = checker_cell.x + checker_cell.y;
+        let reveal_at = select(0.72, 0.28, (checker_index - 2.0 * floor(checker_index / 2.0)) < 1.0);
+        transition_alpha = smoothstep(reveal_at - 0.035, reveal_at + 0.035, transition_progress);
+    }
+    if (transition_kind == 10) {
+        // Outgoing half of dip-to-black: stay opaque so the track below cannot
+        // show through while the outgoing picture is being darkened.
+        let blacken = smoothstep(0.0, 0.5, transition_progress);
+        col = col * (1.0 - blacken);
     }
     // Preserve source alpha (notably transparent PNG layers) as well as the
     // geometric, crop, opacity and transition coverage.

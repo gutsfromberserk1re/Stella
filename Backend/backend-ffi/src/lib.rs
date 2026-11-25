@@ -779,19 +779,25 @@ fn transition_out(clip: &Clip) -> Option<(String, f64)> {
     let stored_kind = transition["type"].as_str()?;
     let kind = match stored_kind {
         "none" => return None,
-        "crossfade" => "fade",       // projects saved by older Stella builds
-        "dip" => "fadeblack",
-        "wipe" => "wipeleft",
-        "iris" => "circleopen",
-        "slide" => "slideleft",
+        "crossfade" | "fade" | "dissolve" => "crossfade",
+        "wipe" | "wipeleft" => "wipe",
+        "iris" | "circleopen" => "iris",
+        "slide" | "slideleft" => "slide",
+        "dip" | "fadeblack" => "dip",
+        "zoom" | "zoomin" => "zoom",
+        "spin" => "spin",
+        "blur" | "hblur" => "blur",
+        "checker" | "pixelize" => "checker",
         value => value,
     };
     if !matches!(kind,
-        "fade" | "dissolve" | "fadeblack" | "fadewhite" |
-        "wipeleft" | "wiperight" | "wipeup" | "wipedown" |
+        "fade" | "crossfade" | "dissolve" | "dip" |
+        "wipe" | "wipeleft" | "wiperight" | "wipeup" | "wipedown" |
         "diagtl" | "diagtr" | "diagbl" | "diagbr" |
-        "slideleft" | "slideright" | "slideup" | "slidedown" |
-        "circleopen" | "circleclose" | "radial" | "zoomin" | "squeezeh" | "squeezev")
+        "slide" | "slideleft" | "slideright" | "slideup" | "slidedown" |
+        "iris" | "circleopen" | "circleclose" | "radial" |
+        "zoom" | "zoomin" | "spin" | "blur" | "checker" |
+        "squeezeh" | "squeezev")
     { return None; }
     let duration = transition["duration"].as_f64().filter(|v| v.is_finite()).unwrap_or(1.0).max(0.05).min(clip.duration.min(3.0).max(0.05));
     Some((kind.to_owned(), duration))
@@ -803,6 +809,21 @@ fn transition_between(left: &Clip, right: &Clip) -> Option<(String, f64)> {
     let preserve_preview_duration = left.extra.get("previewSeekAdjusted").and_then(Value::as_bool) == Some(true);
     let duration = if preserve_preview_duration { duration } else { duration.min(left.duration * 0.5).min(right.duration * 0.5) };
     (duration > 0.0).then_some((kind, duration))
+}
+
+/// Neighbor pairs are discovered within each video lane, never by looking at
+/// adjacent entries in a globally sorted multi-lane list. An overlay clip on
+/// V2 must not break a transition between two consecutive clips on V1.
+fn same_track_neighbor_indices(clips: &[&Clip]) -> Vec<(usize, usize)> {
+    let mut order: Vec<usize> = (0..clips.len()).collect();
+    order.sort_by(|left, right| {
+        clips[*left].track.sort_index().cmp(&clips[*right].track.sort_index())
+            .then_with(|| clips[*left].start.total_cmp(&clips[*right].start))
+            .then_with(|| clips[*left].id.cmp(&clips[*right].id))
+    });
+    order.windows(2).filter_map(|pair| {
+        (clips[pair[0]].track == clips[pair[1]].track).then_some((pair[0], pair[1]))
+    }).collect()
 }
 
 fn transition_preroll_source_time(source_offset: f64, duration: f64, elapsed: f64) -> f64 {
@@ -822,10 +843,10 @@ fn timeline_transition_start_at(timeline: &Timeline, at: f64) -> Option<f64> {
         let rank = |track: TrackId| track.sort_index();
         rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
-    clips.windows(2).find_map(|pair| {
-        let (_, duration) = transition_between(pair[0], pair[1])?;
-        let start = pair[1].start - duration;
-        (at >= start - 0.02 && at <= pair[1].start + 0.02).then_some(start.max(0.0))
+    same_track_neighbor_indices(&clips).into_iter().find_map(|(left, right)| {
+        let (_, duration) = transition_between(clips[left], clips[right])?;
+        let start = clips[right].start - duration;
+        (at >= start - 0.02 && at <= clips[right].start + 0.02).then_some(start.max(0.0))
     })
 }
 
@@ -872,11 +893,9 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         let order = |track: TrackId| track.sort_index();
         order(a.track).cmp(&order(b.track)).then_with(|| a.start.total_cmp(&b.start))
     });
-    let mut outgoing = Vec::with_capacity(video_clips.len());
-    for i in 0..video_clips.len() {
-        outgoing.push(if i + 1 < video_clips.len() {
-            transition_between(video_clips[i], video_clips[i + 1])
-        } else { None });
+    let mut outgoing = vec![None; video_clips.len()];
+    for (left, right) in same_track_neighbor_indices(&video_clips) {
+        outgoing[left] = transition_between(video_clips[left], video_clips[right]);
     }
     let mut incoming = vec![None; video_clips.len()];
     for i in 1..video_clips.len() { incoming[i] = outgoing[i - 1].clone(); }
@@ -942,7 +961,19 @@ fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u
         graph.push(format!("color=c=black@0:s={width}x{height}:r={fps}:d={duration:.5},format=rgba,settb=AVTB[{right_bg}]"));
         graph.push(format!("[{left_bg}][{left_raw}]overlay=x={left_x}:y={left_y}:shortest=1:repeatlast=0:format=auto,format=rgba,setpts=PTS-STARTPTS[{left_full}]"));
         graph.push(format!("[{right_bg}][{right_raw}]overlay=x={right_x}:y={right_y}:shortest=1:repeatlast=0:format=auto,format=rgba,setpts=PTS-STARTPTS[{right_full}]"));
-        graph.push(format!("[{left_full}][{right_full}]xfade=transition={kind}:duration={duration:.5}:offset=0,format=rgba,setpts=PTS-STARTPTS+{transition_start:.5}/TB[{output}]"));
+        let ffmpeg_kind = match kind.as_str() {
+            "crossfade" => "fade",
+            "dip" => "fadeblack",
+            "zoom" => "zoomin",
+            "spin" => "radial",
+            "blur" => "hblur",
+            "checker" => "pixelize",
+            "wipe" => "wipeleft",
+            "iris" => "circleopen",
+            "slide" => "slideleft",
+            value => value,
+        };
+        graph.push(format!("[{left_full}][{right_full}]xfade=transition={ffmpeg_kind}:duration={duration:.5}:offset=0,format=rgba,setpts=PTS-STARTPTS+{transition_start:.5}/TB[{output}]"));
         transition_layers[i] = Some(output);
     }
 
@@ -1063,11 +1094,17 @@ fn render_wgpu_export_frame(
     });
 
     let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
-    for pair in ordered_video.windows(2) {
-        let Some((kind, duration)) = transition_between(pair[0], pair[1]) else { continue; };
-        let transition_start = pair[1].start - duration;
-        if frame_at + 1e-7 >= transition_start && frame_at < pair[1].start - 1e-7 {
-            incoming_transitions.insert(pair[1].id.clone(), (kind, duration));
+    let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
+    for (left_index, right_index) in same_track_neighbor_indices(&ordered_video) {
+        let left = ordered_video[left_index];
+        let right = ordered_video[right_index];
+        let Some((kind, duration)) = transition_between(left, right) else { continue; };
+        let transition_start = right.start - duration;
+        if frame_at + 1e-7 >= transition_start && frame_at < right.start - 1e-7 {
+            incoming_transitions.insert(right.id.clone(), (kind.clone(), duration));
+            if kind == "dip" {
+                outgoing_transitions.insert(left.id.clone(), (kind, duration));
+            }
         }
     }
 
@@ -1107,8 +1144,11 @@ fn render_wgpu_export_frame(
         let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
             (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
         });
-        let layer_uniforms = LayerUniforms::from_props_with_keyframes_and_transition(
-            props, frame_at, keyframes, transition,
+        let transition_out = outgoing_transitions.get(&clip.id).map(|(kind, duration)| {
+            (kind.as_str(), ((frame_at - (clip.end() - duration)) / duration.max(1e-9)) as f32)
+        });
+        let layer_uniforms = LayerUniforms::from_props_with_keyframes_and_transitions(
+            props, frame_at, keyframes, transition, transition_out,
         );
         // Match preview's resolution-aware decode policy, but use the export
         // canvas dimensions instead of its smaller preview-quality dimensions.
@@ -1484,14 +1524,20 @@ impl PreviewEngine {
             rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
         });
         let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
-        for pair in ordered_video.windows(2) {
-            let (kind, duration) = match transition_between(pair[0], pair[1]) {
+        let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
+        for (left_index, right_index) in same_track_neighbor_indices(&ordered_video) {
+            let left = ordered_video[left_index];
+            let right = ordered_video[right_index];
+            let (kind, duration) = match transition_between(left, right) {
                 Some(value) => value,
                 None => continue,
             };
-            let transition_start = pair[1].start - duration;
-            if frame_at + 1e-7 >= transition_start && frame_at < pair[1].start - 1e-7 {
-                incoming_transitions.insert(pair[1].id.clone(), (kind, duration));
+            let transition_start = right.start - duration;
+            if frame_at + 1e-7 >= transition_start && frame_at < right.start - 1e-7 {
+                incoming_transitions.insert(right.id.clone(), (kind.clone(), duration));
+                if kind == "dip" {
+                    outgoing_transitions.insert(left.id.clone(), (kind, duration));
+                }
             }
         }
 
@@ -1568,7 +1614,12 @@ impl PreviewEngine {
             let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
                 (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
             });
-            let uniforms = LayerUniforms::from_props_with_keyframes_and_transition(props, frame_at, keyframes, transition);
+            let transition_out = outgoing_transitions.get(&clip.id).map(|(kind, duration)| {
+                (kind.as_str(), ((frame_at - (clip.end() - duration)) / duration.max(1e-9)) as f32)
+            });
+            let uniforms = LayerUniforms::from_props_with_keyframes_and_transitions(
+                props, frame_at, keyframes, transition, transition_out,
+            );
             // Decode close to the layer's displayed pixel size. A 15% picture-in-picture
             // clip needs far fewer source pixels than a full-canvas background. Keep a
             // 160px floor for motion/detail and use the largest scale axis for rotation.
@@ -1724,8 +1775,10 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let clips: Vec<Clip> =
                 serde_json::from_value(request["clips"].clone()).map_err(|e| e.to_string())?;
             let snapping = timeline.snapping;
+            let magnetic = timeline.magnetic;
             *timeline = Timeline::new(clips).map_err(|e| format!("{e:?}"))?;
             timeline.snapping = snapping;
+            timeline.magnetic = magnetic;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
@@ -2424,6 +2477,45 @@ mod tests {
         assert_eq!(frames[1]["values"]["opacity"].as_f64(), Some(35.0));
         assert_eq!(frames[1]["values"]["scaleW"].as_f64(), Some(150.0));
         assert_eq!(frames[2]["values"]["x"].as_f64(), Some(30.0));
+    }
+
+    #[test]
+    fn transition_pairing_ignores_interleaved_clips_on_other_video_lanes() {
+        let mut first = test_clip("first-v1");
+        first.start = 0.0;
+        first.duration = 2.0;
+        first.extra.insert("props".into(), json!({"transitionOut":{"type":"crossfade","duration":0.8}}));
+        let mut overlay = test_clip("overlay-v2");
+        overlay.track = TrackId::V2;
+        overlay.start = 0.8;
+        overlay.duration = 0.5;
+        let mut second = test_clip("second-v1");
+        second.start = 2.0;
+        second.duration = 2.0;
+
+        let mut ordered = vec![&first, &overlay, &second];
+        ordered.sort_by(|a, b| a.track.sort_index().cmp(&b.track.sort_index()).then_with(|| a.start.total_cmp(&b.start)));
+        let pairs = same_track_neighbor_indices(&ordered);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(ordered[pairs[0].0].id, "first-v1");
+        assert_eq!(ordered[pairs[0].1].id, "second-v1");
+        assert_eq!(transition_between(ordered[pairs[0].0], ordered[pairs[0].1]), Some(("crossfade".to_owned(), 0.8)));
+    }
+
+    #[test]
+    fn new_transition_types_are_preserved_from_clip_properties() {
+        for kind in ["zoom", "spin", "blur", "checker", "dip", "crossfade"] {
+            let mut clip = test_clip(kind);
+            clip.extra.insert("props".into(), json!({"transitionOut":{"type":kind,"duration":0.6}}));
+            assert_eq!(transition_out(&clip).map(|value| value.0), Some(kind.to_owned()));
+        }
+    }
+
+    #[test]
+    fn legacy_fadeblack_alias_keeps_the_full_dip_to_black_behavior() {
+        let mut clip = test_clip("legacy-dip");
+        clip.extra.insert("props".into(), json!({"transitionOut":{"type":"fadeblack","duration":0.6}}));
+        assert_eq!(transition_out(&clip).map(|value| value.0), Some("dip".to_owned()));
     }
 
     #[test]

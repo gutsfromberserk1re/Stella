@@ -16,6 +16,35 @@ typedef struct TimelineSnapPoint { float time; int clipIndex; } TimelineSnapPoin
 static TimelineSnapPoint gTimelineSnapPoints[MAX_TIMELINE_CLIPS * 2];
 static int gTimelineSnapPointCount;
 static bool gTimelineSnapCacheValid;
+/* Magnetic ripple edits are committed in Rust; animate the resulting video
+   lane movement locally so clips visibly glide into the newly closed gap. */
+static char gTimelineMotionIds[MAX_TIMELINE_CLIPS][64];
+static float gTimelineMotionStarts[MAX_TIMELINE_CLIPS];
+static bool gTimelineMotionReady[MAX_TIMELINE_CLIPS];
+
+static void TimelineTickClipMotion(void) {
+    float blend = 1.f - expf(-20.f * fmaxf(0.f, gDt));
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        TimelineClipUi *clip = &gTimelineClips[i];
+        if (!gTimelineMotionReady[i] || strcmp(gTimelineMotionIds[i], clip->id) != 0) {
+            strncpy(gTimelineMotionIds[i], clip->id, sizeof(gTimelineMotionIds[i]) - 1);
+            gTimelineMotionIds[i][sizeof(gTimelineMotionIds[i]) - 1] = 0;
+            gTimelineMotionStarts[i] = clip->start;
+            gTimelineMotionReady[i] = true;
+            continue;
+        }
+        float delta = clip->start - gTimelineMotionStarts[i];
+        gTimelineMotionStarts[i] += delta * blend;
+        if (fabsf(delta) < .001f) gTimelineMotionStarts[i] = clip->start;
+    }
+}
+
+static float TimelineDisplayStart(int index) {
+    if (index < 0 || index >= gTimelineClipCount || !gTimelineMotionReady[index] ||
+        strcmp(gTimelineMotionIds[index], gTimelineClips[index].id) != 0)
+        return index >= 0 && index < gTimelineClipCount ? gTimelineClips[index].start : 0.f;
+    return gTimelineMotionStarts[index];
+}
 
 static bool TimelineTrackIsVideo(int track) { return track >= 0 && track < TIMELINE_MAX_VIDEO_TRACKS; }
 static bool TimelineTrackIsAudio(int track) { return track >= TIMELINE_MAX_VIDEO_TRACKS && track < TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS; }
@@ -371,7 +400,8 @@ static float TimelineSnapStart(float start, float duration, bool video, int movi
        the anchor; do not silently lock to the previous clip edge when snapping
        is disabled. Dragging uses a prebuilt edge cache instead of rescanning all
        clips on every pointer event. */
-    float bestDistance = 0.25f, snapped = fmaxf(0.f, start);
+    float snapThreshold = Clampf(13.f / fmaxf(1.f, TimelinePps()), .18f, .75f);
+    float bestDistance = snapThreshold, snapped = fmaxf(0.f, start);
     if (gClipDragIndex >= 0 || gMediaDragIndex >= 0) {
         if (!gTimelineSnapCacheValid) TimelineBuildSnapCache();
         for (int i = 0; i < gTimelineSnapPointCount; i++) {
@@ -652,7 +682,7 @@ static void TimelineClipLane(int track, float height) {
     float visualCursor = 0.f;
     for (int n = 0; n < count; n++) {
         int i = order[n];
-        float x = gTimelinePan + gTimelineClips[i].start * pps;
+        float x = gTimelinePan + TimelineDisplayStart(i) * pps;
         float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
         if (lane.width > 0.f && x >= lane.width) break; /* sorted: every later clip is also off-screen */
         if (x + width <= 0.f) continue;
@@ -731,7 +761,7 @@ static void TimelineClipLane(int track, float height) {
         float cursor = 0.f;
         for (int n = 0; n < count; n++) {
             int i = order[n];
-            float x = gTimelinePan + gTimelineClips[i].start * pps;
+            float x = gTimelinePan + TimelineDisplayStart(i) * pps;
             float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
             if (lane.width > 0.f && x >= lane.width) break; /* don't create Clay nodes for invisible clips */
             if (x + width <= 0.f) continue;
@@ -1022,6 +1052,7 @@ static void DrawTimelineContextMenu(void) {
 }
 
 static void Timeline(void) {
+    TimelineTickClipMotion();
     gTransitionButtonCount = 0;
     TimelinePrepareSnapCache();
     TimelineContextLogic();

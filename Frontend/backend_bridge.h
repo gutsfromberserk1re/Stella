@@ -514,8 +514,9 @@ static bool PlutoTimelineUpdateTitleClip(const char *clipId, const char *path, c
 static bool PlutoTimelineMove(int index, float start, int track) {
     if (index < 0 || index >= gTimelineClipCount) return false;
     char id[128], request[512]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
-    snprintf(request, sizeof(request), "{\"command\":\"timeline_move_clip\",\"id\":\"%s\",\"start\":%.4f,\"track\":\"%s\",\"playhead\":%.4f,\"snapThreshold\":0.25}",
-             id, fmaxf(0.f, start), PlutoTrackName(track), gPlayhead);
+    float snapThreshold = fmaxf(.18f, fminf(.75f, 13.f / fmaxf(1.f, 21.5f * gTimelineZoom)));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_move_clip\",\"id\":\"%s\",\"start\":%.4f,\"track\":\"%s\",\"playhead\":%.4f,\"snapThreshold\":%.4f}",
+             id, fmaxf(0.f, start), PlutoTrackName(track), gPlayhead, snapThreshold);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
     return okay;
