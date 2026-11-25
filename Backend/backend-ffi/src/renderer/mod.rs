@@ -4,4 +4,4 @@ mod params;
 mod wgpu_renderer;
 
 pub use params::LayerUniforms;
-pub use wgpu_renderer::{GpuLayerFrame, GpuPreviewRenderer};
+pub use wgpu_renderer::{set_host_gl_context, GpuLayerFrame, GpuPreviewRenderer, SharedGlPreviewFrame};

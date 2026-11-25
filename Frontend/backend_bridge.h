@@ -22,6 +22,14 @@ typedef int32_t(__cdecl *PlutoBackendCopyPreviewFn)(uint64_t requestId, uint8_t 
 typedef int32_t(__cdecl *PlutoBackendTakePreviewFn)(uint64_t requestId, const uint8_t **pixels, size_t *byteLength,
                                                     uint32_t *width, uint32_t *height, double *at, void **owner);
 typedef void(__cdecl *PlutoBackendReleasePreviewPixelsFn)(void *owner);
+typedef int32_t(__cdecl *PlutoBackendSetGLShareContextFn)(void *context, void *deviceContext);
+typedef int32_t(__cdecl *PlutoBackendDisableGLShareFn)(void);
+typedef int32_t(__cdecl *PlutoBackendTakeGLPreviewFn)(uint64_t requestId, uint32_t *textureId,
+    uint32_t *width, uint32_t *height, double *at, uint64_t *slotToken, void **readyFence);
+typedef int32_t(__cdecl *PlutoBackendDiscardGLPreviewFn)(uint64_t requestId);
+typedef int32_t(__cdecl *PlutoBackendFinishGLPreviewFn)(uint64_t slotToken);
+typedef int32_t(__cdecl *PlutoBackendReleaseGLPreviewFencedFn)(uint64_t slotToken, void *uiFence);
+typedef int32_t(__cdecl *PlutoBackendReleaseGLPreviewFn)(uint64_t slotToken);
 
 typedef struct {
     HMODULE module;
@@ -32,6 +40,13 @@ typedef struct {
     PlutoBackendCopyPreviewFn copyPreview;
     PlutoBackendTakePreviewFn takePreview;
     PlutoBackendReleasePreviewPixelsFn releasePreviewPixels;
+    PlutoBackendSetGLShareContextFn setGlShareContext;
+    PlutoBackendDisableGLShareFn disableGlShare;
+    PlutoBackendTakeGLPreviewFn takeGlPreview;
+    PlutoBackendDiscardGLPreviewFn discardGlPreview;
+    PlutoBackendFinishGLPreviewFn finishGlPreview;
+    PlutoBackendReleaseGLPreviewFencedFn releaseGlPreviewFenced;
+    PlutoBackendReleaseGLPreviewFn releaseGlPreview;
 } PlutoBackend;
 
 static PlutoBackend gBackend;
@@ -53,12 +68,31 @@ static bool PlutoBackendLoad(void) {
     gBackend.copyPreview = (PlutoBackendCopyPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_copy_preview_frame");
     gBackend.takePreview = (PlutoBackendTakePreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_take_preview_frame");
     gBackend.releasePreviewPixels = (PlutoBackendReleasePreviewPixelsFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_release_preview_pixels");
+    gBackend.setGlShareContext = (PlutoBackendSetGLShareContextFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_set_gl_share_context");
+    gBackend.disableGlShare = (PlutoBackendDisableGLShareFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_disable_gl_share");
+    gBackend.takeGlPreview = (PlutoBackendTakeGLPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_take_gl_preview_frame");
+    gBackend.discardGlPreview = (PlutoBackendDiscardGLPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_discard_gl_preview_frame");
+    gBackend.finishGlPreview = (PlutoBackendFinishGLPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_finish_gl_preview_frame");
+    gBackend.releaseGlPreviewFenced = (PlutoBackendReleaseGLPreviewFencedFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_release_gl_preview_frame_fenced");
+    gBackend.releaseGlPreview = (PlutoBackendReleaseGLPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_release_gl_preview_frame");
     if (!gBackend.request || !gBackend.submit || !gBackend.poll || !gBackend.release || !gBackend.copyPreview) {
         FreeLibrary(gBackend.module);
         gBackend = (PlutoBackend){0};
         return false;
     }
     return true;
+}
+
+static bool PlutoBackendShareHostGLContext(void) {
+#ifdef _WIN32
+    if (!gBackend.setGlShareContext) return false;
+    HGLRC context = wglGetCurrentContext();
+    HDC deviceContext = wglGetCurrentDC();
+    return context && deviceContext &&
+        gBackend.setGlShareContext((void *)context, (void *)deviceContext) == 1;
+#else
+    return false;
+#endif
 }
 
 static bool PlutoJsonString(const char *json, const char *key, char *out, size_t cap) {
@@ -134,10 +168,9 @@ static bool PlutoCompletePreviewRequest(uint64_t requestId, StellaPreviewRequest
 }
 
 
-/* Raylib uses an OpenGL texture for the preview. Upload pixels through a small
-   PBO ring so the driver can transfer bytes asynchronously instead of forcing
-   UpdateTexture to wait for the texture upload on the UI thread. This is not
-   WGPU/GL zero-copy: it removes the synchronous client-memory upload stall. */
+/* CPU-readback fallback: upload pixels through a small PBO ring so the driver
+   can transfer bytes asynchronously instead of forcing UpdateTexture to wait
+   on the UI thread. The preferred WGL shared-texture path bypasses this block. */
 #if defined(_WIN32)
 typedef unsigned int StellaGLenum;
 typedef unsigned int StellaGLuint;
@@ -201,6 +234,19 @@ static StellaPFNGLBINDTEXTUREPROC stella_glBindTexture;
 static StellaPFNGLTEXSUBIMAGE2DPROC stella_glTexSubImage2D;
 static StellaPFNGLACTIVETEXTUREPROC stella_glActiveTexture;
 static StellaPFNGLPIXELSTOREIPROC stella_glPixelStorei;
+typedef void (APIENTRY *StellaPFNGLWAITSYNCPROC)(StellaGLsync, StellaGLbitfield, uint64_t);
+typedef unsigned char (APIENTRY *StellaPFNGLISSYNCPROC)(StellaGLsync);
+typedef unsigned char (APIENTRY *StellaPFNGLISTEXTUREPROC)(StellaGLuint);
+typedef void (APIENTRY *StellaPFNGLFLUSHPROC)(void);
+typedef void (APIENTRY *StellaPFNGLFINISHPROC)(void);
+static StellaPFNGLWAITSYNCPROC stella_glWaitSync;
+static StellaPFNGLISSYNCPROC stella_glIsSync;
+static StellaPFNGLISTEXTUREPROC stella_glIsTexture;
+static StellaPFNGLFLUSHPROC stella_glFlush;
+static StellaPFNGLFINISHPROC stella_glFinish;
+static uint64_t gPreviewFrameGlSlot;
+static uint64_t gPreviewPendingGlReleaseSlots[3];
+static int gPreviewPendingGlReleaseCount;
 
 static PROC PlutoGetGlProc(const char *name) {
     PROC proc = wglGetProcAddress(name);
@@ -220,6 +266,11 @@ static void PlutoLoadPreviewPboFunctions(void) {
     STELLA_GL_LOAD(stella_glBindBuffer, StellaPFNGLBINDBUFFERPROC, "glBindBuffer");
     STELLA_GL_LOAD(stella_glBufferData, StellaPFNGLBUFFERDATAPROC, "glBufferData");
     STELLA_GL_LOAD(stella_glFenceSync, StellaPFNGLFENCESYNCPROC, "glFenceSync");
+    STELLA_GL_LOAD(stella_glWaitSync, StellaPFNGLWAITSYNCPROC, "glWaitSync");
+    STELLA_GL_LOAD(stella_glIsSync, StellaPFNGLISSYNCPROC, "glIsSync");
+    STELLA_GL_LOAD(stella_glIsTexture, StellaPFNGLISTEXTUREPROC, "glIsTexture");
+    STELLA_GL_LOAD(stella_glFlush, StellaPFNGLFLUSHPROC, "glFlush");
+    STELLA_GL_LOAD(stella_glFinish, StellaPFNGLFINISHPROC, "glFinish");
     STELLA_GL_LOAD(stella_glClientWaitSync, StellaPFNGLCLIENTWAITSYNCPROC, "glClientWaitSync");
     STELLA_GL_LOAD(stella_glDeleteSync, StellaPFNGLDELETESYNCPROC, "glDeleteSync");
     STELLA_GL_LOAD(stella_glGetIntegerv, StellaPFNGLGETINTEGERVPROC, "glGetIntegerv");
@@ -311,6 +362,68 @@ static bool PlutoUploadPreviewTexturePbo(Texture2D texture, const uint8_t *pixel
 static void PlutoReleasePreviewPbos(void) { }
 #endif
 
+#ifdef _WIN32
+static void PlutoQueueSharedPreviewRelease(uint64_t slotToken) {
+    if (!slotToken || !gBackend.releaseGlPreview) return;
+    if (gPreviewPendingGlReleaseCount < 3) {
+        gPreviewPendingGlReleaseSlots[gPreviewPendingGlReleaseCount++] = slotToken;
+        return;
+    }
+    /* Never recycle a shared texture unless its draw completion can be
+       acknowledged. With a three-slot renderer this indicates an ownership
+       invariant failure; retain the slot rather than risk a write/read race. */
+    OutputDebugStringA("Stella: shared preview release queue is full; retaining texture slot\n");
+}
+
+static void PlutoAfterDraw(void) {
+    if (gPreviewPendingGlReleaseCount <= 0 || !gBackend.releaseGlPreview) return;
+    PlutoLoadPreviewPboFunctions();
+    int remaining = 0;
+    for (int i = 0; i < gPreviewPendingGlReleaseCount; i++) {
+        uint64_t token = gPreviewPendingGlReleaseSlots[i];
+        bool released = false;
+        if (stella_glFenceSync && stella_glFlush && gBackend.releaseGlPreviewFenced) {
+            StellaGLsync fence = stella_glFenceSync(STELLA_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (fence) {
+                stella_glFlush();
+                released = gBackend.releaseGlPreviewFenced(token, fence) == 1;
+                if (!released && stella_glDeleteSync) stella_glDeleteSync(fence);
+            }
+        }
+        if (!released) {
+            /* Some WGL implementations share textures but not GLsync names.
+               Complete the host's sampling commands before releasing the slot. */
+            if (!stella_glFinish) {
+                gPreviewPendingGlReleaseSlots[remaining++] = token;
+                continue;
+            }
+            stella_glFinish();
+            released = gBackend.releaseGlPreview(token) == 1;
+        }
+        if (!released) gPreviewPendingGlReleaseSlots[remaining++] = token;
+    }
+    for (int i = remaining; i < 3; i++) gPreviewPendingGlReleaseSlots[i] = 0;
+    gPreviewPendingGlReleaseCount = remaining;
+}
+
+static void PlutoRetireCurrentPreviewTexture(void) {
+    if (gPreviewFrameGlSlot) {
+        PlutoQueueSharedPreviewRelease(gPreviewFrameGlSlot);
+        gPreviewFrameGlSlot = 0;
+    } else if (gPreviewFrame.id) {
+        UnloadTexture(gPreviewFrame);
+    }
+    gPreviewFrame = (Texture2D){0};
+}
+#else
+static void PlutoQueueSharedPreviewRelease(uint64_t slotToken) { (void)slotToken; }
+static void PlutoAfterDraw(void) { }
+static void PlutoRetireCurrentPreviewTexture(void) {
+    if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+    gPreviewFrame = (Texture2D){0};
+}
+#endif
+
 static bool PlutoUploadPreviewTexture(Texture2D texture, const uint8_t *pixels, size_t byteCount) {
     if (PlutoUploadPreviewTexturePbo(texture, pixels, byteCount)) return true;
     UpdateTexture(texture, pixels);
@@ -319,6 +432,62 @@ static bool PlutoUploadPreviewTexture(Texture2D texture, const uint8_t *pixels, 
 
 static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
     if (!requestId) return false;
+#ifdef _WIN32
+    /* Preferred path: the backend returns a native GL texture name. No CPU
+       pixels cross the ABI. Wait on WGPU's producer fence only if glIsSync
+       confirms it is visible in this context; otherwise finish on WGPU's side. */
+    if (gBackend.takeGlPreview) {
+        PlutoLoadPreviewPboFunctions();
+        uint32_t glTexture = 0, glWidth = 0, glHeight = 0;
+        uint64_t slotToken = 0;
+        double glAt = 0.0;
+        void *readyFence = NULL;
+        int32_t takenGl = gBackend.takeGlPreview(requestId, &glTexture, &glWidth, &glHeight,
+                                                 &glAt, &slotToken, &readyFence);
+        if (takenGl == 1) {
+            if (!glTexture || !glWidth || !glHeight || !slotToken || !readyFence) {
+                /* A malformed shared-frame descriptor must not release a texture
+                   until the producer context confirms its writes have completed. */
+                if (gBackend.finishGlPreview && slotToken && gBackend.finishGlPreview(slotToken) == 1 &&
+                    gBackend.releaseGlPreview) {
+                    gBackend.releaseGlPreview(slotToken);
+                }
+                return false;
+            }
+            /* Verify the native name exists in Raylib's context before using it.
+               A WGL context creation/share failure must degrade to readback,
+               never sample an unrelated object with a colliding GLuint. */
+            if (!stella_glIsTexture || !stella_glIsTexture(glTexture)) {
+                bool producerFinished = gBackend.finishGlPreview &&
+                    gBackend.finishGlPreview(slotToken) == 1;
+                if (producerFinished && gBackend.releaseGlPreview)
+                    gBackend.releaseGlPreview(slotToken);
+                if (gBackend.disableGlShare) gBackend.disableGlShare();
+                OutputDebugStringA("Stella: WGPU texture is not visible in Raylib's GL namespace; disabling shared preview and using readback\n");
+                return false;
+            }
+            bool syncVisible = stella_glIsSync && stella_glWaitSync &&
+                stella_glIsSync((StellaGLsync)readyFence) != 0;
+            if (syncVisible) {
+                stella_glWaitSync((StellaGLsync)readyFence, 0, UINT64_MAX);
+            } else if (!gBackend.finishGlPreview || gBackend.finishGlPreview(slotToken) != 1) {
+                /* If synchronization cannot be established, intentionally retain
+                   the slot. Releasing it early could race an unfinished GPU write. */
+                return false;
+            }
+            PlutoRetireCurrentPreviewTexture();
+            gPreviewFrame.id = glTexture;
+            gPreviewFrame.width = (int)glWidth;
+            gPreviewFrame.height = (int)glHeight;
+            gPreviewFrame.mipmaps = 1;
+            gPreviewFrame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            gPreviewFrameGlSlot = slotToken;
+            SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
+            if (displayedAt) *displayedAt = glAt;
+            return true;
+        }
+    }
+#endif
     uint32_t width = 0, height = 0;
     size_t required = 0;
     double at = 0.0;
@@ -337,14 +506,14 @@ static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
             return false;
         }
         bool uploaded = true;
-        if (gPreviewFrame.id && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
+        if (gPreviewFrame.id && !gPreviewFrameGlSlot && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
             PlutoUploadPreviewTexture(gPreviewFrame, pixels, required);
         } else {
             Image image = {(void *)pixels, (int)width, (int)height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
             Texture2D next = LoadTextureFromImage(image);
             if (!next.id) uploaded = false;
             else {
-                if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+                PlutoRetireCurrentPreviewTexture();
                 gPreviewFrame = next;
                 SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
             }
@@ -368,13 +537,13 @@ static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
                                       &width, &height, &required, &at);
     }
     if (copied != 1 || !width || !height || required != (size_t)width * height * 4u) return false;
-    if (gPreviewFrame.id && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
+    if (gPreviewFrame.id && !gPreviewFrameGlSlot && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
         PlutoUploadPreviewTexture(gPreviewFrame, gPreviewPixels, required);
     } else {
         Image image = {gPreviewPixels, (int)width, (int)height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
         Texture2D next = LoadTextureFromImage(image);
         if (!next.id) return false;
-        if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+        PlutoRetireCurrentPreviewTexture();
         gPreviewFrame = next;
         SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
     }
@@ -918,6 +1087,8 @@ static void PlutoPollBackend(void) {
             StellaPreviewRequest completedRequest = {0};
             bool matchingRequest = PlutoJsonNumber(event, "requestId", &requestId) &&
                                    PlutoCompletePreviewRequest((uint64_t)requestId, &completedRequest);
+            if (!matchingRequest && strstr(event, "\"sharedGl\":true") && gBackend.discardGlPreview && requestId > 0.0)
+                gBackend.discardGlPreview((uint64_t)requestId);
             if (matchingRequest) {
                 const float requestAt = completedRequest.at;
                 const int requestRes = completedRequest.resolution;
@@ -944,10 +1115,16 @@ static void PlutoPollBackend(void) {
                     if (currentRequest && frameMatchesRequest) {
                         double uploadedAt = renderedAt;
                         double uploadStartedAt = GetTime();
-                        if (!PlutoUploadPreviewFrame((uint64_t)frameIdNumber, &uploadedAt)) {
+                        bool upload = PlutoUploadPreviewFrame((uint64_t)frameIdNumber, &uploadedAt);
+                        if (!upload) {
                             snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not upload preview frame");
+                            /* A failed shared-texture handoff may have disabled WGL
+                               interop. Request another frame so the backend can use
+                               its asynchronous CPU-readback compatibility path. */
+                            gPreviewDirty = true;
                         } else {
                             gPreviewDisplayedAt = (float)uploadedAt;
+                            gPerfSharedGl = strstr(event, "\"sharedGl\":true") != NULL;
                             /* F3 end-to-end latency must follow the frame actually
                                displayed, not whichever worker happened to finish last. */
                             gPreviewRequestAt = requestAt;
@@ -1003,17 +1180,23 @@ static void PlutoPollBackend(void) {
                                     "[Stella preview] end-to-end=%.1fms queue=%.1fms setup=%.1fms decode=%.1fms (xfer=%.1f convert=%.1f) composite=%.1fms publish=%.1fms upload=%.1fms backend=%.1fms path=%s\n",
                                     (now - requestStartedAt) * 1000.0, queueMs, setupMs, decodeMs,
                                     gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfPublishMs,
-                                    (now - uploadStartedAt) * 1000.0, renderMs, gPerfPath >= 1.5 ? "FFMPEG-FALLBACK" : "native");
+                                    (now - uploadStartedAt) * 1000.0, renderMs,
+                                    strstr(event, "\"sharedGl\":true") ? "WGPU-GL-ZERO-COPY" :
+                                    (gPerfPath >= 1.5 ? "FFMPEG-FALLBACK" : "WGPU-readback"));
                                 OutputDebugStringA(timing);
                                 gPreviewTelemetryAt = now;
                             }
                         }
-                        /* Keep showing completed frames during playback/scrubbing even if
-                           the playhead advanced slightly while FFmpeg rendered this one.
-                           Reject older frames so the picture cannot visibly run backward. */
-                        gPreviewDirty = previewMoving &&
-                            fabsf(requestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
+                        if (upload) {
+                            /* Keep showing completed frames during playback/scrubbing even if
+                               the playhead advanced slightly while FFmpeg rendered this one.
+                               Reject older frames so the picture cannot visibly run backward. */
+                            gPreviewDirty = previewMoving &&
+                                fabsf(requestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
+                        }
                     } else {
+                        if (strstr(event, "\"sharedGl\":true") && gBackend.discardGlPreview && frameIdNumber > 0.0)
+                            gBackend.discardGlPreview((uint64_t)frameIdNumber);
                         gPerfDiscardedFrames++;
                         gPreviewDirty = true;
                     }
@@ -1068,7 +1251,16 @@ static void PlutoUnloadMedia(void) {
         if (gImported[i].waveform.id) UnloadTexture(gImported[i].waveform);
         if (gImported[i].thumbnail.id) UnloadTexture(gImported[i].thumbnail);
     }
+#ifdef _WIN32
+    if (gPreviewFrameGlSlot) {
+        PlutoQueueSharedPreviewRelease(gPreviewFrameGlSlot);
+        gPreviewFrameGlSlot = 0;
+        PlutoAfterDraw();
+        gPreviewFrame = (Texture2D){0};
+    } else if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+#else
     if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+#endif
     free(gPreviewPixels);
     gPreviewPixels = NULL;
     gPreviewPixelCapacity = 0;

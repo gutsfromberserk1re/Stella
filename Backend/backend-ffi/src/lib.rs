@@ -9,7 +9,7 @@ mod decoder;
 mod filters;
 mod renderer;
 use decoder::{DecodedFrame, DecoderPool};
-use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms};
+use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms, SharedGlPreviewFrame};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     cell::Cell,
@@ -67,6 +67,7 @@ fn note_wgpu_preview_failure(reason: u64, detail: impl Into<String>) -> Result<O
 }
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static PREVIEW_FRAMES: OnceLock<Mutex<HashMap<u64, PreviewFrame>>> = OnceLock::new();
+static PREVIEW_SHARED_GL_FRAMES: OnceLock<Mutex<HashMap<u64, SharedGlPreviewEntry>>> = OnceLock::new();
 static PREVIEW_FRAME_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 static TIMELINE_REVISION: AtomicU64 = AtomicU64::new(1);
 /// Latest timeline as an immutable `Arc`. Preview requests used to clone the
@@ -85,6 +86,12 @@ struct PreviewFrame {
     height: u32,
     at: f64,
     pixels: Vec<u8>,
+}
+
+struct SharedGlPreviewEntry {
+    request_id: u64,
+    at: f64,
+    frame: SharedGlPreviewFrame,
 }
 
 struct PreviewStream {
@@ -374,6 +381,7 @@ struct PreviewEngine {
 
 enum PreviewRenderResult {
     Published { width: u32, height: u32, at: f64, decode_ms: f64, ring_depth: usize },
+    SharedGl { width: u32, height: u32, at: f64, decode_ms: f64, ring_depth: usize, frame: SharedGlPreviewFrame },
     Pending {
         width: u32,
         height: u32,
@@ -441,6 +449,26 @@ fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pix
         if let Some(oldest) = frames.keys().copied().min() {
             if let Some(old) = frames.remove(&oldest) { recycle_preview_buffer(old.pixels); }
         } else { break; }
+    }
+    Ok(())
+}
+
+fn publish_shared_gl_preview(request_id: u64, at: f64, frame: SharedGlPreviewFrame) -> Result<(), String> {
+    let frames = PREVIEW_SHARED_GL_FRAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut frames = match frames.lock() {
+        Ok(frames) => frames,
+        Err(_) => {
+            let _ = GpuPreviewRenderer::discard_shared_gl_frame(frame);
+            return Err("shared preview frame lock failed".to_owned());
+        }
+    };
+    frames.insert(request_id, SharedGlPreviewEntry { request_id, at, frame });
+    while frames.len() > MAX_STORED_PREVIEW_FRAMES {
+        let oldest = frames.values().map(|entry| entry.request_id).min();
+        let Some(oldest) = oldest else { break };
+        if let Some(discarded) = frames.remove(&oldest) {
+            let _ = GpuPreviewRenderer::discard_shared_gl_frame(discarded.frame);
+        }
     }
     Ok(())
 }
@@ -581,6 +609,38 @@ fn preview_worker(
         let fallback_reason = PREVIEW_FALLBACK_REASON.load(Ordering::Relaxed);
 
         match rendered {
+            Ok(PreviewRenderResult::SharedGl { width, height, at, decode_ms, ring_depth, frame }) => {
+                let slot_token = frame.slot_token;
+                let published = publish_shared_gl_preview(id, at, frame);
+                preview_inflight.fetch_sub(1, Ordering::AcqRel);
+                let response = match published {
+                    Ok(()) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
+                        "sharedGl":true,"width":width,"height":height,"at":at,"queueMs":queue_ms,
+                        "streamSetupMs":0.0,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
+                        "hwDecode":hardware as u8,"path":path,"fallbackReason":fallback_reason,
+                        "compositeMs":composite_ms,"publishMs":PREVIEW_PUBLISH_US.with(Cell::get) as f64/1000.0,
+                        "readbackMs":0.0,"uploadMs":0.0,"transferMs":transfer_ms,"convertMs":convert_ms,
+                        "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),
+                        "proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),
+                        "originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
+                        "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
+                    Err(error) => {
+                        let _ = GpuPreviewRenderer::release_shared_gl_frame(slot_token);
+                        json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
+                            "queueMs":queue_ms,"totalMs":total_started.elapsed().as_secs_f64()*1000.0})
+                    }
+                };
+                if events.send(response.to_string()).is_err() {
+                    if let Some(frames) = PREVIEW_SHARED_GL_FRAMES.get() {
+                        if let Ok(mut frames) = frames.lock() {
+                            if let Some(entry) = frames.remove(&id) {
+                                let _ = GpuPreviewRenderer::discard_shared_gl_frame(entry.frame);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
             Ok(PreviewRenderResult::Pending { width, height, at, decode_ms, ring_depth, readback }) => {
                 let pending = PendingPreview {
                     id, width, height, at, readback, readback_started: Instant::now(),
@@ -2058,17 +2118,37 @@ impl PreviewEngine {
         }).collect();
 
         let composite_started = Instant::now();
+        self.stream = None;
+        PREVIEW_PATH.store(1, Ordering::Relaxed);
+        PREVIEW_FALLBACK_REASON.store(0, Ordering::Relaxed);
+
+        // On Windows, the preferred path renders into one of three WGPU-owned
+        // GL textures shared with Raylib. A ready fence crosses the context
+        // boundary; there is no mapped staging buffer or CPU pixel transfer.
+        if GpuPreviewRenderer::shared_gl_available() {
+            match GpuPreviewRenderer::composite_shared_gl(&layers, width, height) {
+                Ok(frame) => {
+                    PREVIEW_COMPOSITE_US.with(|value| value.set(composite_started.elapsed().as_micros() as u64));
+                    return Ok(Some(PreviewRenderResult::SharedGl {
+                        width, height, at: frame_at, decode_ms: *decode_ms,
+                        ring_depth: *ring_depth, frame,
+                    }));
+                }
+                Err(error) => {
+                    // If every shared slot is still being sampled, fall back for
+                    // this frame to the async readback path. Do not stop playback
+                    // or overwrite a texture that the UI may still be drawing.
+                    eprintln!("Stella shared GL preview fallback for this frame: {error}");
+                }
+            }
+        }
+
         let readback = match GpuPreviewRenderer::composite_rgba_async(&layers, width, height) {
             Ok(receiver) => receiver,
             Err(error) => return note_wgpu_preview_failure(6, format!("GPU compositing submission failed: {error}")),
         };
         PREVIEW_COMPOSITE_US.with(|value| value.set(composite_started.elapsed().as_micros() as u64));
-        // The command buffer owns the queued texture uploads now. Hand its
-        // readback receiver to the completion service and immediately return to
-        // the preview worker, which can start decoding the next request.
-        self.stream = None;
-        PREVIEW_PATH.store(1, Ordering::Relaxed);
-        PREVIEW_FALLBACK_REASON.store(0, Ordering::Relaxed);
+        // If interop is not available, preserve the existing mapped readback path.
         Ok(Some(PreviewRenderResult::Pending {
             width, height, at: frame_at, decode_ms: *decode_ms, ring_depth: *ring_depth, readback,
         }))
@@ -2680,6 +2760,110 @@ pub unsafe extern "C" fn pluto_backend_take_preview_frame(
         let boxed = Box::new(buffer);
         *owner = Box::into_raw(boxed) as *mut std::ffi::c_void;
         1
+    })).unwrap_or(0)
+}
+
+/// Register Raylib's current WGL context before the first preview request.
+/// The patched WGPU HAL uses it as the native WGL share context when creating
+/// its hidden context, before WGPU allocates any GL resources.
+#[no_mangle]
+pub extern "C" fn pluto_backend_set_gl_share_context(
+    context: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        renderer::set_host_gl_context(context as usize, device_context as usize) as i32
+    })).unwrap_or(0)
+}
+
+/// Disable WGPU/OpenGL direct presentation when the host cannot see a returned
+/// texture in its WGL share group. Subsequent preview requests use CPU readback.
+#[no_mangle]
+pub extern "C" fn pluto_backend_disable_gl_share() -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        GpuPreviewRenderer::disable_shared_gl();
+        1
+    })).unwrap_or(0)
+}
+
+/// Takes a shared OpenGL preview frame. No CPU pixels are returned: `texture_id`
+/// is a WGPU-owned texture name in the host context's WGL share group. The host
+/// probes `ready_fence` visibility before selecting a GPU wait or producer-finish fallback.
+#[no_mangle]
+pub unsafe extern "C" fn pluto_backend_take_gl_preview_frame(
+    request_id: u64,
+    texture_id: *mut u32,
+    width: *mut u32,
+    height: *mut u32,
+    at: *mut f64,
+    slot_token: *mut u64,
+    ready_fence: *mut *mut std::ffi::c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if texture_id.is_null() || width.is_null() || height.is_null() || at.is_null() ||
+            slot_token.is_null() || ready_fence.is_null() { return 0; }
+        let Some(frames) = PREVIEW_SHARED_GL_FRAMES.get() else { return 0; };
+        let Ok(mut frames) = frames.lock() else { return 0; };
+        let Some(entry) = frames.remove(&request_id) else { return 0; };
+        if entry.request_id != request_id || entry.frame.texture_id == 0 || entry.frame.slot_token == 0 {
+            let _ = GpuPreviewRenderer::discard_shared_gl_frame(entry.frame);
+            return 0;
+        }
+        *texture_id = entry.frame.texture_id;
+        *width = entry.frame.width;
+        *height = entry.frame.height;
+        *at = entry.at;
+        *slot_token = entry.frame.slot_token;
+        *ready_fence = entry.frame.ready_fence as *mut std::ffi::c_void;
+        1
+    })).unwrap_or(0)
+}
+
+/// Discard a shared GL frame which the UI decided was stale and never sampled.
+#[no_mangle]
+pub extern "C" fn pluto_backend_discard_gl_preview_frame(request_id: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(frames) = PREVIEW_SHARED_GL_FRAMES.get() else { return 0; };
+        let Ok(mut frames) = frames.lock() else { return 0; };
+        let Some(entry) = frames.remove(&request_id) else { return 0; };
+        GpuPreviewRenderer::discard_shared_gl_frame(entry.frame).unwrap_or(false) as i32
+    })).unwrap_or(0)
+}
+
+/// Completes the WGPU producer context for drivers where its ready fence is
+/// not visible through the Raylib WGL share group.
+#[no_mangle]
+pub extern "C" fn pluto_backend_finish_gl_preview_frame(slot_token: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(windows)]
+        { GpuPreviewRenderer::finish_shared_gl_frame(slot_token).unwrap_or(false) as i32 }
+        #[cfg(not(windows))]
+        { let _ = slot_token; 0 }
+    })).unwrap_or(0)
+}
+
+/// Try to release a displayed texture with a host GLsync. The backend checks
+/// that WGPU can see the object before queuing a server-side wait. Returns 0
+/// when the caller must use the glFinish fallback instead.
+#[no_mangle]
+pub extern "C" fn pluto_backend_release_gl_preview_frame_fenced(
+    slot_token: u64,
+    ui_fence: *mut std::ffi::c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(windows)]
+        { GpuPreviewRenderer::try_release_shared_gl_frame_with_fence(slot_token, ui_fence as usize).unwrap_or(false) as i32 }
+        #[cfg(not(windows))]
+        { let _ = (slot_token, ui_fence); 0 }
+    })).unwrap_or(0)
+}
+
+/// Release a displayed texture slot after Raylib calls glFinish following its
+/// final draw. This is the driver-independent reverse-handoff fallback.
+#[no_mangle]
+pub extern "C" fn pluto_backend_release_gl_preview_frame(slot_token: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        GpuPreviewRenderer::release_shared_gl_frame(slot_token).unwrap_or(false) as i32
     })).unwrap_or(0)
 }
 

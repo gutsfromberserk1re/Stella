@@ -728,7 +728,13 @@ int main(void) {
     gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));
     LoadUiIcons();
     LoadKnobTexture();
-    if (PlutoBackendLoad()) PlutoTimelineCall("{\"command\":\"timeline_get\"}");
+    if (PlutoBackendLoad()) {
+#ifdef _WIN32
+        if (!PlutoBackendShareHostGLContext())
+            OutputDebugStringA("Stella: WGPU/OpenGL sharing unavailable; preview will use async readback\n");
+#endif
+        PlutoTimelineCall("{\"command\":\"timeline_get\"}");
+    }
     SetWindowMinSize(1180, 720);
 #ifdef _WIN32
     HWND hwnd = (HWND)GetWindowHandle();
@@ -1013,6 +1019,7 @@ int main(void) {
         DrawTimelineContextMenu();
         DrawPerfOverlay();
         EndDrawing();
+        PlutoAfterDraw();
         SetMouseCursor(gResize == 1 ? MOUSE_CURSOR_RESIZE_EW : gResize == 2 ? MOUSE_CURSOR_RESIZE_NS :
                        gCross ? MOUSE_CURSOR_CROSSHAIR : gScrubCursor ? MOUSE_CURSOR_RESIZE_EW :
                        gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);

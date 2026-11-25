@@ -128,6 +128,7 @@ static double gPerfIntervalMedMs, gPerfIntervalP95Ms;
 static int    gPerfShownInWindow;
 static double gPerfRingDepth;
 static double gPerfPath, gPerfFallbackReason; /* path: 1 native GPU, 2 FFmpeg fallback */
+static bool gPerfSharedGl; /* last successfully displayed preview used a WGL-shared texture */
 static double gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfReadbackMs, gPerfPublishMs;
 static double gPerfHwDecode; /* 1 when the last shown frame came from a hardware decoder */
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;

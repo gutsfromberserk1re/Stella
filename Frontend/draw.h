@@ -1247,9 +1247,11 @@ static void DrawPerfOverlay(void) {
     snprintf(line[5], sizeof(line[5]), "gpu submit %.1f   async readback %.1f   publish %.1f", gPerfCompositeMs, gPerfReadbackMs, gPerfPublishMs);
     snprintf(line[6], sizeof(line[6]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
     if (gPerfPath >= 1.5)
-        snprintf(line[7], sizeof(line[7]), "decode: %s   PATH: FFMPEG FALLBACK (%s)   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW", (reason >= 0 && reason <= 6) ? reasons[reason] : "?");
+        snprintf(line[7], sizeof(line[7]), "decode: %s   path: FFMPEG fallback (%s)   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW", (reason >= 0 && reason <= 6) ? reasons[reason] : "?");
+    else if (gPerfSharedGl)
+        snprintf(line[7], sizeof(line[7]), "decode: %s   output: WGPU-GL ZERO-COPY   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW");
     else
-        snprintf(line[7], sizeof(line[7]), "decode: %s   path: native GPU   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW");
+        snprintf(line[7], sizeof(line[7]), "decode: %s   output: WGPU CPU readback   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW");
     const int rows = 8; const float w = 440.f, h = 16.f * rows + 14.f;
     Rectangle box = {(float)GetScreenWidth() - w - 12.f, 44.f, w, h};
     DrawRectangleRec(box, (Color){0, 0, 0, 190});

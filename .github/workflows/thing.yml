@@ -24,6 +24,10 @@ jobs:
             Backend -> target
           cache-on-failure: true
 
+      - name: Prepare WGPU WGL texture sharing
+        shell: pwsh
+        run: ./Backend/scripts/prepare-wgpu-gl-share.ps1
+
       # Cache the extracted static decoder SDK so the large archive is fetched only on a miss.
       - name: Cache static FFmpeg decoder SDK
         id: ffmpeg-static-cache
