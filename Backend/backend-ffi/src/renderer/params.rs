@@ -438,14 +438,21 @@ impl LayerUniforms {
         u.fx8 = [burn_flicker as f32, leak_amount as f32, leak_warmth as f32, leak_position as f32];
 
         // ------------------------------------------------------------- sine waves
-        let (mut wave_amount, mut wave_frequency, mut wave_speed) = (0.0_f64, 3.5_f64, 1.2_f64);
-        if on(effects, "sineWaves") {
+        // Keep the disabled state fully neutral. Frequency/speed defaults only
+        // belong to an enabled effect; otherwise they make identity uniforms
+        // differ from the no-properties baseline and needlessly exercise shader
+        // math on every layer.
+        u.fx9 = if on(effects, "sineWaves") {
             let waves = &effects["sineWaves"];
-            wave_amount = n(waves, "amount", 12.0).clamp(0.0, 100.0);
-            wave_frequency = n(waves, "frequency", 3.5).clamp(1.0, 24.0);
-            wave_speed = n(waves, "speed", 1.2).clamp(0.0, 10.0);
-        }
-        u.fx9 = [wave_amount as f32, wave_frequency as f32, wave_speed as f32, 0.0];
+            [
+                n(waves, "amount", 12.0).clamp(0.0, 100.0) as f32,
+                n(waves, "frequency", 3.5).clamp(1.0, 24.0) as f32,
+                n(waves, "speed", 1.2).clamp(0.0, 10.0) as f32,
+                0.0,
+            ]
+        } else {
+            [0.0; 4]
+        };
         u
     }
 }
@@ -680,6 +687,13 @@ mod tests {
         let props = json!({"effects": {"sineWaves": {"enabled": true, "amount": 24.0, "frequency": 6.0, "speed": 2.5}}});
         let uniforms = LayerUniforms::from_props(&props, 1.0);
         assert_eq!(uniforms.fx9, [24.0, 6.0, 2.5, 0.0]);
+    }
+
+    #[test]
+    fn disabled_sine_waves_keep_neutral_uniforms() {
+        let props = json!({"effects": {"sineWaves": {"enabled": false, "amount": 24.0, "frequency": 6.0, "speed": 2.5}}});
+        let uniforms = LayerUniforms::from_props(&props, 1.0);
+        assert_eq!(uniforms.fx9, [0.0; 4]);
     }
 
     #[test]

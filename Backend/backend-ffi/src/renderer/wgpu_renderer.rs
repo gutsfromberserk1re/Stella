@@ -283,7 +283,7 @@ fn init_state() -> Result<RendererState, String> {
         // normal backend set (D3D12/Vulkan on Windows) for the CPU-readback
         // fallback. The successful WGL path remains on the GL adapter.
         #[cfg(windows)]
-        let (instance, adapter, shared_gl_context) =
+        let (_instance, adapter, shared_gl_context) =
             if wants_shared_gl && initial_info.backend == wgpu::Backend::Gl && shared_gl_context.is_none() {
                 eprintln!("Stella WGL texture sharing failed; retrying WGPU with the normal backend set");
                 drop(adapter);
@@ -304,7 +304,7 @@ fn init_state() -> Result<RendererState, String> {
                 (instance, adapter, shared_gl_context)
             };
         #[cfg(not(windows))]
-        let (instance, adapter, shared_gl_context) = (instance, adapter, shared_gl_context);
+        let (_instance, adapter, shared_gl_context) = (instance, adapter, shared_gl_context);
 
         let info = adapter.get_info();
         eprintln!("wgpu adapter: {} | backend: {:?} | type: {:?} | driver: {}",
@@ -436,8 +436,9 @@ fn init_state() -> Result<RendererState, String> {
 }
 
 pub struct GpuLayerFrame<'a> {
-    /// Layer identity. No longer needed for GPU resources (uniforms are slotted
-    /// by draw order), kept so existing callers keep compiling.
+    /// Layer identity retained for caller-side diagnostics and stable tracing;
+    /// the compositor currently keys reusable textures by `source_key`.
+    #[allow(dead_code)]
     pub key: &'a str,
     /// Identity of the decoded source frame, shared by duplicate clip layers.
     pub source_key: &'a str,

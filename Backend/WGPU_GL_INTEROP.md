@@ -29,7 +29,12 @@ The script creates `Backend/.interop/wgpu-0.19.4` and root `.cargo/config.toml`;
 ### Vendored WGPU warning hygiene
 
 The preparation script registers WGPU 0.19.4's legacy custom cfg names with
-`check-cfg` and limits style-lint allowances (`unused_qualifications` and
-`mismatched_lifetime_syntaxes`) to the two locally patched upstream crates.
-This keeps build output useful without changing WGPU behavior or removing any
-platform/backend code. Warnings in Stella's own crates remain enabled.
+`cargo:rustc-check-cfg` from the two upstream build scripts. It applies
+`unused_qualifications` and `mismatched_lifetime_syntaxes` allowances only after
+the upstream crate-root `warn` attributes in `wgpu-core` and `wgpu-hal`, where
+Cargo manifest lint settings alone did not override those explicit warnings.
+It also replaces four deprecated primitive `MAX`/`MIN` paths with identical
+associated constants. These are warning-only compatibility edits: no WGPU
+behavior, validation, synchronization, or platform/backend code is removed.
+Warnings in Stella's own active code remain visible; retained legacy FFmpeg
+preview helpers carry local `dead_code` annotations instead of being deleted.

@@ -94,3 +94,12 @@ The next bottleneck pass addresses the blocking presentation work left by the fi
 - Source-level changes and archive integrity are checked for this patch.
 - Cargo/Rust and the Windows Raylib/Clay build toolchain are not installed in this container, so Rust tests and the Windows application build cannot be run here. The Windows GitHub Actions build and F3 playback comparison remain necessary before treating any throughput improvement as measured.
 - Benchmark at the same resolution, project, playhead, and hardware-decode override. Compare `decodeWaitMs`, `compositeMs`, the new `readbackMs`, upload timing, frame-interval median/p95, and displayed FPS. Do not treat source-level changes as a measured FPS claim.
+
+
+## Follow-up: sine-wave neutral uniforms and CI warning cleanup
+
+- Fixed `LayerUniforms::from_props` so disabled/missing sine waves produce a fully neutral `fx9` vector. Frequency and speed defaults are now applied only while the effect is enabled; this fixes the reported `missing_props_are_neutral` regression without changing enabled sine-wave defaults.
+- Added a regression test for a sine-wave effect explicitly disabled while it still has saved nonzero parameters. The existing enabled-effect uniform test remains intact.
+- The WGPU preparation script now registers `native`, `send_sync`, `webgl`, `Emscripten`, `dx12`, `gles`, `metal`, and `vulkan` through each vendored crate's build-script `cargo:rustc-check-cfg` output. It places style-only lint allowances after WGPU 0.19.4's own crate-level warning attributes and replaces the deprecated primitive `MAX`/`MIN` paths with equivalent associated constants. No backend or synchronization implementation is removed.
+- Cleaned Stella-owned diagnostics: the retained WGL `Instance` binding is underscore-prefixed to preserve its lifetime without an unused-variable warning; legacy FFmpeg-only preview code is locally annotated as intentionally retained; the compositor's diagnostic layer key is annotated as retained for callers. No active preview/export path was removed.
+- The previous Windows run reported 47/48 tests passing, with only `renderer::params::tests::missing_props_are_neutral` failing. The changes above directly address that assertion. This environment does not contain Cargo/rustc or PowerShell, so the updated tests and Windows build still need to be run in CI; no compile success is claimed here.

@@ -67,6 +67,63 @@ mismatched_lifetime_syntaxes = "allow"
 Set-UpstreamLintHygiene (Join-Path $halRoot 'Cargo.toml') 'wgpu-hal'
 Set-UpstreamLintHygiene (Join-Path $coreRoot 'Cargo.toml') 'wgpu-core'
 
+# WGPU v0.19.4 explicitly enables `unused_qualifications` in its crate roots.
+# Apply narrowly scoped crate-level allows after those warn attributes so these
+# style-only lints do not flood a downstream application build. No implementation
+# code, backend selection, synchronization, or validation is changed.
+function Set-UpstreamSourceLintHygiene([string]$libPath, [string]$crateName) {
+    $sourceText = Get-Content -Raw $libPath
+    $allowAttribute = '#![allow(unused_qualifications, mismatched_lifetime_syntaxes)]'
+    if ($sourceText -notmatch [regex]::Escape($allowAttribute)) {
+        $warnBlock = [regex]::Match($sourceText, '(?s)#!\[warn\(.*?\)\]')
+        if (-not $warnBlock.Success) {
+            throw "$crateName source no longer has the expected crate-level warn block; update the WGPU lint patch deliberately."
+        }
+        $insertAt = $warnBlock.Index + $warnBlock.Length
+        $sourceText = $sourceText.Insert($insertAt, "`r`n$allowAttribute")
+        Set-Content -Path $libPath -Value $sourceText -NoNewline
+    }
+}
+
+Set-UpstreamSourceLintHygiene (Join-Path $coreRoot 'src/lib.rs') 'wgpu-core'
+Set-UpstreamSourceLintHygiene (Join-Path $halRoot 'src/lib.rs') 'wgpu-hal'
+
+# Register WGPU's legacy cfg aliases with modern rustc through each crate's
+# build-script output. The cfg_aliases! invocations remain unchanged and still
+# compute the actual target/backend predicates.
+function Register-UpstreamCfgChecks([string]$buildScriptPath, [string]$crateName) {
+    $buildText = Get-Content -Raw $buildScriptPath
+    $cfgNames = @('native', 'send_sync', 'webgl', 'Emscripten', 'dx12', 'gles', 'metal', 'vulkan')
+    $missingLines = @()
+    foreach ($cfgName in $cfgNames) {
+        $registration = "cargo:rustc-check-cfg=cfg($cfgName)"
+        if ($buildText -notmatch [regex]::Escape($registration)) {
+            $missingLines += ('    println!("' + $registration + '");')
+        }
+    }
+    if ($missingLines.Count -gt 0) {
+        if ($buildText -notmatch '(?m)^fn main\(\)\s*\{') {
+            throw "$crateName build.rs no longer has the expected main function."
+        }
+        $block = $missingLines -join "`r`n"
+        $buildText = $buildText.Replace('fn main() {', "fn main() {`r`n$block")
+        Set-Content -Path $buildScriptPath -Value $buildText -NoNewline
+    }
+}
+
+Register-UpstreamCfgChecks (Join-Path $coreRoot 'build.rs') 'wgpu-core'
+Register-UpstreamCfgChecks (Join-Path $halRoot 'build.rs') 'wgpu-hal'
+
+# Replace deprecated primitive MAX/MIN paths in the pinned core source with
+# identical associated constants. This is a mechanical warning-only cleanup.
+$textureInitPath = Join-Path $coreRoot 'src/init_tracker/texture.rs'
+$textureInitText = Get-Content -Raw $textureInitPath
+$textureInitText = $textureInitText.Replace('std::usize::MAX', 'usize::MAX')
+$textureInitText = $textureInitText.Replace('std::usize::MIN', 'usize::MIN')
+$textureInitText = $textureInitText.Replace('std::u32::MAX', 'u32::MAX')
+$textureInitText = $textureInitText.Replace('std::u32::MIN', 'u32::MIN')
+Set-Content -Path $textureInitPath -Value $textureInitText -NoNewline
+
 # These three packages are one tightly-coupled WGPU ABI family. The patched
 # wgpu-hal depends on the sibling wgpu-types by path; wgpu-core must also come
 # from this checkout so it uses those same sibling types and HAL. Finally,

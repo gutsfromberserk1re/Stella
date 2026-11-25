@@ -94,6 +94,9 @@ struct SharedGlPreviewEntry {
     frame: SharedGlPreviewFrame,
 }
 
+// Legacy FFmpeg preview stream retained for compatibility/debug comparison.
+// The active preview path is the per-clip decoder + WGPU compositor.
+#[allow(dead_code)]
 struct PreviewStream {
     signature: u64,
     width: u32,
@@ -111,6 +114,8 @@ struct PreviewStream {
    bounded queue so the preview request path normally finds its frame already
    waiting instead of blocking on the decoder. When the ring is full the reader
    stops reading, the pipe fills, and FFmpeg itself backs off. */
+// Backing storage for the retained legacy FFmpeg preview reader.
+#[allow(dead_code)]
 struct RingState {
     frames: VecDeque<(u64, Vec<u8>)>,
     free: Vec<Vec<u8>>,
@@ -118,12 +123,14 @@ struct RingState {
     ended: bool,
 }
 
+#[allow(dead_code)]
 struct FrameRing {
     state: Mutex<RingState>,
     changed: Condvar,
     capacity: usize,
 }
 
+#[allow(dead_code)] // Kept with the legacy stream implementation; not used by WGPU preview.
 fn preview_reader(mut stdout: ChildStdout, ring: Arc<FrameRing>, frame_bytes: usize) {
     let mut index = 0u64;
     loop {
@@ -1068,7 +1075,13 @@ fn append_filter_graph_arg(command: &mut std::process::Command, binary: &std::pa
 }
 
 #[derive(Clone)]
-struct RenderInput { path: String, image: bool, seek: f64 }
+struct RenderInput {
+    path: String,
+    #[allow(dead_code)] // Used by the retained FFmpeg filter-graph preview path.
+    image: bool,
+    #[allow(dead_code)] // Used by the retained FFmpeg filter-graph preview path.
+    seek: f64,
+}
 
 fn render_inputs(timeline: &Timeline, deduplicate: bool) -> Result<(Vec<RenderInput>, HashMap<String, usize>), String> {
     let mut clips: Vec<_> = timeline.clips.iter().filter(|clip| clip.extra.get("path").and_then(Value::as_str).is_some()).collect();
@@ -1163,6 +1176,7 @@ fn transition_preroll_source_time(source_offset: f64, duration: f64, elapsed: f6
     source_start + (elapsed.max(0.0) - missing_preroll).max(0.0)
 }
 
+#[allow(dead_code)] // Legacy FFmpeg visual graph helper; WGPU is the active visual renderer.
 fn timeline_transition_start_at(timeline: &Timeline, at: f64) -> Option<f64> {
     let mut clips: Vec<_> = timeline.clips.iter()
         .filter(|clip| clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio"))
@@ -1207,10 +1221,12 @@ fn split_source_streams(
     labels_by_clip
 }
 
+#[allow(dead_code)] // Retained for legacy FFmpeg preview compatibility and diagnostics.
 fn export_filter_graph(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<(String, Vec<RenderInput>, f64, bool), String> {
     export_filter_graph_mode(timeline, width, height, fps, true)
 }
 
+#[allow(dead_code)] // Retained for legacy FFmpeg preview compatibility and diagnostics.
 fn export_filter_graph_mode(timeline: &Timeline, width: u32, height: u32, fps: u32, deduplicate: bool) -> Result<(String, Vec<RenderInput>, f64, bool), String> {
     let duration = project_duration(timeline);
     if duration <= 0.0 { return Err("Add at least one clip before exporting".into()); }
@@ -1775,6 +1791,7 @@ fn export_project(request: &Value, id: u64) -> Result<Value, String> {
     )
 }
 
+#[allow(dead_code)] // Legacy FFmpeg stream identity helper; WGPU requests use request ids.
 fn preview_signature(timeline: &Timeline, width: u32, height: u32, fps: u32) -> Result<u64, String> {
     let mut hasher = DefaultHasher::new();
     "stella-preview-stream-v2".hash(&mut hasher);
@@ -1783,6 +1800,7 @@ fn preview_signature(timeline: &Timeline, width: u32, height: u32, fps: u32) -> 
     Ok(hasher.finish())
 }
 
+#[allow(dead_code)] // Kept as a compatibility path; visual preview currently uses WGPU only.
 fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, id: u64, signature: u64, origin_index: u64) -> Result<PreviewStream, String> {
     let (graph, inputs, duration, _) = export_filter_graph_mode(timeline, width, height, fps, false)?;
     let script = filter_script(id, &graph)?;
