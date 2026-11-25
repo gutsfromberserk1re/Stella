@@ -26,15 +26,48 @@ static float SlDefault(int gi) {
     return .5f;
 }
 
-/* Only effects with a reliable preview/export implementation are exposed. */
+/* Effects with editable preview/export parameters. Expansion and enabled
+   state are intentionally independent: clicking a row opens its controls,
+   while the trailing plus/minus button enables or disables the effect. */
 #define VIDEO_FX_COUNT 2
-static float gFxV[VIDEO_FX_COUNT][2];
-static float gFxSent[VIDEO_FX_COUNT][2];
+static float gFxV[VIDEO_FX_COUNT][3] = {{.3f, .5f, .5f}, {.3f, .5f, .5f}};
+static float gFxSent[VIDEO_FX_COUNT][3] = {{.3f, .5f, .5f}, {.3f, .5f, .5f}};
+static const char *gFxProp[VIDEO_FX_COUNT][3] = {
+    {"props.effects.chromatic.amount", "props.effects.chromatic.angle", "props.effects.chromatic.offset"},
+    {"props.effects.pixelate.size", "props.effects.pixelate.blend", NULL}
+};
+static const int gFxParamCount[VIDEO_FX_COUNT] = {3, 2};
+static const char *gFxToggle[VIDEO_FX_COUNT] = {
+    "props.effects.chromatic.enabled", "props.effects.pixelate.enabled"
+};
 static bool gFxOn[VIDEO_FX_COUNT];
-static const char *gExtraFxNames[] = {"Gaussian Blur", "Vignette", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror"};
-static const char *gExtraFxKeys[] = {"blur", "vignette", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror"};
-#define EXTRA_FX_COUNT 10
+static bool gFxSlDrag[VIDEO_FX_COUNT][3];
+static int gFxOpen = -1;
+static bool gVfxOpen = false, gFiltOpen = false;
+static const char *gExtraFxNames[] = {"Gaussian Blur", "Vignette", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror", "Sine Waves"};
+static const char *gExtraFxKeys[] = {"blur", "vignette", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror", "sineWaves"};
+#define EXTRA_FX_COUNT 11
+typedef struct { const char *label, *field, *suffix; float min, max, initial; } ExtraFxParamDef;
+static const ExtraFxParamDef gExtraFxParams[EXTRA_FX_COUNT][4] = {
+    {{"Amount", "amount", "%", 0.f, 100.f, 22.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 50.f}, {"Midpoint", "midpoint", "%", 0.f, 100.f, 50.f}, {"Roundness", "roundness", "%", 0.f, 100.f, 0.f}, {"Feather", "feather", "%", 0.f, 100.f, 65.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 45.f}, {"Radius", "radius", "px", 1.f, 23.f, 5.f}, {"Threshold", "threshold", "%", 0.f, 100.f, 10.f}},
+    {{"Spacing", "spacing", "px", 1.f, 20.f, 4.f}, {"Amount", "amount", "%", 0.f, 100.f, 32.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 18.f}, {"Frequency", "frequency", "Hz", .5f, 30.f, 8.f}, {"Smoothness", "smoothness", "%", 0.f, 100.f, 35.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 42.f}, {"Warmth", "warmth", "%", 0.f, 100.f, 70.f}, {"Edge", "edge", "%", 0.f, 100.f, 38.f}, {"Flicker", "flicker", "%", 0.f, 100.f, 12.f}},
+    {{"Size", "size", "px", 1.f, 24.f, 5.f}, {"Angle", "angle", "°", -180.f, 180.f, 45.f}, {"Contrast", "contrast", "%", 0.f, 100.f, 48.f}},
+    {{"Levels", "levels", "", 2.f, 16.f, 6.f}, {"Blend", "blend", "%", 0.f, 100.f, 100.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 40.f}, {"Warmth", "warmth", "%", 0.f, 100.f, 70.f}, {"Position", "position", "%", 0.f, 100.f, 35.f}},
+    {{0}},
+    {{"Amount", "amount", "px", 0.f, 100.f, 12.f}, {"Frequency", "frequency", "", 1.f, 24.f, 3.5f}, {"Speed", "speed", "Hz", 0.f, 10.f, 1.2f}}
+};
+static const int gExtraFxParamCount[EXTRA_FX_COUNT] = {1, 4, 3, 2, 3, 4, 3, 2, 3, 0, 3};
+static float gExtraFxV[EXTRA_FX_COUNT][4];
+static float gExtraFxSent[EXTRA_FX_COUNT][4];
+static bool gExtraFxSlDrag[EXTRA_FX_COUNT][4];
 static bool gExtraFxOn[EXTRA_FX_COUNT];
+static int gExtraFxOpen = -1;
+static float gExtraFxBodyHeight[EXTRA_FX_COUNT] = {100.f, 250.f, 205.f, 155.f, 205.f, 250.f, 205.f, 155.f, 205.f, 88.f, 205.f};
 static int gFilter;
 
 static int PlutoTextColorChannel(float value) {
@@ -193,7 +226,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     }
 
     for (int i = 0; i < 2; i++) {
-        float defaults[2][2] = {{.3f, .5f}, {.3f, .5f}};
+        float defaults[2][3] = {{.3f, .5f, .5f}, {.3f, .5f, .5f}};
         bool enabled = false;
         char path[128];
         snprintf(path, sizeof(path), "props.effects.%s.enabled", effectNames[i]);
@@ -208,11 +241,25 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         snprintf(path, sizeof(path), "props.effects.%s.%s", effectNames[i], i == 0 ? "angle" : "blend");
         float second = PlutoReadNumber(clipBegin, clipEnd, path, i == 0 ? 0.f : defaults[i][1] * 100.f);
         defaults[i][1] = i == 0 ? second / 360.f + .5f : second / 100.f;
-        for (int p = 0; p < 2; p++) gFxV[i][p] = gFxSent[i][p] = fmaxf(0.f, fminf(1.f, defaults[i][p]));
+        for (int p = 0; p < gFxParamCount[i]; p++) gFxV[i][p] = gFxSent[i][p] = fmaxf(0.f, fminf(1.f, defaults[i][p]));
+        if (i == 0) {
+            float offset = PlutoReadNumber(clipBegin, clipEnd, "props.effects.chromatic.offset", 0.f);
+            gFxV[i][2] = gFxSent[i][2] = fmaxf(0.f, fminf(1.f, .5f + offset / 60.f));
+        }
     }
+    gExtraFxOpen = -1;
     for (int i = 0; i < EXTRA_FX_COUNT; i++) {
-        char path[96]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
+        char path[128]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
         gExtraFxOn[i] = false; PlutoJsonBoolPath(clipBegin, clipEnd, path, &gExtraFxOn[i]);
+        for (int p = 0; p < gExtraFxParamCount[i]; p++) {
+            char paramPath[160];
+            snprintf(paramPath, sizeof(paramPath), "props.effects.%s.%s", gExtraFxKeys[i], gExtraFxParams[i][p].field);
+            const ExtraFxParamDef *def = &gExtraFxParams[i][p];
+            float value = PlutoReadNumber(clipBegin, clipEnd, paramPath, def->initial);
+            float span = fmaxf(.0001f, def->max - def->min);
+            float normalized = (value - def->min) / span;
+            gExtraFxV[i][p] = gExtraFxSent[i][p] = fmaxf(0.f, fminf(1.f, normalized));
+        }
     }
     char preset[32] = {0};
     gFilter = 0;
@@ -1167,18 +1214,6 @@ static const FxDef kFx[VIDEO_FX_COUNT] = {
     {"Chromatic aberration", "Amount", "Angle", true},
     {"Pixelate", "Size", "Blend", false},
 };
-static float gFxV[VIDEO_FX_COUNT][2] = {{.3f, .5f}, {.3f, .5f}};
-static float gFxSent[VIDEO_FX_COUNT][2] = {{.3f, .5f}, {.3f, .5f}};
-static const char *gFxProp[VIDEO_FX_COUNT][2] = {
-    {"props.effects.chromatic.amount", "props.effects.chromatic.angle"},
-    {"props.effects.pixelate.size", "props.effects.pixelate.blend"}
-};
-static const char *gFxToggle[VIDEO_FX_COUNT] = {"props.effects.chromatic.enabled", "props.effects.pixelate.enabled"};
-static bool  gFxOn[VIDEO_FX_COUNT];
-static bool  gFxSlDrag[VIDEO_FX_COUNT][2];
-static int   gFxOpen = -1;
-static bool  gVfxOpen = false, gFiltOpen = false;
-
 static void FxSliderLogic(Clay_ElementId id, float *v, bool *drag, float kr) {
     if (Clay_PointerOver(id) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gDragId = id.id;
     *drag = false;
@@ -1194,29 +1229,36 @@ static void FxSliderLogic(Clay_ElementId id, float *v, bool *drag, float kr) {
     }
 }
 
+static double FxParamStoredValue(int i, int p, float value) {
+    if (i == 0 && p == 1) return (value - .5f) * 360.0;
+    if (i == 0 && p == 2) return (value - .5f) * 60.0;
+    return value * 100.0;
+}
+
 static void FxParam(int i, int p, const char *label) {
     float *v = &gFxV[i][p];
-    bool isAngle = (p == 1 && kFx[i].angle);
+    bool isAngle = (i == 0 && p == 1);
+    bool isOffset = (i == 0 && p == 2);
+    float minimum = (isAngle || isOffset) ? (isAngle ? -180.f : -30.f) : 0.f;
+    float maximum = (isAngle || isOffset) ? (isAngle ? 180.f : 30.f) : 100.f;
     CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
             Tx(label, 13.5f, C_MUTED, 0);
             HSPACE
-            float displayValue = isAngle ? roundf((*v - .5f) * 360.f) : roundf(*v * 100.f);
-            if (ValBoxTyped(CLAY_IDI("FxValue", i * 2 + p), &displayValue,
-                               isAngle ? "\xC2\xB0" : NULL, 72, 22, 13.f, 11.f, 10,
-                               isAngle ? -180.f : 0.f, isAngle ? 180.f : 100.f, 0)) {
-                *v = isAngle ? .5f + displayValue / 360.f : displayValue / 100.f;
-                *v = fmaxf(0.f, fminf(1.f, *v));
-                double stored = isAngle ? (*v - .5f) * 360.0 : *v * 100.0;
-                PlutoTimelineSetProperty(gFxProp[i][p], stored);
+            float displayValue = minimum + *v * (maximum - minimum);
+            if (ValBoxTyped(CLAY_IDI("FxValue", i * 3 + p), &displayValue,
+                               isAngle ? "°" : isOffset ? "px" : NULL, 72, 22, 13.f, 11.f, 10,
+                               minimum, maximum, 0)) {
+                *v = fmaxf(0.f, fminf(1.f, (displayValue - minimum) / (maximum - minimum)));
+                PlutoTimelineSetProperty(gFxProp[i][p], FxParamStoredValue(i, p, *v));
                 gFxSent[i][p] = *v;
             }
         }
-        Clay_ElementId sid = CLAY_IDI("FxSl", i * 2 + p);
+        Clay_ElementId sid = CLAY_IDI("FxSl", i * 3 + p);
         Bs bs = Interact(sid);
         FxSliderLogic(sid, v, &gFxSlDrag[i][p], 7.f);
         if (fabsf(*v - gFxSent[i][p]) > .0015f) {
-            double value = (p == 1 && kFx[i].angle) ? (*v - .5f) * 360.0 : *v * 100.0;
+            double value = FxParamStoredValue(i, p, *v);
             if (gFxSlDrag[i][p]) PlutoTimelineSetPropertyLive(gFxProp[i][p], value);
             else PlutoTimelineSetProperty(gFxProp[i][p], value);
             gFxSent[i][p] = *v;
@@ -1237,14 +1279,15 @@ static void FxBody(int i) {
             Bs sb = Interact(swid);
             if (sb.clicked) {
                 gFxOn[i] = !gFxOn[i];
-                if (gFxOn[i]) {
-                    double first = gFxV[i][0] * 100.0;
-                    double second = i == 0 ? (gFxV[i][1] - .5f) * 360.0 : gFxV[i][1] * 100.0;
-                    char updates[512];
-                    snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":true},{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
-                             gFxToggle[i], gFxProp[i][0], first, gFxProp[i][1], second);
-                    PlutoTimelineSetPropertiesJson(updates);
-                } else PlutoTimelineSetBoolProperty(gFxToggle[i], false);
+                char updates[512]; size_t used = 0;
+                used += (size_t)snprintf(updates + used, sizeof(updates) - used, "[{\"path\":\"%s\",\"value\":%s}",
+                                          gFxToggle[i], gFxOn[i] ? "true" : "false");
+                if (gFxOn[i]) for (int p = 0; p < gFxParamCount[i]; p++) {
+                    used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                                             ",{\"path\":\"%s\",\"value\":%.4f}",
+                                             gFxProp[i][p], FxParamStoredValue(i, p, gFxV[i][p]));
+                }
+                if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
             }
             float on = Anim(swid.id + 5u, gFxOn[i] ? 1.f : 0.f, 22.f);
             CLAY(swid, {.layout = {.sizing = {FIT, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
@@ -1261,60 +1304,166 @@ static void FxBody(int i) {
                 Tx("Reset", 14, rc, 0);
             }
             if (rb.clicked) {
-                gFxV[i][0] = gFxSent[i][0] = .3f;
-                gFxV[i][1] = gFxSent[i][1] = .5f;
                 gFxOn[i] = false;
-                char updates[512];
-                snprintf(updates, sizeof(updates), "[{\"path\":\"%s\",\"value\":false},{\"path\":\"%s\",\"value\":%.4f},{\"path\":\"%s\",\"value\":%.4f}]",
-                         gFxToggle[i], gFxProp[i][0], gFxV[i][0] * 100.0, gFxProp[i][1], i == 0 ? 0.0 : gFxV[i][1] * 100.0);
-                PlutoTimelineSetPropertiesJson(updates);
+                for (int p = 0; p < gFxParamCount[i]; p++) {
+                    gFxV[i][p] = gFxSent[i][p] = (i == 0 && p == 1) ? .5f :
+                                                     (i == 0 && p == 2) ? .5f : .3f;
+                }
+                if (i == 1) gFxV[i][1] = gFxSent[i][1] = .5f;
+                char updates[512]; size_t used = 0;
+                used += (size_t)snprintf(updates + used, sizeof(updates) - used, "[{\"path\":\"%s\",\"value\":false}", gFxToggle[i]);
+                for (int p = 0; p < gFxParamCount[i]; p++)
+                    used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                                             ",{\"path\":\"%s\",\"value\":%.4f}",
+                                             gFxProp[i][p], FxParamStoredValue(i, p, gFxV[i][p]));
+                if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
             }
         }
-        FxParam(i, 0, kFx[i].p1);
-        FxParam(i, 1, kFx[i].p2);
+        for (int p = 0; p < gFxParamCount[i]; p++) {
+            static const char *labels[2][3] = {{"Amount", "Angle", "Offset"}, {"Size", "Blend", ""}};
+            FxParam(i, p, labels[i][p]);
+        }
     }
 }
 
 static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected);
 
-static void ExtraFxRow(int i) {
-    Clay_ElementId id = CLAY_IDI("FxExtra", i);
-    Bs b = Interact(id);
-    if (b.clicked) {
-        gExtraFxOn[i] = !gExtraFxOn[i];
-        char path[96]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
-        if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "blur") == 0) {
-            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.blur.enabled\",\"value\":true},{\"path\":\"props.effects.blur.amount\",\"value\":22},{\"path\":\"props.effects.blur.mode\",\"value\":\"gaussian\"}]");
-        } else if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "vignette") == 0) {
-            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.vignette.enabled\",\"value\":true},{\"path\":\"props.effects.vignette.amount\",\"value\":50},{\"path\":\"props.effects.vignette.midpoint\",\"value\":50},{\"path\":\"props.effects.vignette.roundness\",\"value\":0},{\"path\":\"props.effects.vignette.feather\",\"value\":65}]");
-        } else if (gExtraFxOn[i] && strcmp(gExtraFxKeys[i], "filmBurn") == 0) {
-            PlutoTimelineSetPropertiesJson("[{\"path\":\"props.effects.filmBurn.enabled\",\"value\":true},{\"path\":\"props.effects.filmBurn.amount\",\"value\":42},{\"path\":\"props.effects.filmBurn.warmth\",\"value\":70},{\"path\":\"props.effects.filmBurn.edge\",\"value\":38},{\"path\":\"props.effects.filmBurn.flicker\",\"value\":12}]");
+static void ExtraFxCommit(int i, bool includeParameters) {
+    char updates[1024]; size_t used = 0;
+    used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                             "[{\"path\":\"props.effects.%s.enabled\",\"value\":%s}",
+                             gExtraFxKeys[i], gExtraFxOn[i] ? "true" : "false");
+    if (includeParameters) {
+        for (int p = 0; p < gExtraFxParamCount[i]; p++) {
+            const ExtraFxParamDef *def = &gExtraFxParams[i][p];
+            double value = def->min + gExtraFxV[i][p] * (def->max - def->min);
+            used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                                     ",{\"path\":\"props.effects.%s.%s\",\"value\":%.4f}",
+                                     gExtraFxKeys[i], def->field, value);
+        }
+        if (i == 0) used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                                              ",{\"path\":\"props.effects.blur.mode\",\"value\":\"gaussian\"}");
+    }
+    if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
+}
+
+static void ExtraFxSetDefaults(int i) {
+    for (int p = 0; p < gExtraFxParamCount[i]; p++) {
+        const ExtraFxParamDef *def = &gExtraFxParams[i][p];
+        float normalized = (def->initial - def->min) / fmaxf(.0001f, def->max - def->min);
+        gExtraFxV[i][p] = gExtraFxSent[i][p] = fmaxf(0.f, fminf(1.f, normalized));
+    }
+}
+
+static void ExtraFxParam(int i, int p) {
+    const ExtraFxParamDef *def = &gExtraFxParams[i][p];
+    float *value = &gExtraFxV[i][p];
+    float actual = def->min + *value * (def->max - def->min);
+    CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 6}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
+            Tx(def->label, 13.5f, C_MUTED, 0);
+            HSPACE
+            float displayValue = actual;
+            if (ValBoxTyped(CLAY_IDI("FxExtraValue", i * 4 + p), &displayValue,
+                            def->suffix, 72, 22, 13.f, 11.f, 10, def->min, def->max, 0)) {
+                *value = fmaxf(0.f, fminf(1.f, (displayValue - def->min) / (def->max - def->min)));
+                char path[160]; snprintf(path, sizeof(path), "props.effects.%s.%s", gExtraFxKeys[i], def->field);
+                PlutoTimelineSetProperty(path, def->min + *value * (def->max - def->min));
+                gExtraFxSent[i][p] = *value;
+            }
+        }
+        Clay_ElementId sid = CLAY_IDI("FxExtraSlider", i * 4 + p);
+        Bs sb = Interact(sid);
+        FxSliderLogic(sid, value, &gExtraFxSlDrag[i][p], 7.f);
+        if (fabsf(*value - gExtraFxSent[i][p]) > .0015f) {
+            char path[160]; snprintf(path, sizeof(path), "props.effects.%s.%s", gExtraFxKeys[i], def->field);
+            double actualValue = def->min + *value * (def->max - def->min);
+            if (gExtraFxSlDrag[i][p]) PlutoTimelineSetPropertyLive(path, actualValue);
+            else PlutoTimelineSetProperty(path, actualValue);
+            gExtraFxSent[i][p] = *value;
+        }
+        CLAY(sid, {.layout = {.sizing = {GROW, FIX(16)}},
+                   .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160), C_CARD, *value,
+                                               (sb.hover + (gExtraFxSlDrag[i][p] ? 1.f : 0.f)) * 1.5f, 0)}}) {}
+    }
+}
+
+static void ExtraFxBody(int i) {
+    CLAY(CLAY_IDI("FxExtraBody", i), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {14, 12, 12, 12}, .childGap = 10},
+                                      .backgroundColor = C_RCARD,
+                                      .cornerRadius = {0.f, 0.f, 18.f, 18.f}}) {
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
+        if (gExtraFxParamCount[i] == 0) {
+            Tx("Flips the clip horizontally.", 13.5f, C_MUTED, 0);
         } else {
-            PlutoTimelineSetBoolProperty(path, gExtraFxOn[i]);
+            for (int p = 0; p < gExtraFxParamCount[i]; p++) ExtraFxParam(i, p);
+        }
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .childAlignment = AL_Y}}) {
+            HSPACE
+            Clay_ElementId rid = CLAY_IDI("FxExtraReset", i);
+            Bs rb = Interact(rid);
+            Clay_Color rc = Mix(RGB(140, 142, 150), C_TEXT, rb.hover);
+            CLAY(rid, {.layout = {.sizing = {FIT, FIT}, .childGap = 5, .childAlignment = AL_Y}}) {
+                ResetIcon(rid, I_RESET, 14, rc, rb.clicked);
+                Tx("Reset", 13.5f, rc, 0);
+            }
+            if (rb.clicked) {
+                ExtraFxSetDefaults(i);
+                gExtraFxOn[i] = false;
+                ExtraFxCommit(i, true);
+            }
         }
     }
+}
 
-    float openAnim = EaseIO(AnimLin(id.id, gExtraFxOn[i] ? 1.f : 0.f, 0.2f));
-    bool down = Clay_PointerOver(id) && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    float squash = Clampf(Spring(id.id + 7u, down ? 1.f : 0.f, 700.f, 26.f), 0.f, 1.2f);
-    int inset = (int)roundf(squash * 4.f);
-    int verticalInset = (int)roundf(squash * 1.5f);
-    CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(48)}, .padding = {inset, inset, verticalInset, verticalInset}}}) {
-        CLAY(id, {.layout = {.sizing = {GROW, GROW}, .padding = {16, 14, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
-                  .backgroundColor = Mix(Mix(C_RCARD, RGB(33, 34, 38), openAnim), Mix(RGB(36, 37, 43), RGB(40, 41, 47), openAnim), b.hover),
-                  .cornerRadius = CLAY_CORNER_RADIUS(18),
-                  .border = {.color = Mix(Mix(C_RCARDB, RGB(62, 64, 72), openAnim), RGB(84, 87, 96), b.hover * 0.7f),
-                             .width = CLAY_BORDER_OUTSIDE(1)}}) {
-            Icon(I_SPARKLE, 22, C_ICON);
-            Tx(gExtraFxNames[i], 18, C_TEXT, 0);
-            HSPACE
-            if (gExtraFxOn[i]) {
-                CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = C_TEXT, .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
-                GAPX(2)
+static void ExtraFxRow(int i) {
+    Clay_ElementId header = CLAY_IDI("FxExtraHdr", i);
+    Clay_ElementId toggle = CLAY_IDI("FxExtraToggle", i);
+    Bs hb = Interact(header);
+    Bs tb = Interact(toggle);
+    bool open = gExtraFxOpen == i;
+    /* The enable control is a sibling of the accordion header; don't let its
+       click bubble into the header's expand/collapse action. */
+    bool toggleHovered = Clay_PointerOver(toggle);
+    if (hb.clicked && !toggleHovered) gExtraFxOpen = open ? -1 : i;
+    if (tb.clicked) {
+        gExtraFxOn[i] = !gExtraFxOn[i];
+        ExtraFxCommit(i, gExtraFxOn[i]);
+    }
+    bool targetOpen = gExtraFxOpen == i;
+    float openAnim = EaseIO(AnimLin(header.id + 0x319u, targetOpen ? 1.f : 0.f, 0.2f));
+    float measured = Clay_GetElementData(CLAY_IDI("FxExtraBody", i)).boundingBox.height;
+    if (measured > 1.f) gExtraFxBodyHeight[i] = measured;
+    float wrapHeight = roundf(openAnim * gExtraFxBodyHeight[i]);
+    CLAY(CLAY_IDI("FxExtraItem", i), {.layout = {COLM, .sizing = {GROW, FIT}},
+                                      .backgroundColor = C_RCARD,
+                                      .cornerRadius = CLAY_CORNER_RADIUS(16),
+                                      .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(48)}, .childGap = 0, .childAlignment = AL_Y}}) {
+            CLAY(header, {.layout = {.sizing = {GROW, GROW}, .padding = {15, 12, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
+                          .backgroundColor = Mix(C_RCARD, RGB(38, 40, 46), hb.hover * .5f),
+                          .cornerRadius = {16.f, 16.f, 16.f, 16.f}}) {
+                Icon(I_SPARKLE, 21, C_ICON);
+                Tx(gExtraFxNames[i], 16, C_TEXT, 0);
+                HSPACE
+                if (gExtraFxOn[i]) {
+                    CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = RGB(114, 213, 227), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
+                    GAPX(3)
+                }
+                Icon(targetOpen ? I_CHEV_UP : I_CHEV_DN, 12, C_DIM);
             }
-            CLAY_AUTO_ID({.layout = {.sizing = {FIX(16), FIX(16)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(9),
-                          .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), b.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                IconV(I_PLUS, 10, C_DIM, 1.f - openAnim);
+            CLAY(toggle, {.layout = {.sizing = {FIX(38), FIX(48)}, .childAlignment = AL_C},
+                          .backgroundColor = Mix(C_RCARD, RGB(38, 40, 46), tb.hover * .5f)}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {FIX(20), FIX(20)}, .childAlignment = AL_C},
+                              .cornerRadius = CLAY_CORNER_RADIUS(10),
+                              .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), tb.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    IconV(I_PLUS, 11, gExtraFxOn[i] ? C_TEXT : C_DIM, gExtraFxOn[i] ? 0.f : 1.f);
+                }
+            }
+        }
+        if (wrapHeight >= 1.f) {
+            CLAY(CLAY_IDI("FxExtraBodyWrap", i), {.layout = {COLM, .sizing = {GROW, FIX(wrapHeight)}}, .clip = {.vertical = true}}) {
+                ExtraFxBody(i);
             }
         }
     }
@@ -1326,8 +1475,8 @@ static bool FxHeader(int i, float open) {
     return EffectsSectionHeader(id, kFx[i].name, I_SPARKLE, open > 0.5f, gFxOn[i], true);
 }
 
-static float gEffectSectionHeight[3] = {96.f, 286.f, 1005.f};
-static float gFxBodyHeight[VIDEO_FX_COUNT] = {180.f, 180.f};
+static float gEffectSectionHeight[3] = {96.f, 286.f, 1220.f};
+static float gFxBodyHeight[VIDEO_FX_COUNT] = {230.f, 180.f};
 static bool gTransitionBodyMeasured;
 
 static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected) {

@@ -26,6 +26,7 @@ struct Params {
     fx6:   vec4<f32>, // reserved, reserved, halftone_size_px(0=off), halftone_contrast
     fx7:   vec4<f32>, // halftone_angle_rad, burn_amount, burn_warmth, burn_spread
     fx8:   vec4<f32>, // burn_flicker, leak_amount, leak_warmth, leak_position
+    fx9:   vec4<f32>, // sine_wave_amplitude_px, frequency_cycles, speed_hz, reserved
 };
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
@@ -200,8 +201,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                            min((l.y - u.crop.z) * u.size.y, (crop_bottom - l.y) * u.size.y));
     let crop_coverage = clamp(crop_edge_px + 0.5, 0.0, 1.0);
     if (crop_coverage <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
-    let suv = l;
     let ruv = k / base_px; // source-uv per reference pixel
+    var suv = l;
+    // Horizontal sine-wave displacement is measured in 1080p reference
+    // pixels, so it stays visually consistent at proxy and export sizes.
+    if (u.fx9.x > 0.001) {
+        let phase = suv.y * u.fx9.y * 2.0 * PI + u.geo1.w * u.fx9.z * 2.0 * PI;
+        suv.x = suv.x + sin(phase) * u.fx9.x * ruv.x;
+    }
 
     // ------------------------------------------------------- sampling / blurs
     var col = fetch(suv);
@@ -224,7 +231,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     // chromatic aberration + glitch (RGB split)
     var shift = vec2<f32>(0.0, 0.0);
-    if (u.fx2.w > 0.01) {
+    if (abs(u.fx2.w) > 0.01) {
         shift = vec2<f32>(cos(u.fx3.x), sin(u.fx3.x)) * u.fx2.w;
     }
     if (abs(shift.x) + abs(shift.y) > 0.01) {

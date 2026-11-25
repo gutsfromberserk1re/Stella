@@ -33,6 +33,7 @@ pub struct LayerUniforms {
     pub fx6: [f32; 4],   // reserved, reserved, halftone_size, halftone_contrast
     pub fx7: [f32; 4],   // halftone_angle, burn_amount, burn_warmth, burn_spread
     pub fx8: [f32; 4],   // burn_flicker, leak_amount, leak_warmth, leak_position
+    pub fx9: [f32; 4],   // sine_wave_amplitude_px, frequency_cycles, speed_hz, reserved
 }
 
 fn n(value: &Value, key: &str, fallback: f64) -> f64 {
@@ -112,6 +113,7 @@ impl LayerUniforms {
             fx6: [0.0, 1.0, 0.0, 0.5],
             fx7: [0.0, 0.0, 0.0, 0.5],
             fx8: [0.0, 0.0, 0.0, 0.0],
+            fx9: [0.0; 4],
         }
     }
 
@@ -372,7 +374,8 @@ impl LayerUniforms {
         let mut chroma_px = 0.0_f64;
         let mut chroma_angle = 0.0_f64;
         if on(effects, "chromatic") {
-            chroma_px = n(&effects["chromatic"], "amount", 0.0) * 0.06;
+            chroma_px = n(&effects["chromatic"], "amount", 0.0) * 0.06
+                + n(&effects["chromatic"], "offset", 0.0);
             chroma_angle = n(&effects["chromatic"], "angle", 0.0).to_radians();
         }
         u.fx2 = [vig_aspect as f32, 0.0, 1.0, chroma_px as f32];
@@ -433,6 +436,16 @@ impl LayerUniforms {
             leak_position = n(l, "position", 35.0) / 100.0;
         }
         u.fx8 = [burn_flicker as f32, leak_amount as f32, leak_warmth as f32, leak_position as f32];
+
+        // ------------------------------------------------------------- sine waves
+        let (mut wave_amount, mut wave_frequency, mut wave_speed) = (0.0_f64, 3.5_f64, 1.2_f64);
+        if on(effects, "sineWaves") {
+            let waves = &effects["sineWaves"];
+            wave_amount = n(waves, "amount", 12.0).clamp(0.0, 100.0);
+            wave_frequency = n(waves, "frequency", 3.5).clamp(1.0, 24.0);
+            wave_speed = n(waves, "speed", 1.2).clamp(0.0, 10.0);
+        }
+        u.fx9 = [wave_amount as f32, wave_frequency as f32, wave_speed as f32, 0.0];
         u
     }
 }
@@ -588,7 +601,7 @@ mod tests {
     #[test]
     fn retained_effects_reach_the_preview_uniforms() {
         let props = json!({"effects": {
-            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0},
+            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0, "offset": 4.0},
             "pixelate": {"enabled": true, "size": 20.0, "blend": 50.0},
             "sharpen": {"enabled": true, "amount": 45.0, "radius": 5.0, "threshold": 10.0},
             "vignette": {"enabled": true, "amount": 50.0, "midpoint": 50.0, "roundness": 0.0, "feather": 65.0},
@@ -601,7 +614,7 @@ mod tests {
             "shake": {"enabled": true, "amount": 18.0, "frequency": 8.0, "smoothness": 35.0}
         }});
         let u = LayerUniforms::from_props(&props, 0.25);
-        assert!((u.fx2[3] - 3.0).abs() < 1e-5);
+        assert!((u.fx2[3] - 7.0).abs() < 1e-5);
         assert!((u.fx3[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
         assert!((u.fx4[0] - 10.0).abs() < 1e-5);
         assert!((u.fx4[1] - 6.0).abs() < 1e-5);
@@ -660,6 +673,13 @@ mod tests {
         let u = LayerUniforms::from_props_with_transition(&props, 0.0, Some(("wiperight", 0.5)));
         assert_eq!(u.distort, [10.0, 20.0, 30.0, 40.0]);
         assert_eq!(u.transition, [-1.0, 0.0, 0.5, 2.0]);
+    }
+
+    #[test]
+    fn sine_waves_reach_the_preview_uniforms() {
+        let props = json!({"effects": {"sineWaves": {"enabled": true, "amount": 24.0, "frequency": 6.0, "speed": 2.5}}});
+        let uniforms = LayerUniforms::from_props(&props, 1.0);
+        assert_eq!(uniforms.fx9, [24.0, 6.0, 2.5, 0.0]);
     }
 
     #[test]

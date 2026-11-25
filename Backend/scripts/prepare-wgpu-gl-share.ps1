@@ -13,6 +13,22 @@ if (-not (Test-Path (Join-Path $halRoot 'src/gles/wgl.rs'))) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the wgpu v0.19.4 source required for the WGL interop accessor patch.' }
 }
 
+# The vendored wgpu-hal manifest normally inherits cfg_aliases from the
+# upstream WGPU workspace. When Cargo resolves this path patch from Stella's
+# nested Backend workspace, that inherited workspace dependency can be
+# resolved against the wrong workspace root. Make the leaf manifest
+# standalone with the exact cfg_aliases major/minor used by wgpu v0.19.4.
+$halManifest = Join-Path $halRoot 'Cargo.toml'
+$halManifestText = Get-Content -Raw $halManifest
+if ($halManifestText -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
+    $halManifestText = [regex]::Replace($halManifestText,
+        '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$', 'cfg_aliases = "0.1"', 1)
+    Set-Content -Path $halManifest -Value $halManifestText -NoNewline
+}
+if ((Get-Content -Raw $halManifest) -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
+    throw 'Could not make the vendored wgpu-hal cfg_aliases dependency independent of workspace inheritance.'
+}
+
 $modPath = Join-Path $halRoot 'src/gles/mod.rs'
 $modText = Get-Content -Raw $modPath
 $old = '(?m)^#\[cfg\(windows\)\]\r?\nuse self::wgl::AdapterContext;'

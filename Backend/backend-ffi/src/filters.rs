@@ -78,9 +78,21 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
         filters.push(format!("scale={}:{}:flags=neighbor,scale={width}:{height}:flags=neighbor", (width as f64 / block).max(1.0) as u32, (height as f64 / block).max(1.0) as u32));
     }
     if enabled(effects, "chromatic") {
-        let amount = n(&effects["chromatic"], "amount", 0.0) * 0.06 * (height as f64 / 1080.0);
+        let amount = (n(&effects["chromatic"], "amount", 0.0) * 0.06
+            + n(&effects["chromatic"], "offset", 0.0)) * (height as f64 / 1080.0);
         let angle = n(&effects["chromatic"], "angle", 0.0).to_radians();
         filters.push(format!("rgbashift=rh={:.3}:rv={:.3}:bh={:.3}:bv={:.3}", amount * angle.cos(), amount * angle.sin(), -amount * angle.cos(), -amount * angle.sin()));
+    }
+    if enabled(effects, "sineWaves") {
+        let waves = &effects["sineWaves"];
+        let amount = n(waves, "amount", 12.0).clamp(0.0, 100.0) * (height as f64 / 1080.0);
+        let frequency = n(waves, "frequency", 3.5).clamp(1.0, 24.0);
+        let speed = n(waves, "speed", 1.2).clamp(0.0, 10.0);
+        if amount > 0.001 {
+            let shift = format!("(sin(Y/max(H-1,1)*{frequency:.4}*2*PI+T*{speed:.4}*2*PI)*{amount:.4})");
+            let x = format!("min(max(X+{shift},0),W-1)");
+            filters.push(format!("geq=r='r({x},Y)':g='g({x},Y)':b='b({x},Y)':a='alpha(X,Y)'"));
+        }
     }
     let mut sharpen_amount = (n(detail, "sharpness", 0.0) / 100.0).clamp(0.0, 1.0);
     let mut sharpen_radius = 2.5;
@@ -403,7 +415,7 @@ mod tests {
     fn curated_effects_generate_matching_export_operations() {
         let clip = json!({"start": 0.0, "props": {"effects": {
             "blur": {"enabled": true, "amount": 22.0},
-            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0},
+            "chromatic": {"enabled": true, "amount": 50.0, "angle": 90.0, "offset": 4.0},
             "shake": {"enabled": true, "amount": 18.0, "frequency": 8.0, "smoothness": 35.0},
             "sharpen": {"enabled": true, "amount": 45.0, "radius": 5.0, "threshold": 10.0},
             "vignette": {"enabled": true, "amount": 50.0, "midpoint": 50.0, "roundness": 0.0, "feather": 65.0},
@@ -412,11 +424,13 @@ mod tests {
             "halftone": {"enabled": true, "size": 5.0, "angle": 45.0, "contrast": 48.0},
             "posterize": {"enabled": true, "levels": 6.0, "blend": 100.0},
             "lightLeak": {"enabled": true, "amount": 40.0, "warmth": 70.0, "position": 35.0},
-            "mirror": {"enabled": true}
+            "mirror": {"enabled": true},
+            "sineWaves": {"enabled": true, "amount": 24.0, "frequency": 6.0, "speed": 2.5}
         }}});
         let (graph, overlay_x, overlay_y) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
         assert!(graph.contains("gblur=sigma="));
         assert!(graph.contains("rgbashift="));
+        assert!(graph.contains("sin(Y/max(H-1,1)*6.0000*2*PI"));
         assert!(graph.contains("geq=r='r(X,Y)+("));
         assert!(graph.contains("sqrt(pow("));
         assert!(graph.contains("floor(Y/"));

@@ -621,16 +621,14 @@ static int TimelineSelectedKeyframeIndex(int clipIndex) {
 
 static bool TimelineKeyframeToolbarButton(Clay_ElementId id, int icon, bool active, bool accent, float size) {
     Bs b = Interact(id);
-    Clay_Color base = active ? RGB(55, 45, 70) : RGB(28, 29, 34);
-    Clay_Color hover = active ? RGB(76, 62, 96) : RGB(45, 47, 54);
-    Clay_Color iconColor = accent ? (active ? RGB(225, 207, 255) : RGB(183, 164, 211))
-                                : RGB(166, 169, 179);
-    CLAY(id, {.layout = {.sizing = {FIX(size), FIX(30)}, .childAlignment = AL_C},
-              .backgroundColor = BtnBg(base, hover, b),
-              .cornerRadius = CLAY_CORNER_RADIUS(8),
-              .border = {.color = Mix(RGB(45, 46, 53), accent ? RGB(126, 99, 164) : RGB(83, 86, 96),
-                                      (active ? .72f : 0.f) + b.hover * .22f),
-                         .width = CLAY_BORDER_OUTSIDE(1)}}) {
+    /* Keyframe navigation is deliberately icon-only: no nested button cards,
+       fills or borders. The diamond has its own cool accent so it reads as the
+       keyframe action without painting a background behind it. */
+    Clay_Color iconColor = accent
+        ? (active ? RGB(166, 244, 250) : RGB(91, 194, 211))
+        : RGB(143, 147, 158);
+    iconColor = Mix(iconColor, C_TEXT, b.hover * .62f);
+    CLAY(id, {.layout = {.sizing = {FIX(size), FIX(30)}, .childAlignment = AL_C}}) {
         Icon(icon, 15.5f, iconColor);
     }
     return b.clicked;
@@ -1221,9 +1219,7 @@ static void Timeline(void) {
             if (IconBtn(CLAY_ID("Redo"), I_REDO, 34, 16, RGB(143, 146, 155), false, 8)) TimelineHistoryAction(true);
             HSPACE
             int keyframeOnPlayhead = TimelineKeyframeAtPlayhead(gTimelineSelected);
-            CLAY(CLAY_ID("KfGroup"), {.layout = {.sizing = {FIT, FIX(36)}, .padding = {3, 3, 0, 0}, .childGap = 2, .childAlignment = AL_Y},
-                                      .backgroundColor = RGB(21, 22, 26), .cornerRadius = CLAY_CORNER_RADIUS(11),
-                                      .border = {.color = RGB(40, 42, 48), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+            CLAY(CLAY_ID("KfGroup"), {.layout = {.sizing = {FIT, FIX(32)}, .childGap = 8, .childAlignment = AL_Y}}) {
                 if (TimelineKeyframeToolbarButton(CLAY_ID("KfPrev"), I_KF_PREV, false, false, 30) &&
                     gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
                     float prev = -1.f;

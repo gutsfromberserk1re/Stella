@@ -941,12 +941,12 @@ static void DrawCustom(Cust *cu, Rectangle r) {
                 float y = r.y + 13.f, half = 8.f; /* 2px larger than the previous 14px diamond */
                 bool activeKey = fabsf(time - gPlayhead) <= (0.5f / (float)fmaxf(1, gPreviewFps) + .001f);
                 bool selectedKey = gSelectedKeyframeClip == clipIndex && fabsf(time - gSelectedKeyframeTime) < .02f;
-                Color key = activeKey ? (Color){221, 202, 255, 255} : (Color){180, 151, 232, 255};
+                Color key = activeKey ? (Color){177, 247, 252, 255} : (Color){91, 194, 211, 255};
                 Vector2 a = {x, y - half}, b = {x + half, y}, c = {x, y + half}, d = {x - half, y};
                 /* Keep the marker crisp: the old dark circular backing made the
                    keyframes look like green buttons instead of timeline diamonds. */
                 DrawTriangle(a, d, b, key); DrawTriangle(c, b, d, key);
-                Color edge = selectedKey ? (Color){245, 236, 255, 255} : (Color){112, 82, 161, 255};
+                Color edge = selectedKey ? (Color){226, 253, 255, 255} : (Color){39, 120, 137, 255};
                 float edgeWidth = selectedKey ? 1.f : 1.25f;
                 DrawLineEx(a, b, edgeWidth, edge);
                 DrawLineEx(b, c, edgeWidth, edge);
