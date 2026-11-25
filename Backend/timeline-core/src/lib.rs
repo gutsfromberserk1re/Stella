@@ -181,7 +181,8 @@ impl Timeline {
         if clip.track.is_video() && self.magnetic {
             let previous_start = clip.start;
             clip.start = self.magnetic_start(&clip.id, clip.start, clip.duration, None);
-            shift_clip_keyframes(&mut clip, clip.start - previous_start);
+            let start_delta = clip.start - previous_start;
+shift_clip_keyframes(&mut clip, start_delta);
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
