@@ -9,8 +9,8 @@ static float gTimelineLaneHeight = TIMELINE_LANE_MIN;
 
 /* Track rows animate independently. A row remains in the Clay layout while it
    is fading out, so the rows below it do not jump when a clip is removed. */
-static float gTimelineTrackVis[4] = {1.f, 0.f, 0.f, 0.f};
-static bool gTimelineTrackWanted[4] = {true, false, false, false};
+static float gTimelineTrackVis[TIMELINE_MAX_VIDEO_TRACKS] = {1.f};
+static bool gTimelineTrackWanted[TIMELINE_MAX_VIDEO_TRACKS] = {true};
 static int gTimelineDragTargetTrack = -1;
 typedef struct TimelineSnapPoint { float time; int clipIndex; } TimelineSnapPoint;
 static TimelineSnapPoint gTimelineSnapPoints[MAX_TIMELINE_CLIPS * 2];
@@ -62,7 +62,7 @@ static bool TimelineVideoTrackIsVisible(int track) {
 }
 
 static void TimelineAddVisibleVideoTrack(int track) {
-    if (track < 0 || track >= 4 || TimelineVideoTrackIsVisible(track) || gTimelineVideoTracks >= 4) return;
+    if (track < 0 || track >= TIMELINE_MAX_VIDEO_TRACKS || TimelineVideoTrackIsVisible(track) || gTimelineVideoTracks >= TIMELINE_MAX_VIDEO_TRACKS) return;
     /* Higher-numbered video layers sit above V1. Keeping the list in
        descending order also means a newly revealed layer is inserted at the
        top, exactly where an upward drag expects the next lane to appear. */
@@ -79,19 +79,19 @@ static void TimelineRebuildVisibleVideoTracks(void) {
     /* V1 is permanent. Other video rows are wanted while occupied or while a
        drag is temporarily exposing them. Rows already fading out stay mounted
        until their visibility reaches zero. This avoids a one-frame layout pop. */
-    bool wanted[4] = {true, false, false, false};
+    bool wanted[TIMELINE_MAX_VIDEO_TRACKS] = {true};
     for (int i = 0; i < gTimelineClipCount; i++) {
         int track = gTimelineClips[i].track;
         if (TimelineTrackIsVideo(track)) wanted[track] = true;
     }
     if (gTimelinePendingVideoTrack >= 1) {
-        int last = gTimelinePendingVideoTrack < 3 ? gTimelinePendingVideoTrack : 3;
+        int last = gTimelinePendingVideoTrack < TIMELINE_MAX_VIDEO_TRACKS - 1 ? gTimelinePendingVideoTrack : TIMELINE_MAX_VIDEO_TRACKS - 1;
         for (int track = 1; track <= last; track++) wanted[track] = true;
     }
-    for (int track = 0; track < 4; track++) gTimelineTrackWanted[track] = wanted[track];
+    for (int track = 0; track < TIMELINE_MAX_VIDEO_TRACKS; track++) gTimelineTrackWanted[track] = wanted[track];
 
     gTimelineVideoTracks = 0;
-    for (int track = 3; track >= 0; track--) {
+    for (int track = TIMELINE_MAX_VIDEO_TRACKS - 1; track >= 0; track--) {
         if (wanted[track] || gTimelineTrackVis[track] > 0.001f)
             TimelineAddVisibleVideoTrack(track);
     }
@@ -100,7 +100,7 @@ static void TimelineRebuildVisibleVideoTracks(void) {
 static void TimelineUpdateTrackVisibility(void) {
     const float dt = fminf(fmaxf(gDt, 0.f), 0.05f);
     const float k = 1.f - expf(-24.f * dt);
-    for (int track = 0; track < 4; track++) {
+    for (int track = 0; track < TIMELINE_MAX_VIDEO_TRACKS; track++) {
         float target = gTimelineTrackWanted[track] ? 1.f : 0.f;
         float delta = target - gTimelineTrackVis[track];
         if (fabsf(delta) < 0.002f) {
@@ -274,15 +274,15 @@ static void TimelineExpandVideoTracksForDrag(void) {
 
     /* One additional lane appears for each deliberate upward movement. The
        pointer can travel just above the track viewport into the ruler area,
-       so each new lane requires another small upward step instead of all
-       four lanes popping open at once. */
+       so each new lane requires another small upward step instead of all remaining
+       video lanes popping open at once. */
     int highest = -1;
     for (int i = 0; i < gTimelineVideoTracks; i++) {
         int track = gTimelineVideoTrackIds[i];
         if ((gTimelineTrackWanted[track] || gTimelineTrackVis[track] >= 0.18f) && track > highest)
             highest = track;
     }
-    if (highest >= 0 && highest < 3) {
+    if (highest >= 0 && highest < TIMELINE_MAX_VIDEO_TRACKS - 1) {
         Clay_BoundingBox top = Clay_GetElementData(CLAY_IDI("TrackLane", highest)).boundingBox;
         if (top.height > 0.f && mouse.y <= gTimelineLastRevealY &&
             mouse.y >= top.y - 48.f) {
@@ -312,7 +312,7 @@ static int TimelineTrackUnderPointer(void) {
             best = distance; bestTrack = track;
         }
     }
-    for (int track = 4; track < 4 + gTimelineAudioTracks; track++) {
+    for (int track = TIMELINE_MAX_VIDEO_TRACKS; track < TIMELINE_MAX_VIDEO_TRACKS + gTimelineAudioTracks; track++) {
         Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", track)).boundingBox;
         if (lane.width <= 0.f || lane.height < 10.f) continue;
         float center = lane.y + lane.height * .5f;
@@ -453,7 +453,7 @@ static bool TimelineTrackOverlaps(int track, float start, float duration, int ex
 }
 
 static int TimelineClosestFreeTrack(int requested, float start, float duration, int excluded, const char *excludeGroup) {
-    int first = TimelineTrackIsVideo(requested) ? 0 : 4;
+    int first = TimelineTrackIsVideo(requested) ? 0 : TIMELINE_MAX_VIDEO_TRACKS;
     int last = TimelineTrackIsVideo(requested) ? TIMELINE_MAX_VIDEO_TRACKS - 1
                                                : TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
     int best = requested, bestDistance = 99;
@@ -468,7 +468,7 @@ static int TimelineClosestFreeTrack(int requested, float start, float duration, 
 }
 
 static const char *TimelineTrackLabel(int track) {
-    static const char *labels[] = {"V1", "V2", "V3", "V4", "A1", "A2", "A3", "A4", "A5", "A6"};
+    static const char *labels[] = {"V1", "V2", "V3", "V4", "V5", "V6", "A1", "A2", "A3", "A4", "A5", "A6"};
     int last = TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
     return labels[track < 0 ? 0 : track > last ? last : track];
 }
@@ -479,14 +479,14 @@ static void TimelineTrackRow(int track, float height) {
     Clay_ElementId row = CLAY_IDI("TrackRow", track);
     static const Color videoBands[3] = {{26, 27, 30, 255}, {25, 26, 29, 255}, {30, 30, 32, 255}};
     static const Color audioBands[2] = {{23, 24, 27, 255}, {26, 27, 30, 255}};
-    Color bgRaylib = track < 4 ? videoBands[track % 3] : audioBands[(track - 4) % 2];
+    Color bgRaylib = track < TIMELINE_MAX_VIDEO_TRACKS ? videoBands[track % 3] : audioBands[(track - TIMELINE_MAX_VIDEO_TRACKS) % 2];
     /* FIX: Clay's backgroundColor is a Clay_Color (floats), not a raylib Color (unsigned char). */
     Clay_Color bg = (Clay_Color){(float)bgRaylib.r, (float)bgRaylib.g, (float)bgRaylib.b, (float)bgRaylib.a};
     CLAY(row, {.layout = {.sizing = {GROW, FIX(height)}, .childAlignment = AL_Y}, .backgroundColor = bg,
                .clip = {.horizontal = true, .vertical = true},
                .border = {.color = RGB(41, 42, 46), .width = {.bottom = 1}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
-            Icon(track < 4 ? I_FILM : I_NOTE, 14, C_MUTED);
+            Icon(TimelineTrackIsVideo(track) ? I_FILM : I_NOTE, 14, C_MUTED);
             TxMedium(TimelineTrackLabel(track), 13, C_MUTED);
         }
         TimelineClipLane(track, height);
@@ -694,7 +694,7 @@ static void TimelineClipLane(int track, float height) {
         visualCursor = placed + width;
     }
 
-    if (track < 4) {
+    if (TimelineTrackIsVideo(track)) {
         for (int n = 0; n + 1 < count && gTransitionButtonCount < 64; n++) {
             int left = order[n], right = order[n + 1];
             float end = gTimelineClips[left].start + gTimelineClips[left].duration;
@@ -742,7 +742,7 @@ static void TimelineClipLane(int track, float height) {
                 float start = fmaxf(0.f, (GetMousePosition().x - lane.x - gTimelinePan) / pps);
                 start = TimelineSnapStart(start, media->duration, !mediaIsAudio, -1, 0.f, false, NULL);
                 int target = TimelineClosestFreeTrack(track, start, media->duration, -1, NULL);
-                if (target < 4 && !TimelineVideoTrackIsVisible(target)) gTimelinePendingVideoTrack = target;
+                if (TimelineTrackIsVideo(target) && !TimelineVideoTrackIsVisible(target)) gTimelinePendingVideoTrack = target;
                 if (TimelineTrackIsAudio(target) && target > gTimelinePendingAudioTrack) gTimelinePendingAudioTrack = target;
                 Clay_BoundingBox targetBox = Clay_GetElementData(CLAY_IDI("TrackLane", target)).boundingBox;
                 float x = targetBox.x + gTimelinePan + start * pps;
@@ -1112,7 +1112,7 @@ static void Timeline(void) {
         int targetTrack = TimelineTrackUnderPointerForDrag();
         if (targetTrack >= 0 && gMediaDragIndex < gImportedCount) {
             ImportedMedia *media = &gImported[gMediaDragIndex];
-            bool audioTrack = targetTrack >= 4;
+            bool audioTrack = targetTrack >= TIMELINE_MAX_VIDEO_TRACKS;
             if (audioTrack == (strcmp(media->kind, "audio") == 0)) {
                 Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", targetTrack)).boundingBox;
                 float start = lane.width > 0.f ? fmaxf(0.f, (mouse.x - lane.x - gTimelinePan) / pps) : 0.f;

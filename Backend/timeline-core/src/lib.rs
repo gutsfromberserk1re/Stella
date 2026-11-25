@@ -16,6 +16,10 @@ pub enum TrackId {
     V3,
     #[serde(rename = "v4")]
     V4,
+    #[serde(rename = "v5")]
+    V5,
+    #[serde(rename = "v6")]
+    V6,
     #[serde(rename = "a1")]
     A1,
     #[serde(rename = "a2")]
@@ -32,12 +36,12 @@ pub enum TrackId {
 
 impl TrackId {
     pub fn is_video(self) -> bool {
-        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4)
+        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5 | Self::V6)
     }
 
     fn lanes(self) -> &'static [TrackId] {
         if self.is_video() {
-            &[Self::V1, Self::V2, Self::V3, Self::V4]
+            &[Self::V1, Self::V2, Self::V3, Self::V4, Self::V5, Self::V6]
         } else {
             &[Self::A1, Self::A2, Self::A3, Self::A4, Self::A5, Self::A6]
         }
@@ -47,8 +51,9 @@ impl TrackId {
     pub const fn sort_index(self) -> usize {
         match self {
             Self::V1 => 0, Self::V2 => 1, Self::V3 => 2, Self::V4 => 3,
-            Self::A1 => 4, Self::A2 => 5, Self::A3 => 6, Self::A4 => 7,
-            Self::A5 => 8, Self::A6 => 9,
+            Self::V5 => 4, Self::V6 => 5,
+            Self::A1 => 6, Self::A2 => 7, Self::A3 => 8, Self::A4 => 9,
+            Self::A5 => 10, Self::A6 => 11,
         }
     }
 }
@@ -182,7 +187,7 @@ impl Timeline {
             let previous_start = clip.start;
             clip.start = self.magnetic_start(&clip.id, clip.start, clip.duration, None);
             let start_delta = clip.start - previous_start;
-shift_clip_keyframes(&mut clip, start_delta);
+            shift_clip_keyframes(&mut clip, start_delta);
         }
         let requested_track = clip.track;
         clip.track = self.nearest_free_lane(&clip.id, requested_track, clip.start, clip.duration)
@@ -717,6 +722,43 @@ mod tests {
     fn timeline_starts_with_only_the_primary_video_track_visible() {
         let timeline = Timeline::default();
         assert_eq!(timeline.visible_tracks(), HashSet::from([TrackId::V1]));
+    }
+
+    #[test]
+    fn clips_can_be_added_to_the_new_v5_and_v6_video_lanes() {
+        let mut timeline = Timeline::default();
+        timeline.snapping = false;
+        timeline.magnetic = false;
+
+        let mut v5 = video_clip("overlay-v5", 0.0, 2.0);
+        v5.track = TrackId::V5;
+        let mut v6 = video_clip("overlay-v6", 0.0, 2.0);
+        v6.track = TrackId::V6;
+
+        timeline.add_clip(v5).unwrap();
+        timeline.add_clip(v6).unwrap();
+
+        assert_eq!(timeline.clips.iter().find(|clip| clip.id == "overlay-v5").unwrap().track, TrackId::V5);
+        assert_eq!(timeline.clips.iter().find(|clip| clip.id == "overlay-v6").unwrap().track, TrackId::V6);
+        assert!(timeline.visible_tracks().contains(&TrackId::V5));
+        assert!(timeline.visible_tracks().contains(&TrackId::V6));
+    }
+
+    #[test]
+    fn all_six_video_track_ids_round_trip_and_sort_below_audio_tracks() {
+        for (name, track, index) in [
+            ("v1", TrackId::V1, 0), ("v2", TrackId::V2, 1),
+            ("v3", TrackId::V3, 2), ("v4", TrackId::V4, 3),
+            ("v5", TrackId::V5, 4), ("v6", TrackId::V6, 5),
+        ] {
+            assert!(track.is_video());
+            assert_eq!(serde_json::from_str::<TrackId>(&format!("\"{name}\"" )).unwrap(), track);
+            assert_eq!(serde_json::to_string(&track).unwrap(), format!("\"{name}\""));
+            assert_eq!(track.sort_index(), index);
+        }
+        assert_eq!(TrackId::A1.sort_index(), 6);
+        assert_eq!(TrackId::A6.sort_index(), 11);
+        assert!(!TrackId::A1.is_video());
     }
 
     #[test]

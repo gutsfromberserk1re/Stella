@@ -94,8 +94,21 @@ static float gPreviewDisplayedAt = -1.f;
 static bool  gTimelineScrubbing;
 static float gPreviewDebounce;
 static uint64_t gPreviewTaskId;
-/* Title image currently being read by the in-flight WGPU preview request.
-   Live text updates write to the other TGA slot to avoid a file-read race. */
+/* Small preview request window: finished frames are matched to the exact
+   playhead/resolution snapshot that produced them, even when requests finish
+   out of order on the preview workers. */
+#define STELLA_PREVIEW_REQUESTS 3
+typedef struct {
+    uint64_t id;
+    float at;
+    int resolution, fps;
+    double startedAt;
+    char textPath[1024];
+} StellaPreviewRequest;
+static StellaPreviewRequest gPreviewRequests[STELLA_PREVIEW_REQUESTS];
+static int gPreviewInFlightCount;
+/* Legacy mirror of the first protected title path; new code should use
+   PlutoPreviewPathInFlight(), which checks every outstanding request. */
 static char gPreviewTextPathInFlight[1024];
 static float gPreviewRequestAt;
 static int gPreviewRequestRes;
@@ -115,7 +128,7 @@ static double gPerfIntervalMedMs, gPerfIntervalP95Ms;
 static int    gPerfShownInWindow;
 static double gPerfRingDepth;
 static double gPerfPath, gPerfFallbackReason; /* path: 1 native GPU, 2 FFmpeg fallback */
-static double gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfPublishMs;
+static double gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfReadbackMs, gPerfPublishMs;
 static double gPerfHwDecode; /* 1 when the last shown frame came from a hardware decoder */
 static unsigned gPerfShownFrames, gPerfDiscardedFrames;
 
@@ -324,7 +337,7 @@ enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
 typedef struct {
     char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16];
     char transitionType[16];
-    int track, mediaIndex; /* 0..3 = video V1..V4, 4..9 = audio A1..A6 */
+    int track, mediaIndex; /* 0..5 = video V1..V6, 6..11 = audio A1..A6 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
     float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
     bool hasAudio, audioFadeIn, audioFadeOut;
@@ -348,10 +361,10 @@ static bool gTimelineContextConsumedClick;
 static int gTimelineContextClip = -1;
 static Vector2 gTimelineContextPos;
 static Rectangle gTimelineContextRect;
-#define TIMELINE_MAX_VIDEO_TRACKS 4
+#define TIMELINE_MAX_VIDEO_TRACKS 6
 #define TIMELINE_MAX_AUDIO_TRACKS 6
 static int gTimelineVideoTracks = 1, gTimelineAudioTracks = 0;
-static int gTimelineVideoTrackIds[TIMELINE_MAX_VIDEO_TRACKS] = {0, 0, 0, 0};
+static int gTimelineVideoTrackIds[TIMELINE_MAX_VIDEO_TRACKS] = {0};
 static float gTimelineAudioTrackVis[TIMELINE_MAX_AUDIO_TRACKS] = {0};
 static bool gTimelineAudioTrackWanted[TIMELINE_MAX_AUDIO_TRACKS] = {0};
 static int gTimelinePendingVideoTrack = -1;

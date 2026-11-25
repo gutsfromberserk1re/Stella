@@ -12,6 +12,7 @@ use decoder::{DecodedFrame, DecoderPool};
 use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
+    cell::Cell,
     ffi::{CStr, CString},
     hash::{Hash, Hasher},
     io::{Read, Write},
@@ -19,7 +20,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     process::{Child, ChildStdout, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
         Arc, Condvar, Mutex, OnceLock,
     },
@@ -35,10 +36,11 @@ struct Backend {
     redo: Mutex<Vec<Timeline>>,
     next_task: AtomicU64,
     task_tx: Sender<(u64, Value)>,
-    preview_task_tx: Sender<(u64, Value)>,
+    preview_task_txs: Vec<Sender<(u64, Value)>>,
+    preview_next_worker: AtomicU64,
     proxy_task_tx: Sender<(u64, Value)>,
     event_rx: Mutex<Receiver<String>>,
-    preview_inflight: Arc<AtomicBool>,
+    preview_inflight: Arc<AtomicUsize>,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
@@ -51,21 +53,31 @@ static PREVIEW_PATH: AtomicU64 = AtomicU64::new(0);
 /// Last WGPU preview failure reason: 0 = none, 4 = missing/empty source,
 /// 5 = decoder error, 6 = GPU composite error.
 static PREVIEW_FALLBACK_REASON: AtomicU64 = AtomicU64::new(0);
-static PREVIEW_COMPOSITE_US: AtomicU64 = AtomicU64::new(0);
-static PREVIEW_TRANSFER_US: AtomicU64 = AtomicU64::new(0);
-static PREVIEW_CONVERT_US: AtomicU64 = AtomicU64::new(0);
-static PREVIEW_PUBLISH_US: AtomicU64 = AtomicU64::new(0);
-fn note_wgpu_preview_failure(reason: u64, detail: impl Into<String>) -> Result<Option<(u32, u32, f64)>, String> {
+thread_local! {
+    // Per-preview-worker metrics: concurrent render workers must not overwrite
+    // each other's F3 telemetry between a frame finishing and its event publish.
+    static PREVIEW_COMPOSITE_US: Cell<u64> = const { Cell::new(0) };
+    static PREVIEW_TRANSFER_US: Cell<u64> = const { Cell::new(0) };
+    static PREVIEW_CONVERT_US: Cell<u64> = const { Cell::new(0) };
+    static PREVIEW_PUBLISH_US: Cell<u64> = const { Cell::new(0) };
+}
+fn note_wgpu_preview_failure(reason: u64, detail: impl Into<String>) -> Result<Option<PreviewRenderResult>, String> {
     PREVIEW_FALLBACK_REASON.store(reason, Ordering::Relaxed);
     Err(format!("WGPU preview failed (reason {reason}): {}. FFmpeg visual fallback is disabled to preserve preview/export consistency.", detail.into()))
 }
 static MEDIA_PROXIES: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
-static PREVIEW_FRAME: OnceLock<Mutex<PreviewFrame>> = OnceLock::new();
+static PREVIEW_FRAMES: OnceLock<Mutex<HashMap<u64, PreviewFrame>>> = OnceLock::new();
+static PREVIEW_FRAME_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+static TIMELINE_REVISION: AtomicU64 = AtomicU64::new(1);
 /// Latest timeline as an immutable `Arc`. Preview requests used to clone the
 /// whole timeline, serialize it to JSON on the UI thread, and re-parse it on the
 /// worker for *every frame*. Now the snapshot is rebuilt only when the timeline
 /// actually changed, and playback frames just clone the `Arc`.
-static PREVIEW_SNAPSHOT: OnceLock<Mutex<Option<Arc<Timeline>>>> = OnceLock::new();
+static PREVIEW_SNAPSHOT: OnceLock<Mutex<Option<(u64, Arc<Timeline>)>>> = OnceLock::new();
+
+const PREVIEW_WORKERS: usize = 2;
+const MAX_PREVIEW_IN_FLIGHT: usize = 3;
+const MAX_STORED_PREVIEW_FRAMES: usize = 8;
 
 struct PreviewFrame {
     request_id: u64,
@@ -73,10 +85,6 @@ struct PreviewFrame {
     height: u32,
     at: f64,
     pixels: Vec<u8>,
-}
-
-impl Default for PreviewFrame {
-    fn default() -> Self { Self { request_id: 0, width: 0, height: 0, at: 0.0, pixels: Vec::new() } }
 }
 
 struct PreviewStream {
@@ -160,14 +168,29 @@ struct DecodeSource {
     is_still_image: bool,
 }
 
-struct DecodeTask {
-    sources: Vec<DecodeSource>,
+struct ClipDecodeTask {
+    source: DecodeSource,
     fps: f64,
     /// Decode ahead only while the transport is playing (Yoru's worker idles
     /// when paused/scrubbing); look-ahead during a scrub only delays the next seek.
     prefetch: bool,
     /// Explicit frame-step (arrow keys): cache the frames before a seek target.
     stepping: bool,
+}
+
+struct DecodeTask {
+    sources: Vec<DecodeSource>,
+    fps: f64,
+    prefetch: bool,
+    stepping: bool,
+}
+
+struct ClipDecodeResult {
+    frame: DecodedFrame,
+    decode_ms: f64,
+    transfer_us: u64,
+    convert_us: u64,
+    prefetched_frames: usize,
 }
 
 struct DecodeBatch {
@@ -178,101 +201,167 @@ struct DecodeBatch {
     prefetched_frames: usize,
 }
 
-/// Yoru-style decode worker: FFmpeg decoder contexts stay on one dedicated
-/// thread, the current frame is returned immediately, then a small look-ahead
-/// (Yoru's VIDEO_QUEUE depth, 3 frames) is filled while the GPU compositor
-/// renders the current frame. Look-ahead runs only during playback.
-/// The request/reply channel is bounded so rapid seeks cannot build a backlog.
-struct DecodeAheadWorker {
-    requests: mpsc::SyncSender<DecodeTask>,
-    replies: Receiver<Result<DecodeBatch, String>>,
+/// Each active timeline clip owns a decoder thread and a small private work
+/// queue.  A preview frame dispatches all source requests first, then gathers
+/// their results, so independent video layers decode concurrently instead of
+/// waiting for one another on a single FFmpeg worker.
+struct ClipDecodeWorker {
+    requests: mpsc::SyncSender<ClipDecodeTask>,
+    replies: Receiver<Result<ClipDecodeResult, String>>,
 }
 
-impl DecodeAheadWorker {
-    fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::sync_channel::<DecodeTask>(1);
-        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<DecodeBatch, String>>(1);
+impl ClipDecodeWorker {
+    fn new(stream_key: String, shared_cache: Arc<Mutex<decoder::SharedFrameCache>>) -> Self {
+        let thread_suffix: String = stream_key.chars().take(12).collect();
+        let (request_tx, request_rx) = mpsc::sync_channel::<ClipDecodeTask>(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<ClipDecodeResult, String>>(1);
         thread::Builder::new()
-            .name("stella-decode-ahead".into())
-            .spawn(move || decode_ahead_loop(request_rx, reply_tx))
-            .expect("failed to start Stella decode-ahead worker");
+            .name(format!("stella-decode-{thread_suffix}"))
+            .spawn(move || clip_decode_loop(request_rx, reply_tx, shared_cache))
+            .expect("failed to start per-clip Stella decoder");
         Self { requests: request_tx, replies: reply_rx }
     }
-
-    fn decode(&self, task: DecodeTask) -> Result<DecodeBatch, String> {
-        self.requests.send(task).map_err(|_| "Stella decode worker stopped".to_owned())?;
-        self.replies.recv().map_err(|_| "Stella decode worker did not return a frame".to_owned())?
-    }
 }
 
-fn decode_ahead_loop(
-    requests: Receiver<DecodeTask>,
-    replies: mpsc::SyncSender<Result<DecodeBatch, String>>,
+fn clip_decode_loop(
+    requests: Receiver<ClipDecodeTask>,
+    replies: mpsc::SyncSender<Result<ClipDecodeResult, String>>,
+    shared_cache: Arc<Mutex<decoder::SharedFrameCache>>,
 ) {
-    let mut pool = DecoderPool::default();
-    let mut pending: Option<DecodeTask> = None;
+    // Every clip keeps an independent sequential decoder, while decoded pixels
+    // are shared in one bounded cache across clips and both render workers.
+    let mut pool = DecoderPool::with_shared_cache(shared_cache);
+    let mut pending: Option<ClipDecodeTask> = None;
     let mut prefetched_from_previous = 0usize;
     loop {
         let task = match pending.take() {
             Some(task) => task,
             None => match requests.recv() { Ok(task) => task, Err(_) => return },
         };
-
         decoder::begin_decode_timing();
-        let decode_started = Instant::now();
-        let current: Result<Vec<DecodedFrame>, String> = task.sources.iter()
-            .map(|source| {
-                if source.is_still_image {
-                    pool.still_frame(&source.path, source.max_width)
-                } else {
-                    pool.frame_at(&source.stream_key, &source.path, source.source_time, source.max_width, task.stepping)
-                }
-            })
-            .collect();
-        let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-        let (transfer_us, convert_us) = decoder::take_decode_timing();
-        let Ok(frames) = current else {
-            let error = current.err().unwrap_or_else(|| "Video frame decode failed".into());
-            if replies.send(Err(error)).is_err() { return; }
-            continue;
+        let started = Instant::now();
+        let current = if task.source.is_still_image {
+            pool.still_frame(&task.source.path, task.source.max_width)
+        } else {
+            pool.frame_at(&task.source.stream_key, &task.source.path, task.source.source_time,
+                          task.source.max_width, task.stepping)
         };
-
-        // Return the requested frame before look-ahead. The caller can composite
-        // and upload it while this worker advances FFmpeg and fills the frame cache.
-        if replies.send(Ok(DecodeBatch {
-            frames,
-            decode_ms,
-            transfer_us,
-            convert_us,
+        let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (transfer_us, convert_us) = decoder::take_decode_timing();
+        let frame = match current {
+            Ok(frame) => frame,
+            Err(error) => {
+                if replies.send(Err(error)).is_err() { return; }
+                continue;
+            }
+        };
+        if replies.send(Ok(ClipDecodeResult {
+            frame, decode_ms, transfer_us, convert_us,
             prefetched_frames: prefetched_from_previous,
-        })).is_err() {
-            return;
-        }
+        })).is_err() { return; }
+
+        // Keep this clip's decode queue warm independently. A newly queued seek
+        // always interrupts prefetch before more old frames are decoded.
         let mut prefetched = 0usize;
-        'prefetch: for step in 1..=PREFETCH_FRAMES {
-            if !task.prefetch { break; }
-            for source in &task.sources {
-                if source.is_still_image { continue; }
-                // Step in *source* frames (Yoru's queue counts decoded frames); at a 60 fps
-                // preview over 30 fps footage, timeline-fps steps only covered half as far.
-                let source_fps = pool.frame_rate_of(&source.path).unwrap_or(task.fps).max(1.0);
-                let ahead_seconds = step as f64 / source_fps;
-                // A new seek/playback request takes priority over warming old frames.
+        if task.prefetch && !task.source.is_still_image {
+            let source_fps = pool.frame_rate_of(&task.source.path).unwrap_or(task.fps).max(1.0);
+            'prefetch: for step in 1..=PREFETCH_FRAMES {
                 match requests.try_recv() {
                     Ok(next) => { pending = Some(next); break 'prefetch; }
                     Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => {}
                 }
-                if ahead_seconds >= source.remaining { continue; }
-                if pool.frame_at(&source.stream_key, &source.path, source.source_time + ahead_seconds, source.max_width, false).is_ok() {
+                let ahead_seconds = step as f64 / source_fps;
+                if ahead_seconds < task.source.remaining &&
+                    pool.frame_at(&task.source.stream_key, &task.source.path,
+                                  task.source.source_time + ahead_seconds,
+                                  task.source.max_width, false).is_ok() {
                     prefetched += 1;
                 }
             }
         }
-        // The bounded decode cache owns the actual frames. Report the warmed
-        // frame count with the next request; a fresh seek can interrupt this loop
-        // at any time without building a stale playback backlog.
         prefetched_from_previous = prefetched;
+    }
+}
+
+struct DecodeAheadWorker {
+    workers: HashMap<String, ClipDecodeWorker>,
+    worker_order: VecDeque<String>,
+    shared_cache: Arc<Mutex<decoder::SharedFrameCache>>,
+}
+
+impl DecodeAheadWorker {
+    fn new() -> Self {
+        Self {
+            workers: HashMap::new(),
+            worker_order: VecDeque::new(),
+            shared_cache: DecoderPool::new_shared_cache(128 * 1024 * 1024),
+        }
+    }
+
+    fn ensure_worker(&mut self, key: &str, active_keys: &[String]) {
+        if !self.workers.contains_key(key) {
+            // Six visible video layers plus transition handles normally fit in
+            // this budget. Evict only an inactive clip so its decoder thread and
+            // codec state cannot grow without bound on long editing sessions.
+            const MAX_CLIP_DECODER_WORKERS: usize = 18;
+            while self.workers.len() >= MAX_CLIP_DECODER_WORKERS {
+                let candidate = self.worker_order.iter().find(|old| !active_keys.iter().any(|active| active == *old)).cloned();
+                let Some(candidate) = candidate else { break; };
+                self.worker_order.retain(|old| old != &candidate);
+                self.workers.remove(&candidate);
+            }
+            self.workers.insert(key.to_owned(), ClipDecodeWorker::new(
+                key.to_owned(), Arc::clone(&self.shared_cache),
+            ));
+        }
+        self.worker_order.retain(|old| old != key);
+        self.worker_order.push_back(key.to_owned());
+    }
+
+    fn decode(&mut self, task: DecodeTask) -> Result<DecodeBatch, String> {
+        let active_keys: Vec<String> = task.sources.iter().map(|source| source.stream_key.clone()).collect();
+        let mut dispatched = Vec::with_capacity(task.sources.len());
+        let mut first_error: Option<String> = None;
+        for source in &task.sources {
+            self.ensure_worker(&source.stream_key, &active_keys);
+            let Some(worker) = self.workers.get(&source.stream_key) else {
+                first_error.get_or_insert_with(|| "Per-clip decoder worker was not created".to_owned());
+                continue;
+            };
+            if worker.requests.send(ClipDecodeTask {
+                source: source.clone(), fps: task.fps, prefetch: task.prefetch, stepping: task.stepping,
+            }).is_ok() {
+                dispatched.push(source.stream_key.clone());
+            } else {
+                first_error.get_or_insert_with(|| format!("Decoder worker for clip {} stopped", source.stream_key));
+            }
+        }
+
+        let mut frames_by_key = HashMap::with_capacity(dispatched.len());
+        let mut decode_ms = 0.0;
+        let mut transfer_us = 0u64;
+        let mut convert_us = 0u64;
+        let mut prefetched_frames = 0usize;
+        for key in &dispatched {
+            let result = self.workers.get(key).and_then(|worker| worker.replies.recv().ok());
+            match result {
+                Some(Ok(result)) => {
+                    decode_ms = decode_ms.max(result.decode_ms);
+                    transfer_us = transfer_us.saturating_add(result.transfer_us);
+                    convert_us = convert_us.saturating_add(result.convert_us);
+                    prefetched_frames += result.prefetched_frames;
+                    frames_by_key.insert(key.clone(), result.frame);
+                }
+                Some(Err(error)) => { first_error.get_or_insert(error); }
+                None => { first_error.get_or_insert_with(|| format!("Decoder worker for clip {key} did not return a frame")); }
+            }
+        }
+        if let Some(error) = first_error { return Err(error); }
+        let frames = task.sources.iter().map(|source| frames_by_key.remove(&source.stream_key)
+            .ok_or_else(|| format!("Decoded frame for clip {} was missing", source.stream_key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DecodeBatch { frames, decode_ms, transfer_us, convert_us, prefetched_frames })
     }
 }
 
@@ -281,38 +370,87 @@ const PREFETCH_FRAMES: usize = 3;
 
 struct PreviewEngine {
     stream: Option<PreviewStream>,
-    decoder_worker: DecodeAheadWorker,
+}
+
+enum PreviewRenderResult {
+    Published { width: u32, height: u32, at: f64, decode_ms: f64, ring_depth: usize },
+    Pending {
+        width: u32,
+        height: u32,
+        at: f64,
+        decode_ms: f64,
+        ring_depth: usize,
+        readback: Receiver<Result<Vec<u8>, String>>,
+    },
+}
+
+struct PendingPreview {
+    id: u64,
+    width: u32,
+    height: u32,
+    at: f64,
+    readback: Receiver<Result<Vec<u8>, String>>,
+    readback_started: Instant,
+    queue_ms: u64,
+    setup_ms: f64,
+    decode_ms: f64,
+    ring_depth: usize,
+    transfer_ms: f64,
+    convert_ms: f64,
+    composite_ms: f64,
+    started: Instant,
+    hardware: bool,
+    path: u64,
+    fallback_reason: u64,
 }
 
 impl Default for PreviewEngine {
-    fn default() -> Self {
-        Self { stream: None, decoder_worker: DecodeAheadWorker::new() }
+    fn default() -> Self { Self { stream: None } }
+}
+
+fn acquire_preview_buffer(buffer: &mut Vec<u8>) {
+    if buffer.capacity() != 0 { return; }
+    if let Some(pool) = PREVIEW_FRAME_POOL.get() {
+        if let Ok(mut pool) = pool.lock() {
+            if let Some(recycled) = pool.pop() { *buffer = recycled; }
+        }
     }
 }
 
-fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>, reuse_last: bool) -> Result<(), String> {
-    let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
-    let mut slot = slot.lock().map_err(|_| "Preview frame lock failed")?;
-    if !reuse_last {
-        slot.pixels.resize(pixels.len(), 0);
-        std::mem::swap(&mut slot.pixels, pixels);
+pub(crate) fn acquire_preview_vec() -> Vec<u8> {
+    let mut buffer = Vec::new();
+    acquire_preview_buffer(&mut buffer);
+    buffer
+}
+
+fn recycle_preview_buffer(mut buffer: Vec<u8>) {
+    buffer.clear();
+    let pool = PREVIEW_FRAME_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut pool) = pool.lock() {
+        if pool.len() < MAX_PREVIEW_IN_FLIGHT + 2 { pool.push(buffer); }
     }
-    slot.request_id = request_id;
-    slot.width = width;
-    slot.height = height;
-    slot.at = at;
+}
+
+fn publish_preview_buffer(request_id: u64, width: u32, height: u32, at: f64, pixels: &mut Vec<u8>) -> Result<(), String> {
+    let frames = PREVIEW_FRAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut frames = frames.lock().map_err(|_| "Preview frame lock failed")?;
+    let mut stored_pixels = Vec::new();
+    std::mem::swap(&mut stored_pixels, pixels);
+    frames.insert(request_id, PreviewFrame { request_id, width, height, at, pixels: stored_pixels });
+    while frames.len() > MAX_STORED_PREVIEW_FRAMES {
+        if let Some(oldest) = frames.keys().copied().min() {
+            if let Some(old) = frames.remove(&oldest) { recycle_preview_buffer(old.pixels); }
+        } else { break; }
+    }
     Ok(())
 }
 
 fn publish_black_frame(request_id: u64, width: u32, height: u32, at: f64) -> Result<(), String> {
-    let slot = PREVIEW_FRAME.get_or_init(|| Mutex::new(PreviewFrame::default()));
-    let mut slot = slot.lock().map_err(|_| "Preview frame lock failed")?;
-    slot.pixels.resize(width as usize * height as usize * 4, 0);
-    for pixel in slot.pixels.chunks_exact_mut(4) { pixel[3] = 255; }
-    slot.request_id = request_id;
-    slot.width = width;
-    slot.height = height;
-    slot.at = at;
+    let mut pixels = Vec::new();
+    acquire_preview_buffer(&mut pixels);
+    pixels.resize(width as usize * height as usize * 4, 0);
+    for pixel in pixels.chunks_exact_mut(4) { pixel[3] = 255; }
+    publish_preview_buffer(request_id, width, height, at, &mut pixels)?;
     Ok(())
 }
 
@@ -333,22 +471,34 @@ fn preview_source_path(clip: &Clip) -> String {
 fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
-        let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value)>();
         let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
         let (event_tx, event_rx) = mpsc::channel::<String>();
-        let preview_inflight = Arc::new(AtomicBool::new(false));
-        let preview_events = event_tx.clone();
-        let preview_worker_inflight = Arc::clone(&preview_inflight);
+        let preview_inflight = Arc::new(AtomicUsize::new(0));
+        let (preview_completion_tx, preview_completion_rx) = mpsc::channel::<PendingPreview>();
+        let completion_events = event_tx.clone();
+        let completion_inflight = Arc::clone(&preview_inflight);
+        thread::Builder::new()
+            .name("stella-preview-readback-completion".into())
+            .spawn(move || preview_completion_worker(preview_completion_rx, completion_events, completion_inflight))
+            .expect("failed to start Stella preview completion worker");
+        let mut preview_task_txs = Vec::with_capacity(PREVIEW_WORKERS);
+        for worker_index in 0..PREVIEW_WORKERS {
+            let (preview_task_tx, preview_task_rx) = mpsc::channel::<(u64, Value)>();
+            let preview_events = event_tx.clone();
+            let preview_worker_inflight = Arc::clone(&preview_inflight);
+            let completion_sender = preview_completion_tx.clone();
+            thread::Builder::new()
+                .name(format!("stella-preview-worker-{worker_index}"))
+                .spawn(move || preview_worker(preview_task_rx, preview_events, completion_sender, preview_worker_inflight))
+                .expect("failed to start Stella preview worker");
+            preview_task_txs.push(preview_task_tx);
+        }
         let proxy_events = event_tx.clone();
         let proxy_tasks = proxy_task_tx.clone();
         thread::Builder::new()
             .name("pluto-media-worker".into())
             .spawn(move || media_worker(task_rx, event_tx, proxy_tasks))
             .expect("failed to start Pluto media worker");
-        thread::Builder::new()
-            .name("stella-preview-worker".into())
-            .spawn(move || preview_worker(preview_task_rx, preview_events, preview_worker_inflight))
-            .expect("failed to start Stella preview worker");
         thread::Builder::new()
             .name("stella-proxy-worker".into())
             .spawn(move || proxy_worker(proxy_task_rx, proxy_events))
@@ -360,7 +510,8 @@ fn backend() -> &'static Backend {
             redo: Mutex::new(Vec::new()),
             next_task: AtomicU64::new(1),
             task_tx,
-            preview_task_tx,
+            preview_task_txs,
+            preview_next_worker: AtomicU64::new(0),
             proxy_task_tx,
             event_rx: Mutex::new(event_rx),
             preview_inflight,
@@ -403,35 +554,151 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, proxy_tas
     }
 }
 
-fn preview_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, preview_inflight: Arc<AtomicBool>) {
-    /* The preview process and its pipe are owned exclusively by this thread.
-       That gives FFmpeg one clear owner and keeps decode waits off the UI and
-       media-import/export workers. */
+fn preview_worker(
+    tasks: Receiver<(u64, Value)>,
+    events: Sender<String>,
+    completions: Sender<PendingPreview>,
+    preview_inflight: Arc<AtomicUsize>,
+) {
+    // The preview process and its pipe are owned exclusively by this thread.
+    // GPU readback is handed to the completion worker, so this thread can begin
+    // decoding the next frame as soon as the command buffer has been submitted.
     let mut engine = PreviewEngine::default();
     while let Ok((id, request)) = tasks.recv() {
         let queued_ms = request["submittedAtMs"].as_u64().unwrap_or(0);
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let queue_ms = now_ms.saturating_sub(queued_ms);
         let total_started = Instant::now();
-        let (result, setup_ms, decode_ms, ring_depth) = engine.render(&request, id);
-        preview_inflight.store(false, Ordering::Release);
-        let response = match result {
-            Ok((width, height, at)) => json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
-                "width":width,"height":height,"at":at,"queueMs":queue_ms,
-                "streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
-                "hwDecode":decoder::last_frame_was_hardware() as u8,
-                "path":PREVIEW_PATH.load(Ordering::Relaxed),"fallbackReason":PREVIEW_FALLBACK_REASON.load(Ordering::Relaxed),
-                "compositeMs":PREVIEW_COMPOSITE_US.load(Ordering::Relaxed) as f64/1000.0,
-                "publishMs":PREVIEW_PUBLISH_US.load(Ordering::Relaxed) as f64/1000.0,
-                "transferMs":PREVIEW_TRANSFER_US.load(Ordering::Relaxed) as f64/1000.0,
-                "convertMs":PREVIEW_CONVERT_US.load(Ordering::Relaxed) as f64/1000.0,
-                "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),"proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),"originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
-                "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
-            Err(error) => json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
-                "queueMs":queue_ms,"streamSetupMs":setup_ms,"decodeWaitMs":decode_ms,
-                "totalMs":total_started.elapsed().as_secs_f64()*1000.0}),
+        let rendered = match catch_unwind(AssertUnwindSafe(|| engine.render(&request, id))) {
+            Ok(rendered) => rendered,
+            Err(_) => Err("Preview worker recovered from an internal panic".to_owned()),
         };
-        if events.send(response.to_string()).is_err() { break; }
+        let transfer_ms = PREVIEW_TRANSFER_US.with(Cell::get) as f64 / 1000.0;
+        let convert_ms = PREVIEW_CONVERT_US.with(Cell::get) as f64 / 1000.0;
+        let composite_ms = PREVIEW_COMPOSITE_US.with(Cell::get) as f64 / 1000.0;
+        let hardware = decoder::last_frame_was_hardware();
+        let path = PREVIEW_PATH.load(Ordering::Relaxed);
+        let fallback_reason = PREVIEW_FALLBACK_REASON.load(Ordering::Relaxed);
+
+        match rendered {
+            Ok(PreviewRenderResult::Pending { width, height, at, decode_ms, ring_depth, readback }) => {
+                let pending = PendingPreview {
+                    id, width, height, at, readback, readback_started: Instant::now(),
+                    queue_ms, setup_ms: 0.0, decode_ms, ring_depth, transfer_ms, convert_ms,
+                    composite_ms, started: total_started, hardware, path,
+                    fallback_reason,
+                };
+                if completions.send(pending).is_err() {
+                    preview_inflight.fetch_sub(1, Ordering::AcqRel);
+                    let response = json!({"requestId":id,"command":"preview_frame","ok":false,
+                        "error":"Preview completion worker is unavailable","queueMs":queue_ms,
+                        "totalMs":total_started.elapsed().as_secs_f64()*1000.0});
+                    let _ = events.send(response.to_string());
+                }
+                // The in-flight counter is released only after pixels are mapped
+                // and the matching request event is published by the completion worker.
+                continue;
+            }
+            Ok(PreviewRenderResult::Published { width, height, at, decode_ms, ring_depth }) => {
+                preview_inflight.fetch_sub(1, Ordering::AcqRel);
+                let response = json!({"requestId":id,"frameId":id,"command":"preview_frame","ok":true,
+                    "width":width,"height":height,"at":at,"queueMs":queue_ms,
+                    "streamSetupMs":0.0,"decodeWaitMs":decode_ms,"ringDepth":ring_depth,
+                    "hwDecode":hardware as u8,"path":path,"fallbackReason":fallback_reason,
+                    "compositeMs":composite_ms,"publishMs":PREVIEW_PUBLISH_US.with(Cell::get) as f64/1000.0,
+                    "readbackMs":0.0,"transferMs":transfer_ms,"convertMs":convert_ms,
+                    "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),
+                    "proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),
+                    "originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
+                    "totalMs":total_started.elapsed().as_secs_f64()*1000.0});
+                if events.send(response.to_string()).is_err() { break; }
+            }
+            Err(error) => {
+                preview_inflight.fetch_sub(1, Ordering::AcqRel);
+                let response = json!({"requestId":id,"command":"preview_frame","ok":false,"error":error,
+                    "queueMs":queue_ms,"streamSetupMs":0.0,"decodeWaitMs":0.0,
+                    "totalMs":total_started.elapsed().as_secs_f64()*1000.0});
+                if events.send(response.to_string()).is_err() { break; }
+            }
+        }
+    }
+}
+
+fn preview_completion_worker(
+    tasks: Receiver<PendingPreview>,
+    events: Sender<String>,
+    preview_inflight: Arc<AtomicUsize>,
+) {
+    let mut pending = Vec::<PendingPreview>::with_capacity(MAX_PREVIEW_IN_FLIGHT);
+    let mut input_disconnected = false;
+
+    loop {
+        // Pull in every newly submitted GPU readback before polling completions.
+        // Receivers are checked independently, so one slow map cannot hold up a
+        // later request whose staging buffer has already become available.
+        loop {
+            match tasks.try_recv() {
+                Ok(task) => pending.push(task),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    input_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        let mut index = 0;
+        let mut completed_any = false;
+        while index < pending.len() {
+            let readback = match pending[index].readback.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Err("GPU readback worker disconnected".to_owned())
+                }
+            };
+
+            let task = pending.swap_remove(index);
+            let readback_ms = task.readback_started.elapsed().as_secs_f64() * 1000.0;
+            let response = match readback {
+                Ok(mut pixels) => {
+                    let publish_started = Instant::now();
+                    let published = publish_preview_buffer(task.id, task.width, task.height, task.at, &mut pixels);
+                    let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
+                    match published {
+                        Ok(()) => json!({"requestId":task.id,"frameId":task.id,"command":"preview_frame","ok":true,
+                            "width":task.width,"height":task.height,"at":task.at,"queueMs":task.queue_ms,
+                            "streamSetupMs":task.setup_ms,"decodeWaitMs":task.decode_ms,"ringDepth":task.ring_depth,
+                            "hwDecode":task.hardware as u8,"path":task.path,"fallbackReason":task.fallback_reason,
+                            "compositeMs":task.composite_ms,"publishMs":publish_ms,"readbackMs":readback_ms,
+                            "transferMs":task.transfer_ms,"convertMs":task.convert_ms,
+                            "restarts":PREVIEW_RESTARTS.load(Ordering::Relaxed),
+                            "proxyClips":PREVIEW_PROXY_CLIPS.load(Ordering::Relaxed),
+                            "originalClips":PREVIEW_ORIGINAL_CLIPS.load(Ordering::Relaxed),
+                            "totalMs":task.started.elapsed().as_secs_f64()*1000.0}),
+                        Err(error) => json!({"requestId":task.id,"command":"preview_frame","ok":false,
+                            "error":error,"queueMs":task.queue_ms,"readbackMs":readback_ms,
+                            "totalMs":task.started.elapsed().as_secs_f64()*1000.0}),
+                    }
+                }
+                Err(error) => json!({"requestId":task.id,"command":"preview_frame","ok":false,
+                    "error":error,"queueMs":task.queue_ms,"readbackMs":readback_ms,
+                    "totalMs":task.started.elapsed().as_secs_f64()*1000.0}),
+            };
+            let _ = events.send(response.to_string());
+            preview_inflight.fetch_sub(1, Ordering::AcqRel);
+            completed_any = true;
+        }
+
+        if input_disconnected && pending.is_empty() {
+            break;
+        }
+        if !completed_any {
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -1171,7 +1438,9 @@ fn render_wgpu_export_frame(
         decoded_frames.push(frame);
     }
 
-    let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
+    let export_indices: Vec<usize> = (0..decoded_frames.len()).collect();
+    let first_kept = first_visible_layer(&decoded_frames, &export_indices, &uniforms, width, height);
+    let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().skip(first_kept).map(|(index, clip)| {
         let frame = &decoded_frames[index];
         GpuLayerFrame {
             key: clip.id.as_str(),
@@ -1495,6 +1764,86 @@ fn start_preview_stream(timeline: &Timeline, width: u32, height: u32, fps: u32, 
     })
 }
 
+/// Returns true only when a decoded frame can provably hide every layer below
+/// it. Conditions are deliberately strict: alpha must be fully opaque, opacity
+/// must be 1, and no crop/distortion/transition may expose anything underneath.
+fn layer_fully_covers_canvas(frame: &DecodedFrame, uniforms: LayerUniforms, tw: u32, th: u32) -> bool {
+    if !frame.opaque || tw == 0 || th == 0 || frame.width == 0 || frame.height == 0 {
+        return false;
+    }
+    let epsilon = 0.0001_f32;
+    if uniforms.geo0[3] < 0.9999
+        || uniforms.transition[3].round() != 0.0
+        || uniforms.crop.iter().any(|value| value.abs() > epsilon)
+        || uniforms.distort.iter().any(|value| value.abs() > epsilon)
+        || uniforms.geo0[..3].iter().any(|value| !value.is_finite())
+        || uniforms.geo1[..2].iter().any(|value| !value.is_finite())
+        || uniforms.geo0[0] <= 0.0 || uniforms.geo0[1] <= 0.0
+    {
+        return false;
+    }
+
+    let target_w = tw as f32;
+    let target_h = th as f32;
+    let source_aspect = frame.width as f32 / frame.height as f32;
+    let target_aspect = target_w / target_h;
+    let (fit_w, fit_h) = if source_aspect > target_aspect {
+        (1.0, target_aspect / source_aspect)
+    } else {
+        (source_aspect / target_aspect, 1.0)
+    };
+    let layer_w = fit_w * target_w * uniforms.geo0[0];
+    let layer_h = fit_h * target_h * uniforms.geo0[1];
+    // Fragment coordinates are pixel centres, so keep a half-pixel safety
+    // margin to ensure the anti-aliased edge never lets a lower layer show.
+    let half_w = layer_w * 0.5 - 0.5;
+    let half_h = layer_h * 0.5 - 0.5;
+    if half_w <= 0.0 || half_h <= 0.0 {
+        return false;
+    }
+
+    let center_x = uniforms.geo1[0] * target_w;
+    let center_y = uniforms.geo1[1] * target_h;
+    let angle = uniforms.geo0[2];
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let screen_half_w = target_w * 0.5 - 0.5;
+    let screen_half_h = target_h * 0.5 - 0.5;
+    for sx in [-screen_half_w, screen_half_w] {
+        for sy in [-screen_half_h, screen_half_h] {
+            let dx = sx - center_x;
+            let dy = sy - center_y;
+            // Inverse rotation exactly matches preview.wgsl's layer transform.
+            let local_x = cos * dx + sin * dy;
+            let local_y = -sin * dx + cos * dy;
+            if local_x.abs() > half_w || local_y.abs() > half_h {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Layers are ordered bottom-to-top. The highest fully covering opaque layer
+/// makes every lower draw redundant, while preserving all layers above it.
+fn first_visible_layer(
+    decoded: &[DecodedFrame],
+    source_indices: &[usize],
+    uniforms: &[LayerUniforms],
+    tw: u32,
+    th: u32,
+) -> usize {
+    for index in (0..source_indices.len()).rev() {
+        let source_index = source_indices[index];
+        if let (Some(frame), Some(layer_uniforms)) = (decoded.get(source_index), uniforms.get(index)) {
+            if layer_fully_covers_canvas(frame, *layer_uniforms, tw, th) {
+                return index;
+            }
+        }
+    }
+    0
+}
+
 impl PreviewEngine {
     /// Sole visual preview path: decode video/still-image frames in-process,
     /// then evaluate all active transforms, colors, effects and transitions in WGPU.
@@ -1511,7 +1860,7 @@ impl PreviewEngine {
         stepping: bool,
         decode_ms: &mut f64,
         ring_depth: &mut usize,
-    ) -> Result<Option<(u32, u32, f64)>, String> {
+    ) -> Result<Option<PreviewRenderResult>, String> {
         // During an edit transition the incoming clip becomes a second GPU
         // layer before its timeline cut. The shader applies its transition mask;
         // the outgoing clip remains underneath, so no expensive FFmpeg graph is
@@ -1556,8 +1905,12 @@ impl PreviewEngine {
         // A gap is a valid native frame and should not start an FFmpeg process.
         if active.is_empty() {
             self.stream = None;
+            let publish_started = Instant::now();
             publish_black_frame(request_id, width, height, frame_at)?;
-            return Ok(Some((width, height, frame_at)));
+            PREVIEW_PUBLISH_US.with(|value| value.set(publish_started.elapsed().as_micros() as u64));
+            return Ok(Some(PreviewRenderResult::Published {
+                width, height, at: frame_at, decode_ms: *decode_ms, ring_depth: *ring_depth,
+            }));
         }
 
         // Keep compositing order stable for every layer. Within one track, the
@@ -1652,20 +2005,32 @@ impl PreviewEngine {
         }
 
         let source_paths: Vec<String> = sources.iter().map(|source| source.path.clone()).collect();
-        let batch = match self.decoder_worker.decode(DecodeTask {
-            sources,
-            fps: fps as f64,
-            prefetch: playing,
-            stepping,
-        }) {
-            Ok(batch) => batch,
-            Err(error) => {
-                return note_wgpu_preview_failure(5, format!("source decoding failed: {error}"));
+        // Both preview workers share one decoder coordinator. Each clip still
+        // owns a dedicated decode thread, but the two render workers no longer
+        // open duplicate FFmpeg contexts for the same clip or race its cursor.
+        // The coordinator lock is released before GPU composition/readback, so
+        // the next frame can decode while the previous frame is being presented.
+        let batch = {
+            static DECODERS: OnceLock<Mutex<DecodeAheadWorker>> = OnceLock::new();
+            let coordinator = DECODERS.get_or_init(|| Mutex::new(DecodeAheadWorker::new()));
+            let Ok(mut coordinator) = coordinator.lock() else {
+                return note_wgpu_preview_failure(5, "per-clip decoder coordinator lock failed");
+            };
+            match coordinator.decode(DecodeTask {
+                sources,
+                fps: fps as f64,
+                prefetch: playing,
+                stepping,
+            }) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    return note_wgpu_preview_failure(5, format!("source decoding failed: {error}"));
+                }
             }
         };
         *decode_ms = batch.decode_ms;
-        PREVIEW_TRANSFER_US.store(batch.transfer_us, Ordering::Relaxed);
-        PREVIEW_CONVERT_US.store(batch.convert_us, Ordering::Relaxed);
+        PREVIEW_TRANSFER_US.with(|value| value.set(batch.transfer_us));
+        PREVIEW_CONVERT_US.with(|value| value.set(batch.convert_us));
         let decoded = batch.frames;
         *ring_depth = batch.prefetched_frames;
         // Stable source-frame keys let the GPU keep one uploaded texture for
@@ -1679,7 +2044,8 @@ impl PreviewEngine {
                 format!("{}:{}:{}x{}", path, frame.pts_seconds.to_bits(), frame.width, frame.height)
             }
         }).collect();
-        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().map(|(index, clip)| {
+        let first_kept = first_visible_layer(&decoded, &source_indices, &layer_uniforms, width, height);
+        let layers: Vec<GpuLayerFrame<'_>> = active.iter().enumerate().skip(first_kept).map(|(index, clip)| {
             let frame = &decoded[source_indices[index]];
             GpuLayerFrame {
                 key: clip.id.as_str(),
@@ -1692,33 +2058,33 @@ impl PreviewEngine {
         }).collect();
 
         let composite_started = Instant::now();
-        let mut pixels = match GpuPreviewRenderer::composite_rgba(&layers, width, height) {
-            Ok(pixels) => pixels,
-            Err(error) => {
-                return note_wgpu_preview_failure(6, format!("GPU compositing failed: {error}"));
-            }
+        let readback = match GpuPreviewRenderer::composite_rgba_async(&layers, width, height) {
+            Ok(receiver) => receiver,
+            Err(error) => return note_wgpu_preview_failure(6, format!("GPU compositing submission failed: {error}")),
         };
-        PREVIEW_COMPOSITE_US.store(composite_started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        // Drop the old CLI stream once the native path has produced a frame.
+        PREVIEW_COMPOSITE_US.with(|value| value.set(composite_started.elapsed().as_micros() as u64));
+        // The command buffer owns the queued texture uploads now. Hand its
+        // readback receiver to the completion service and immediately return to
+        // the preview worker, which can start decoding the next request.
         self.stream = None;
-        let publish_started = Instant::now();
-        publish_preview_buffer(request_id, width, height, frame_at, &mut pixels, false)?;
-        PREVIEW_PUBLISH_US.store(publish_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         PREVIEW_PATH.store(1, Ordering::Relaxed);
         PREVIEW_FALLBACK_REASON.store(0, Ordering::Relaxed);
-        Ok(Some((width, height, frame_at)))
+        Ok(Some(PreviewRenderResult::Pending {
+            width, height, at: frame_at, decode_ms: *decode_ms, ring_depth: *ring_depth, readback,
+        }))
     }
 
-    fn render(&mut self, request: &Value, id: u64) -> (Result<(u32, u32, f64), String>, f64, f64, usize) {
-        let setup_ms = 0.0;
+    fn render(&mut self, request: &Value, id: u64) -> Result<PreviewRenderResult, String> {
         let mut decode_ms = 0.0;
-        PREVIEW_TRANSFER_US.store(0, Ordering::Relaxed);
-        PREVIEW_CONVERT_US.store(0, Ordering::Relaxed);
+        PREVIEW_TRANSFER_US.with(|value| value.set(0));
+        PREVIEW_CONVERT_US.with(|value| value.set(0));
+        PREVIEW_COMPOSITE_US.with(|value| value.set(0));
+        PREVIEW_PUBLISH_US.with(|value| value.set(0));
         let mut ring_depth = 0usize;
-        let result = (|| -> Result<(u32, u32, f64), String> {
+        let result = (|| -> Result<PreviewRenderResult, String> {
             let timeline: Arc<Timeline> = if request["useSnapshot"].as_bool() == Some(true) {
                 PREVIEW_SNAPSHOT.get()
-                    .and_then(|slot| slot.lock().ok().and_then(|slot| slot.clone()))
+                    .and_then(|slot| slot.lock().ok().and_then(|slot| slot.as_ref().map(|(_, timeline)| Arc::clone(timeline))))
                     .ok_or("Preview timeline snapshot is unavailable")?
             } else {
                 Arc::new(serde_json::from_value(request["timeline"].clone()).map_err(|e| format!("Invalid timeline: {e}"))?)
@@ -1743,7 +2109,7 @@ impl PreviewEngine {
             native.ok_or_else(|| "WGPU preview did not produce a frame; FFmpeg visual fallback is disabled".to_owned())
         })();
         if result.is_err() { self.stream = None; }
-        (result, setup_ms, decode_ms, ring_depth)
+        result
     }
 }
 
@@ -1754,7 +2120,7 @@ fn dispatch(request: Value) -> Result<Value, String> {
         .lock()
         .map_err(|_| "Timeline lock failed".to_owned())?;
     let command = request["command"].as_str().ok_or("Command is required")?;
-    match command {
+    let result = match command {
         "timeline_get" => serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()),
         "timeline_undo" => {
             let previous = backend.undo.lock().map_err(|_| "Undo history lock failed")?.pop()
@@ -2054,7 +2420,11 @@ fn dispatch(request: Value) -> Result<Value, String> {
             else { serde_json::to_value(timeline.clone()).map_err(|e| e.to_string()) }
         }
         _ => Err(format!("Unsupported command: {command}")),
+    };
+    if result.is_ok() && command != "timeline_get" {
+        TIMELINE_REVISION.fetch_add(1, Ordering::AcqRel);
     }
+    result
 }
 
 fn save_history(backend: &Backend, before: Timeline) -> Result<(), String> {
@@ -2200,7 +2570,16 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
         let command = request["command"].as_str().unwrap_or_default().to_owned();
         let is_preview = command == "preview_frame";
         if is_preview {
-            if backend.preview_inflight.swap(true, Ordering::AcqRel) { return 0; }
+            let mut current = backend.preview_inflight.load(Ordering::Acquire);
+            loop {
+                if current >= MAX_PREVIEW_IN_FLIGHT { return 0; }
+                match backend.preview_inflight.compare_exchange_weak(
+                    current, current + 1, Ordering::AcqRel, Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             request["submittedAtMs"] = json!(now_ms);
         }
@@ -2210,10 +2589,12 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
                     let slot = PREVIEW_SNAPSHOT.get_or_init(|| Mutex::new(None));
                     match slot.lock() {
                         Ok(mut slot) => {
-                            // Rebuild only when the timeline really changed; this is a plain
-                            // structural compare, with no serialization or allocation.
-                            if !slot.as_ref().is_some_and(|snapshot| **snapshot == *timeline) {
-                                *slot = Some(Arc::new(timeline.clone()));
+                            // Timeline edits bump a revision in dispatch. Playback frame
+                            // requests therefore use an O(1) version check instead of
+                            // walking every clip and property with structural equality.
+                            let revision = TIMELINE_REVISION.load(Ordering::Acquire);
+                            if !slot.as_ref().is_some_and(|(cached_revision, _)| *cached_revision == revision) {
+                                *slot = Some((revision, Arc::new(timeline.clone())));
                             }
                             true
                         }
@@ -2222,26 +2603,31 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
                 }
                 Err(_) => false,
             };
-            if !snapshot_ready { backend.preview_inflight.store(false, Ordering::Release); return 0; }
+            if !snapshot_ready { backend.preview_inflight.fetch_sub(1, Ordering::AcqRel); return 0; }
             request["useSnapshot"] = json!(true);
         } else if matches!(command.as_str(), "preview_frame" | "export_project") && request["timeline"].is_null() {
             let timeline = match backend.timeline.lock() {
                 Ok(timeline) => timeline.clone(),
-                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
+                Err(_) => { if is_preview { backend.preview_inflight.fetch_sub(1, Ordering::AcqRel); } return 0; }
             };
             request["timeline"] = match serde_json::to_value(timeline) {
                 Ok(value) => value,
-                Err(_) => { if is_preview { backend.preview_inflight.store(false, Ordering::Release); } return 0; }
+                Err(_) => { if is_preview { backend.preview_inflight.fetch_sub(1, Ordering::AcqRel); } return 0; }
             };
         }
         let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
-        let sender = if is_preview { &backend.preview_task_tx }
+        let preview_worker = if is_preview && !backend.preview_task_txs.is_empty() {
+            let index = backend.preview_next_worker.fetch_add(1, Ordering::Relaxed) as usize
+                % backend.preview_task_txs.len();
+            Some(&backend.preview_task_txs[index])
+        } else { None };
+        let sender = if is_preview { preview_worker.unwrap() }
             else if command == "generate_proxy" { &backend.proxy_task_tx }
             else { &backend.task_tx };
         if sender.send((id, request)).is_ok() {
             id
         } else {
-            if is_preview { backend.preview_inflight.store(false, Ordering::Release); }
+            if is_preview { backend.preview_inflight.fetch_sub(1, Ordering::AcqRel); }
             0
         }
     }))
@@ -2261,9 +2647,53 @@ pub extern "C" fn pluto_backend_poll() -> *mut c_char {
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Copies the newest raw preview frame into caller-owned memory. Returns 1 on
+/// Transfers ownership of a completed preview pixel buffer to the caller.
+/// `owner` is an opaque handle that must be returned to
+/// `pluto_backend_release_preview_pixels` after the synchronous texture upload.
+/// The pixel pointer remains valid until that release call.
+#[no_mangle]
+pub unsafe extern "C" fn pluto_backend_take_preview_frame(
+    request_id: u64,
+    pixels: *mut *const u8,
+    byte_len: *mut usize,
+    width: *mut u32,
+    height: *mut u32,
+    at: *mut f64,
+    owner: *mut *mut std::ffi::c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if pixels.is_null() || byte_len.is_null() || width.is_null() || height.is_null() ||
+            at.is_null() || owner.is_null() { return 0; }
+        let Some(frames) = PREVIEW_FRAMES.get() else { return 0; };
+        let Ok(mut frames) = frames.lock() else { return 0; };
+        let Some(frame) = frames.remove(&request_id) else { return 0; };
+        if frame.request_id != request_id || frame.pixels.is_empty() {
+            recycle_preview_buffer(frame.pixels);
+            return 0;
+        }
+        *width = frame.width;
+        *height = frame.height;
+        *at = frame.at;
+        *byte_len = frame.pixels.len();
+        let mut buffer = frame.pixels;
+        *pixels = buffer.as_ptr();
+        let boxed = Box::new(buffer);
+        *owner = Box::into_raw(boxed) as *mut std::ffi::c_void;
+        1
+    })).unwrap_or(0)
+}
+
+/// Releases a pixel buffer previously returned by `pluto_backend_take_preview_frame`.
+#[no_mangle]
+pub unsafe extern "C" fn pluto_backend_release_preview_pixels(owner: *mut std::ffi::c_void) {
+    if owner.is_null() { return; }
+    let buffer = Box::from_raw(owner as *mut Vec<u8>);
+    recycle_preview_buffer(*buffer);
+}
+
+/// Copies the requested raw preview frame into caller-owned memory. Returns 1 on
 /// success, -1 when the buffer is too small (required length is still written),
-/// and 0 when this frame is no longer available.
+/// and 0 when this frame is no longer available. Retained for ABI compatibility.
 #[no_mangle]
 pub unsafe extern "C" fn pluto_backend_copy_preview_frame(
     request_id: u64,
@@ -2276,15 +2706,19 @@ pub unsafe extern "C" fn pluto_backend_copy_preview_frame(
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if width.is_null() || height.is_null() || byte_len.is_null() || at.is_null() { return 0; }
-        let Some(slot) = PREVIEW_FRAME.get() else { return 0; };
-        let Ok(slot) = slot.lock() else { return 0; };
-        if slot.request_id != request_id || slot.pixels.is_empty() { return 0; }
-        *width = slot.width;
-        *height = slot.height;
-        *byte_len = slot.pixels.len();
-        *at = slot.at;
-        if destination.is_null() || capacity < slot.pixels.len() { return -1; }
-        std::ptr::copy_nonoverlapping(slot.pixels.as_ptr(), destination, slot.pixels.len());
+        let Some(frames) = PREVIEW_FRAMES.get() else { return 0; };
+        let Ok(mut frames) = frames.lock() else { return 0; };
+        let Some(frame) = frames.get(&request_id) else { return 0; };
+        if frame.request_id != request_id || frame.pixels.is_empty() { return 0; }
+        *width = frame.width;
+        *height = frame.height;
+        *byte_len = frame.pixels.len();
+        *at = frame.at;
+        if destination.is_null() || capacity < frame.pixels.len() { return -1; }
+        std::ptr::copy_nonoverlapping(frame.pixels.as_ptr(), destination, frame.pixels.len());
+        let completed = frames.remove(&request_id).expect("preview frame existed while locked");
+        drop(frames);
+        recycle_preview_buffer(completed.pixels);
         1
     })).unwrap_or(0)
 }
@@ -2516,6 +2950,43 @@ mod tests {
         let mut clip = test_clip("legacy-dip");
         clip.extra.insert("props".into(), json!({"transitionOut":{"type":"fadeblack","duration":0.6}}));
         assert_eq!(transition_out(&clip).map(|value| value.0), Some("dip".to_owned()));
+    }
+
+    #[test]
+    fn opaque_full_canvas_layer_safely_culls_lower_compositing_layers() {
+        let frame = DecodedFrame {
+            width: 1920,
+            height: 1080,
+            pts_seconds: 0.0,
+            rgba: Arc::new(Vec::new()),
+            opaque: true,
+        };
+        let mut uniforms = LayerUniforms::identity();
+        assert!(layer_fully_covers_canvas(&frame, uniforms, 1280, 720));
+
+        uniforms.geo0[0] = 0.75;
+        assert!(!layer_fully_covers_canvas(&frame, uniforms, 1280, 720));
+        uniforms = LayerUniforms::identity();
+        uniforms.geo0[3] = 0.85;
+        assert!(!layer_fully_covers_canvas(&frame, uniforms, 1280, 720));
+        uniforms = LayerUniforms::identity();
+        uniforms.transition[3] = 1.0;
+        assert!(!layer_fully_covers_canvas(&frame, uniforms, 1280, 720));
+        uniforms = LayerUniforms::identity();
+        uniforms.crop[0] = 0.01;
+        assert!(!layer_fully_covers_canvas(&frame, uniforms, 1280, 720));
+
+        let transparent = DecodedFrame { opaque: false, ..frame };
+        assert!(!layer_fully_covers_canvas(&transparent, LayerUniforms::identity(), 1280, 720));
+    }
+
+    #[test]
+    fn highest_opaque_cover_is_the_first_layer_kept() {
+        let opaque = DecodedFrame { width: 16, height: 9, pts_seconds: 0.0,
+            rgba: Arc::new(Vec::new()), opaque: true };
+        let decoded = vec![opaque.clone(), opaque.clone()];
+        let uniforms = vec![LayerUniforms::identity(), LayerUniforms::identity()];
+        assert_eq!(first_visible_layer(&decoded, &[0, 1], &uniforms, 1600, 900), 1);
     }
 
     #[test]

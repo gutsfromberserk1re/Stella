@@ -12,7 +12,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::UNIX_EPOCH,
 };
@@ -86,6 +86,13 @@ pub struct DecodedFrame {
     pub height: u32,
     pub pts_seconds: f64,
     pub rgba: Arc<Vec<u8>>,
+    /// Cached alpha classification lets the compositor safely skip layers
+    /// that are fully hidden beneath an opaque, full-canvas layer.
+    pub opaque: bool,
+}
+
+fn rgba_is_opaque(rgba: &[u8]) -> bool {
+    rgba.len() % 4 == 0 && rgba.chunks_exact(4).all(|pixel| pixel[3] == 255)
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -248,14 +255,18 @@ unsafe extern "C" fn select_hardware_pixel_format(
     }
 }
 
-/// Hardware decode is worth its GPU->CPU readback on large frames (1080p and
-/// up). Smaller sources decode fast enough in software. `STELLA_HWDEC=1|0`
-/// forces it on/off for A/B testing.
-fn hw_decode_wanted(coded_width: u32) -> bool {
+/// Hardware decode has a CPU readback cost, so default to it from 720p-class
+/// content rather than using a width-only 1920px threshold. The explicit
+/// environment override remains useful for driver-specific A/B testing.
+fn default_hw_decode_wanted(coded_width: u32, coded_height: u32) -> bool {
+    coded_width.saturating_mul(coded_height) >= 1280 * 720
+}
+
+fn hw_decode_wanted(coded_width: u32, coded_height: u32) -> bool {
     match std::env::var("STELLA_HWDEC").ok().as_deref() {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
-        _ => coded_width >= 1920,
+        _ => default_hw_decode_wanted(coded_width, coded_height),
     }
 }
 
@@ -327,13 +338,14 @@ impl VideoDecoder {
                 .map_err(|error| format!("Could not read video stream parameters: {error}"))?;
             // Frame-threaded decode lets FFmpeg parallelise H.264/HEVC across cores.
             context.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
-            let (coded_width, stream_color_space, stream_color_range) = unsafe {
+            let (coded_width, coded_height, stream_color_space, stream_color_range) = unsafe {
                 let codec_context = &*context.as_ptr();
-                (codec_context.width.max(0) as u32, codec_context.colorspace, codec_context.color_range)
+                (codec_context.width.max(0) as u32, codec_context.height.max(0) as u32,
+                 codec_context.colorspace, codec_context.color_range)
             };
             let mut hw_callback_state = None;
             let hw_configured = allow_hardware
-                && hw_decode_wanted(coded_width)
+                && hw_decode_wanted(coded_width, coded_height)
                 && configure_hardware_decoder(&mut context, &mut hw_callback_state);
             let decoder = match context.decoder().video() {
                 Ok(decoder) => decoder,
@@ -711,21 +723,30 @@ fn matrix_and_range(
 
 /// Split an RGBA image into row bands and fill them on all cores. Frames are converted
 /// on the decode worker, so this is what keeps 1080p decode-to-texture latency low.
-fn par_rows(rgba: &mut [u8], width: usize, height: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+fn par_rows(rgba: &mut [u8], width: usize, height: usize, f: impl Fn(usize, &mut [u8]) + Send + Sync) {
+    use rayon::prelude::*;
     let row_bytes = width * 4;
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(height.max(1));
     if threads <= 1 || height < 96 {
         for (y, row) in rgba.chunks_exact_mut(row_bytes).enumerate() { f(y, row); }
         return;
     }
-    let rows_per = (height + threads - 1) / threads;
-    std::thread::scope(|scope| {
-        for (band, chunk) in rgba.chunks_mut(rows_per * row_bytes).enumerate() {
-            let f = &f;
-            scope.spawn(move || {
-                for (i, row) in chunk.chunks_exact_mut(row_bytes).enumerate() { f(band * rows_per + i, row); }
-            });
-        }
+    // Rayon owns one persistent bounded pool. The previous implementation
+    // created and joined up to eight OS threads for every decoded frame/layer.
+    // Reusing the pool avoids that per-frame thread churn while retaining the
+    // same row-parallel conversion and deterministic output.
+    static ROW_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = ROW_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("stella-pixel-{index}"))
+            .build()
+            .expect("failed to create Stella pixel conversion pool")
+    });
+    pool.install(|| {
+        rgba.par_chunks_exact_mut(row_bytes)
+            .enumerate()
+            .for_each(|(y, row)| f(y, row));
     });
 }
 
@@ -893,6 +914,7 @@ fn decode_uncompressed_tga(path: &str, max_width: u32, revision: i64) -> Result<
         // Still-image timestamps are otherwise unused. Carry the file revision
         // here so the WGPU source cache sees a changed title at the same path.
         pts_seconds: revision.max(0) as f64 / 1_000_000_000.0,
+        opaque: rgba_is_opaque(&rgba),
         rgba: Arc::new(rgba),
     }))
 }
@@ -989,26 +1011,96 @@ fn convert_frame_to_rgba(
         other => return Err(format!("Preview decoder does not yet convert pixel format {other:?}. Try generating a compatible proxy (8-bit RGB/YUV or supported 9/10/12/16-bit planar YUV and P010).")),
     }
 
-    Ok(DecodedFrame { width: out_width, height: out_height, pts_seconds, rgba: Arc::new(rgba) })
+    let opaque = rgba_is_opaque(&rgba);
+    Ok(DecodedFrame { width: out_width, height: out_height, pts_seconds, rgba: Arc::new(rgba), opaque })
 }
 
-#[derive(Default)]
-pub struct DecoderPool {
-    // Keep an independent sequential decoder per timeline clip. Several clips
-    // can point at the same media file while sampling different source-time
-    // ranges; a single path-keyed decoder would seek backwards/forwards between
-    // those ranges on every preview frame.
-    decoders: HashMap<String, VideoDecoder>,
-    decoder_order: VecDeque<String>,
-    frame_rates: HashMap<String, f64>,
-    // Decoded pixels remain shared by media path + source frame + output size,
-    // even when different clip-specific decoder contexts produce them.
+/// Thread-safe, bounded pixel cache shared by all per-clip decoder threads.
+/// Cache identity is media path + source frame index + output width, so clips
+/// that reference the same source frame reuse one Arc-backed RGBA allocation.
+pub struct SharedFrameCache {
     frames: HashMap<FrameKey, DecodedFrame>,
     frame_order: VecDeque<FrameKey>,
     cached_bytes: usize,
+    cache_budget_bytes: usize,
+}
+
+impl SharedFrameCache {
+    fn with_budget(cache_budget_bytes: usize) -> Self {
+        Self {
+            frames: HashMap::new(),
+            frame_order: VecDeque::new(),
+            cached_bytes: 0,
+            cache_budget_bytes: cache_budget_bytes.max(4 * 1024 * 1024),
+        }
+    }
+
+    fn insert(&mut self, key: FrameKey, frame: &DecodedFrame) {
+        if self.frames.contains_key(&key) { return; }
+        self.cached_bytes += frame.rgba.len();
+        self.frames.insert(key.clone(), frame.clone());
+        self.frame_order.push_back(key);
+        while self.cached_bytes > self.cache_budget_bytes {
+            let Some(oldest) = self.frame_order.pop_front() else { break; };
+            if let Some(removed) = self.frames.remove(&oldest) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(removed.rgba.len());
+            }
+        }
+    }
+
+    fn get(&mut self, key: &FrameKey) -> Option<DecodedFrame> {
+        let frame = self.frames.get(key).cloned();
+        if frame.is_some() {
+            if let Some(index) = self.frame_order.iter().position(|item| item == key) {
+                self.frame_order.remove(index);
+            }
+            self.frame_order.push_back(key.clone());
+        }
+        frame
+    }
+
+    fn closest_before(&self, path: &str, max_width: u32, frame_index: i64) -> Option<DecodedFrame> {
+        self.frames.iter()
+            .filter(|(key, _)| key.path == path && key.max_width == max_width && key.index <= frame_index)
+            .max_by_key(|(key, _)| key.index)
+            .map(|(_, frame)| frame.clone())
+    }
+}
+
+pub struct DecoderPool {
+    // Each timeline clip owns an independent sequential FFmpeg decoder so
+    // clips with different source offsets never fight over one read cursor.
+    decoders: HashMap<String, VideoDecoder>,
+    decoder_order: VecDeque<String>,
+    frame_rates: HashMap<String, f64>,
+    // Pixel cache is shared independently of the sequential decoder contexts.
+    shared_frames: Arc<Mutex<SharedFrameCache>>,
+}
+
+impl Default for DecoderPool {
+    fn default() -> Self { Self::with_cache_budget(MAX_CACHED_FRAME_BYTES) }
 }
 
 impl DecoderPool {
+    /// Creates an isolated cache. Export uses the larger default budget, while
+    /// preview creates one shared cache and injects it into each clip worker.
+    pub fn with_cache_budget(cache_budget_bytes: usize) -> Self {
+        Self::with_shared_cache(Arc::new(Mutex::new(SharedFrameCache::with_budget(cache_budget_bytes))))
+    }
+
+    pub fn new_shared_cache(cache_budget_bytes: usize) -> Arc<Mutex<SharedFrameCache>> {
+        Arc::new(Mutex::new(SharedFrameCache::with_budget(cache_budget_bytes)))
+    }
+
+    pub fn with_shared_cache(shared_frames: Arc<Mutex<SharedFrameCache>>) -> Self {
+        Self {
+            decoders: HashMap::new(),
+            decoder_order: VecDeque::new(),
+            frame_rates: HashMap::new(),
+            shared_frames,
+        }
+    }
+
     fn remember_decoder(&mut self, stream_key: &str, path: &str, decoder: VideoDecoder) {
         self.frame_rates.insert(path.to_owned(), decoder.frame_rate);
         self.decoders.insert(stream_key.to_owned(), decoder);
@@ -1026,18 +1118,13 @@ impl DecoderPool {
         self.frame_rates.get(path).copied()
     }
 
-    /// Insert one frame into the bounded cache (no-op if already present).
+    /// Insert one frame into the shared bounded cache (no-op if already present).
     fn cache_insert(&mut self, key: FrameKey, frame: &DecodedFrame) {
-        if self.frames.contains_key(&key) { return; }
-        self.cached_bytes += frame.rgba.len();
-        self.frames.insert(key.clone(), frame.clone());
-        self.frame_order.push_back(key);
-        while self.cached_bytes > MAX_CACHED_FRAME_BYTES {
-            let Some(oldest) = self.frame_order.pop_front() else { break; };
-            if let Some(removed) = self.frames.remove(&oldest) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(removed.rgba.len());
-            }
-        }
+        if let Ok(mut cache) = self.shared_frames.lock() { cache.insert(key, frame); }
+    }
+
+    fn cache_get(&self, key: &FrameKey) -> Option<DecodedFrame> {
+        self.shared_frames.lock().ok()?.get(key)
     }
 
     /// Load and cache the first frame of a still image for WGPU compositing.
@@ -1051,25 +1138,21 @@ impl DecoderPool {
         let modified_ns = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let revision = modified_ns.min(i64::MAX as u128) as i64;
 
-        // A live title reuses one of two stable paths. Drop only stale versions
-        // of that path so editing never accumulates old title textures in cache.
-        let stale: Vec<FrameKey> = self.frames.keys()
-            .filter(|key| key.path == path && key.max_width == max_width && key.index != revision)
-            .cloned().collect();
-        for stale_key in stale {
-            if let Some(frame) = self.frames.remove(&stale_key) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(frame.rgba.len());
-            }
-        }
-        self.frame_order.retain(|key| key.path != path || key.max_width != max_width || key.index == revision);
-
         let key = FrameKey { path: path.to_owned(), index: revision, max_width };
-        if let Some(frame) = self.frames.get(&key).cloned() {
-            if let Some(index) = self.frame_order.iter().position(|item| item == &key) {
-                self.frame_order.remove(index);
+        {
+            let mut cache = self.shared_frames.lock().map_err(|_| "Shared frame cache lock failed")?;
+            // A live title reuses stable paths. Remove stale revisions for this
+            // path/width without disturbing another still image's cache entries.
+            let stale: Vec<FrameKey> = cache.frames.keys()
+                .filter(|key| key.path == path && key.max_width == max_width && key.index != revision)
+                .cloned().collect();
+            for stale_key in stale {
+                if let Some(frame) = cache.frames.remove(&stale_key) {
+                    cache.cached_bytes = cache.cached_bytes.saturating_sub(frame.rgba.len());
+                }
             }
-            self.frame_order.push_back(key);
-            return Ok(frame);
+            cache.frame_order.retain(|item| item.path != path || item.max_width != max_width || item.index == revision);
+            if let Some(frame) = cache.get(&key) { return Ok(frame); }
         }
 
         let frame = match decode_uncompressed_tga(path, max_width, revision)? {
@@ -1077,7 +1160,6 @@ impl DecoderPool {
             None => {
                 let mut decoder = VideoDecoder::open_with(path, max_width, false)?;
                 let mut frame = decoder.decode_first_frame()?;
-                // Include file revision in the GPU key for all image formats.
                 frame.pts_seconds = revision.max(0) as f64 / 1_000_000_000.0;
                 frame
             }
@@ -1087,13 +1169,10 @@ impl DecoderPool {
     }
 
     /// `stream_key` is normally the timeline clip ID. It keeps the decoder's
-    /// read head aligned with that clip's own source-time progression. The
-    /// pixel cache is still global to the underlying file, so exact duplicate
-    /// source-frame requests are shared without a second decode.
+    /// read head aligned with that clip's own source-time progression. Decoded
+    /// frames are shared by media path/frame/width across all clip workers.
     pub fn frame_at(&mut self, stream_key: &str, path: &str, seconds: f64, max_width: u32, stepping: bool) -> Result<DecodedFrame, String> {
         let max_width = max_width.max(2) & !1;
-        // Obtain stream metadata once per underlying file. Opening this clip's
-        // own decoder below does not need to repeat metadata discovery.
         let frame_rate = if let Some(rate) = self.frame_rates.get(path).copied() {
             rate
         } else {
@@ -1104,11 +1183,7 @@ impl DecoderPool {
         };
         let frame_index = (seconds.max(0.0) * frame_rate).round() as i64;
         let key = FrameKey { path: path.to_owned(), index: frame_index, max_width };
-        if let Some(frame) = self.frames.get(&key).cloned() {
-            if let Some(index) = self.frame_order.iter().position(|item| item == &key) {
-                self.frame_order.remove(index);
-            }
-            self.frame_order.push_back(key);
+        if let Some(frame) = self.cache_get(&key) {
             if self.decoders.contains_key(stream_key) {
                 self.decoder_order.retain(|item| item != stream_key);
                 self.decoder_order.push_back(stream_key.to_owned());
@@ -1132,25 +1207,21 @@ impl DecoderPool {
         let decode_result = {
             let decoder = self.decoders.get_mut(stream_key)
                 .ok_or("Video decoder cache lost its clip stream")?;
-            // Output width can change with animated scale or preview quality. It is
-            // a conversion setting, not codec state, so update it without reopening
-            // the FFmpeg input/decoder context.
-            decoder.max_width = max_width;
+            // Output width changes are a conversion setting, not codec state.
+            // Force a seek at this timestamp so a width-change cache miss never
+            // accidentally reads the following source frame.
+            if decoder.max_width != max_width {
+                decoder.max_width = max_width;
+                decoder.cursor_seconds = -1.0;
+            }
             decoder.decode_at(seconds, stepping)
         };
         let (decoded, history) = match decode_result {
             Ok(result) => result,
             Err(error) if error.starts_with("No decoded video frame at") &&
                 self.decoders.get(stream_key).is_some_and(|decoder| decoder.decoder_eof) => {
-                // Hold the closest already-decoded source frame when a clip's
-                // source is shorter than its timeline duration. This is normal
-                // EOF behavior, not a reason to fail the WGPU preview request.
-                // The cached pixels are still consumed exclusively by WGPU.
-                let held = self.frames.iter()
-                    .filter(|(cached_key, _)| cached_key.path == path &&
-                        cached_key.max_width == max_width && cached_key.index <= frame_index)
-                    .max_by_key(|(cached_key, _)| cached_key.index)
-                    .map(|(_, frame)| frame.clone());
+                let held = self.shared_frames.lock().ok()
+                    .and_then(|cache| cache.closest_before(path, max_width, frame_index));
                 match held {
                     Some(frame) => (frame, Vec::new()),
                     None => return Err(error),
@@ -1158,7 +1229,6 @@ impl DecoderPool {
             }
             Err(error) => return Err(error),
         };
-        // History first so the requested frame ends up most-recently-used.
         for earlier in &history {
             let index = (earlier.pts_seconds.max(0.0) * frame_rate).round() as i64;
             if index != frame_index {
@@ -1186,6 +1256,7 @@ mod thumbnail_tests {
             height: 1,
             pts_seconds: 0.0,
             rgba: Arc::new(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+            opaque: true,
         };
         let resized = resize_rgba_fit(&source, 4, 4).expect("thumbnail resize");
         assert_eq!(resized.len(), 4 * 4 * 4);
@@ -1288,6 +1359,24 @@ mod still_image_tests {
     }
 
     #[test]
+    fn clip_decoder_pools_share_the_bounded_decoded_frame_cache() {
+        let shared = DecoderPool::new_shared_cache(8 * 1024 * 1024);
+        let mut first_pool = DecoderPool::with_shared_cache(Arc::clone(&shared));
+        let second_pool = DecoderPool::with_shared_cache(shared);
+        let key = FrameKey { path: "shared.mp4".into(), index: 42, max_width: 640 };
+        let original = DecodedFrame {
+            width: 640,
+            height: 360,
+            pts_seconds: 1.4,
+            rgba: Arc::new(vec![7u8; 640 * 360 * 4]),
+            opaque: false,
+        };
+        first_pool.cache_insert(key.clone(), &original);
+        let reused = second_pool.cache_get(&key).expect("second clip pool sees shared frame");
+        assert!(Arc::ptr_eq(&original.rgba, &reused.rgba));
+    }
+
+    #[test]
     fn title_tga_decodes_as_rgba_without_ffmpeg() {
         let path = std::env::temp_dir().join(format!(
             "stella-title-tga-{}.tga", std::process::id()
@@ -1308,5 +1397,25 @@ mod still_image_tests {
         assert_eq!(&frame.rgba[..], &[10, 20, 30, 40, 50, 60, 70, 80]);
         assert_eq!(frame.pts_seconds, 123.0 / 1_000_000_000.0);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+
+#[cfg(test)]
+mod hardware_decode_policy_tests {
+    use super::{default_hw_decode_wanted, rgba_is_opaque};
+
+    #[test]
+    fn default_hardware_decode_threshold_uses_pixel_count() {
+        assert!(default_hw_decode_wanted(1280, 720));
+        assert!(default_hw_decode_wanted(1920, 540));
+        assert!(!default_hw_decode_wanted(960, 540));
+    }
+
+    #[test]
+    fn alpha_classification_is_conservative() {
+        assert!(rgba_is_opaque(&[10, 20, 30, 255, 1, 2, 3, 255]));
+        assert!(!rgba_is_opaque(&[10, 20, 30, 254]));
+        assert!(!rgba_is_opaque(&[1, 2, 3]));
     }
 }

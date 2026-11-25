@@ -160,14 +160,201 @@ static void TimelineHistoryAction(bool redo) {
 typedef struct {
     char clipId[64];
     char path[1024];
+    uint64_t clipHash;
+    uint64_t pathHash;
     Music music;
     bool loaded;
+    bool loading;
     bool failed;
     bool wasActive;
 } StellaAudioVoice;
 static StellaAudioVoice gAudioVoices[STELLA_AUDIO_VOICES];
 static bool gAudioReady;
 static float gAudioMixHeadroom = 1.f;
+/* The first active audio stream acts as the transport master. Video-only
+   timelines continue to use the monotonic wall clock as their fallback. */
+static bool gAudioClockValid;
+static float gAudioClockPlayhead;
+static double gAudioClockUpdatedAt;
+
+static uint64_t StellaAudioHash(const char *text) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    if (!text) return hash;
+    while (*text) {
+        hash ^= (uint8_t)*text++;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+#if defined(_WIN32)
+#define STELLA_AUDIO_LOAD_QUEUE_CAPACITY 64
+typedef struct {
+    int slot;
+    uint64_t clipHash;
+    uint64_t pathHash;
+    char path[1024];
+    char fallbackPath[1024];
+} StellaAudioLoadRequest;
+typedef struct StellaAudioLoadResultNode {
+    int slot;
+    uint64_t clipHash;
+    uint64_t pathHash;
+    Music music;
+    char resolvedPath[1024];
+    bool success;
+    struct StellaAudioLoadResultNode *next;
+} StellaAudioLoadResultNode;
+static CRITICAL_SECTION gAudioStateLock;
+static CRITICAL_SECTION gAudioLoadLock;
+static CONDITION_VARIABLE gAudioLoadCondition;
+static bool gAudioWorkersReady;
+static volatile LONG gAudioWorkersStop;
+static HANDLE gAudioLoaderThread;
+static HANDLE gAudioPumpThread;
+static StellaAudioLoadRequest gAudioLoadQueue[STELLA_AUDIO_LOAD_QUEUE_CAPACITY];
+static unsigned gAudioLoadRead;
+static unsigned gAudioLoadCount;
+static StellaAudioLoadResultNode *gAudioLoadResultsHead;
+static StellaAudioLoadResultNode *gAudioLoadResultsTail;
+
+static bool AudioQueueLoadRequest(const StellaAudioLoadRequest *request) {
+    bool queued = false;
+    EnterCriticalSection(&gAudioLoadLock);
+    if (gAudioLoadCount < STELLA_AUDIO_LOAD_QUEUE_CAPACITY && !InterlockedCompareExchange(&gAudioWorkersStop, 0, 0)) {
+        unsigned write = (gAudioLoadRead + gAudioLoadCount) % STELLA_AUDIO_LOAD_QUEUE_CAPACITY;
+        gAudioLoadQueue[write] = *request;
+        gAudioLoadCount++;
+        queued = true;
+        WakeConditionVariable(&gAudioLoadCondition);
+    }
+    LeaveCriticalSection(&gAudioLoadLock);
+    return queued;
+}
+
+static DWORD WINAPI AudioLoaderThreadProc(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        StellaAudioLoadRequest request;
+        EnterCriticalSection(&gAudioLoadLock);
+        while (gAudioLoadCount == 0 && !InterlockedCompareExchange(&gAudioWorkersStop, 0, 0))
+            SleepConditionVariableCS(&gAudioLoadCondition, &gAudioLoadLock, INFINITE);
+        if (InterlockedCompareExchange(&gAudioWorkersStop, 0, 0)) {
+            LeaveCriticalSection(&gAudioLoadLock);
+            break;
+        }
+        request = gAudioLoadQueue[gAudioLoadRead];
+        gAudioLoadRead = (gAudioLoadRead + 1) % STELLA_AUDIO_LOAD_QUEUE_CAPACITY;
+        gAudioLoadCount--;
+        LeaveCriticalSection(&gAudioLoadLock);
+
+        /* File opening and decoder setup happen on this worker, not in the
+           render/UI loop. The fallback path is attempted by the same worker. */
+        Music music = LoadMusicStream(request.path);
+        char resolved[1024] = {0};
+        snprintf(resolved, sizeof(resolved), "%s", request.path);
+        if (!music.stream.buffer && request.fallbackPath[0]) {
+            music = LoadMusicStream(request.fallbackPath);
+            if (music.stream.buffer) snprintf(resolved, sizeof(resolved), "%s", request.fallbackPath);
+        }
+
+        StellaAudioLoadResultNode *result = (StellaAudioLoadResultNode *)calloc(1, sizeof(*result));
+        if (!result) {
+            if (music.stream.buffer) UnloadMusicStream(music);
+            continue;
+        }
+        result->slot = request.slot;
+        result->clipHash = request.clipHash;
+        result->pathHash = request.pathHash;
+        result->music = music;
+        result->success = music.stream.buffer != NULL;
+        snprintf(result->resolvedPath, sizeof(result->resolvedPath), "%s", resolved);
+
+        EnterCriticalSection(&gAudioLoadLock);
+        if (gAudioLoadResultsTail) gAudioLoadResultsTail->next = result;
+        else gAudioLoadResultsHead = result;
+        gAudioLoadResultsTail = result;
+        LeaveCriticalSection(&gAudioLoadLock);
+    }
+    return 0;
+}
+
+static DWORD WINAPI AudioPumpThreadProc(LPVOID unused) {
+    (void)unused;
+    while (!InterlockedCompareExchange(&gAudioWorkersStop, 0, 0)) {
+        if (TryEnterCriticalSection(&gAudioStateLock)) {
+            if (gAudioReady && IsAudioDeviceReady()) {
+                for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
+                    StellaAudioVoice *voice = &gAudioVoices[i];
+                    if (voice->loaded && IsMusicStreamPlaying(voice->music))
+                        UpdateMusicStream(voice->music);
+                }
+            }
+            LeaveCriticalSection(&gAudioStateLock);
+        }
+        Sleep(5);
+    }
+    return 0;
+}
+
+static void AudioCollectLoadResultsLocked(void) {
+    EnterCriticalSection(&gAudioLoadLock);
+    StellaAudioLoadResultNode *results = gAudioLoadResultsHead;
+    gAudioLoadResultsHead = gAudioLoadResultsTail = NULL;
+    LeaveCriticalSection(&gAudioLoadLock);
+
+    while (results) {
+        StellaAudioLoadResultNode *next = results->next;
+        if (results->slot >= 0 && results->slot < STELLA_AUDIO_VOICES) {
+            StellaAudioVoice *voice = &gAudioVoices[results->slot];
+            if (voice->loading && voice->clipHash == results->clipHash && voice->pathHash == results->pathHash) {
+                voice->loading = false;
+                if (results->success) {
+                    voice->music = results->music;
+                    voice->loaded = true;
+                    voice->failed = false;
+                    /* Keep path/pathHash as the requested clip identity. The
+                       resolved path may be a fallback only; changing identity
+                       here would requeue the proxy on the next UI tick. */
+                    SetMusicVolume(voice->music, 0.f);
+                } else {
+                    voice->failed = true;
+                    voice->wasActive = true;
+                    snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio stream could not be opened: %.160s", voice->path);
+                }
+            } else if (results->success) {
+                /* The clip was removed/replaced while loading. Dispose of the
+                   now-unreferenced stream on the UI/audio-state owner. */
+                UnloadMusicStream(results->music);
+            }
+        } else if (results->success) {
+            UnloadMusicStream(results->music);
+        }
+        free(results);
+        results = next;
+    }
+}
+
+static bool AudioPlaybackStartWorkers(void) {
+    InitializeCriticalSection(&gAudioStateLock);
+    InitializeCriticalSection(&gAudioLoadLock);
+    InitializeConditionVariable(&gAudioLoadCondition);
+    InterlockedExchange(&gAudioWorkersStop, 0);
+    gAudioLoaderThread = CreateThread(NULL, 0, AudioLoaderThreadProc, NULL, 0, NULL);
+    gAudioPumpThread = CreateThread(NULL, 0, AudioPumpThreadProc, NULL, 0, NULL);
+    if (!gAudioLoaderThread || !gAudioPumpThread) {
+        InterlockedExchange(&gAudioWorkersStop, 1);
+        WakeAllConditionVariable(&gAudioLoadCondition);
+        if (gAudioLoaderThread) { WaitForSingleObject(gAudioLoaderThread, INFINITE); CloseHandle(gAudioLoaderThread); gAudioLoaderThread = NULL; }
+        if (gAudioPumpThread) { WaitForSingleObject(gAudioPumpThread, INFINITE); CloseHandle(gAudioPumpThread); gAudioPumpThread = NULL; }
+        DeleteCriticalSection(&gAudioLoadLock);
+        DeleteCriticalSection(&gAudioStateLock);
+        return false;
+    }
+    gAudioWorkersReady = true;
+    return true;
+}
+#endif
 
 static void AudioVoiceRelease(StellaAudioVoice *voice) {
     if (!voice) return;
@@ -180,42 +367,69 @@ static void AudioVoiceRelease(StellaAudioVoice *voice) {
 
 static StellaAudioVoice *AudioVoiceForClip(const TimelineClipUi *clip) {
     const char *path = clip->audioPath[0] ? clip->audioPath :
-        ((clip->track >= 4 || clip->hasAudio) ? clip->path : "");
+        ((clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio) ? clip->path : "");
     if ((!path || !*path || !FileExists(path)) && clip->path[0] && FileExists(clip->path))
         path = clip->path;
     if (!path || !*path || !FileExists(path)) return NULL;
+    const uint64_t clipHash = StellaAudioHash(clip->id);
+    const uint64_t pathHash = StellaAudioHash(path);
     StellaAudioVoice *freeVoice = NULL;
     for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
         StellaAudioVoice *voice = &gAudioVoices[i];
-        if ((voice->loaded || voice->failed) && strcmp(voice->clipId, clip->id) == 0) {
-            if (strcmp(voice->path, path) == 0) {
-                if (voice->failed) { voice->wasActive = true; return NULL; }
-                return voice;
+        if ((voice->loaded || voice->loading || voice->failed) && voice->clipHash == clipHash &&
+            strcmp(voice->clipId, clip->id) == 0) {
+            if (voice->pathHash == pathHash && strcmp(voice->path, path) == 0) {
+                voice->wasActive = true;
+                if (voice->failed) return NULL;
+                return voice; /* a loading voice is returned and marked active */
             }
             AudioVoiceRelease(voice);
             freeVoice = voice;
             break;
         }
-        if (!voice->loaded && !voice->failed && !freeVoice) freeVoice = voice;
+        if (!voice->loaded && !voice->loading && !voice->failed && !freeVoice) freeVoice = voice;
     }
     if (!freeVoice) {
         /* Reclaim an inactive cached stream before giving up on a new voice. */
         for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
             StellaAudioVoice *voice = &gAudioVoices[i];
-            if (!voice->wasActive) { AudioVoiceRelease(voice); freeVoice = voice; break; }
+            if (!voice->wasActive && !voice->loading) { AudioVoiceRelease(voice); freeVoice = voice; break; }
         }
     }
     if (!freeVoice) return NULL;
     STELLA_AUDIO_PATH_COPY(freeVoice->clipId, clip->id);
     STELLA_AUDIO_PATH_COPY(freeVoice->path, path);
+    freeVoice->clipHash = clipHash;
+    freeVoice->pathHash = pathHash;
+#if defined(_WIN32)
+    if (gAudioWorkersReady) {
+        StellaAudioLoadRequest request = {0};
+        request.slot = (int)(freeVoice - gAudioVoices);
+        request.clipHash = clipHash;
+        request.pathHash = pathHash;
+        snprintf(request.path, sizeof(request.path), "%s", path);
+        if (clip->path[0] && strcmp(path, clip->path) != 0 && FileExists(clip->path))
+            snprintf(request.fallbackPath, sizeof(request.fallbackPath), "%s", clip->path);
+        freeVoice->loading = true;
+        freeVoice->wasActive = true;
+        if (!AudioQueueLoadRequest(&request)) {
+            freeVoice->loading = false;
+            freeVoice->failed = true;
+            snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio load queue is full; retry playback");
+            return NULL;
+        }
+        return freeVoice;
+    }
+#endif
+    /* Safe synchronous fallback for non-Windows builds or worker startup
+       failure. Normal Windows playback always takes the async queue above. */
     freeVoice->music = LoadMusicStream(path);
     if (!freeVoice->music.stream.buffer && clip->path[0] && strcmp(path, clip->path) != 0 && FileExists(clip->path)) {
-        /* A stale or unavailable proxy should not permanently silence a source
-           that Raylib can decode directly (WAV/MP3/OGG/WebM audio, etc.). */
         if (freeVoice->music.stream.buffer) UnloadMusicStream(freeVoice->music);
         memset(&freeVoice->music, 0, sizeof(freeVoice->music));
         path = clip->path;
         STELLA_AUDIO_PATH_COPY(freeVoice->path, path);
+        freeVoice->pathHash = StellaAudioHash(path);
         freeVoice->music = LoadMusicStream(path);
     }
     if (!freeVoice->music.stream.buffer) {
@@ -231,19 +445,36 @@ static StellaAudioVoice *AudioVoiceForClip(const TimelineClipUi *clip) {
 }
 
 static void AudioPlaybackTick(bool playing) {
-    if (!gAudioReady || !IsAudioDeviceReady()) return;
+    gAudioClockValid = false;
+#if defined(_WIN32)
+    bool audioLockHeld = false;
+    if (gAudioWorkersReady) {
+        /* Never let the UI wait for a stream refill. If the 5ms pump owns the
+           audio state lock, this tick simply falls back to the wall-clock. */
+        if (!TryEnterCriticalSection(&gAudioStateLock)) return;
+        audioLockHeld = true;
+        AudioCollectLoadResultsLocked();
+    }
+#endif
+    if (!gAudioReady || !IsAudioDeviceReady()) {
+#if defined(_WIN32)
+        if (audioLockHeld) LeaveCriticalSection(&gAudioStateLock);
+#endif
+        return;
+    }
     bool active[STELLA_AUDIO_VOICES] = {false};
     float mixGainTotal = 0.f;
     for (int i = 0; i < gTimelineClipCount; i++) {
         TimelineClipUi *clip = &gTimelineClips[i];
-        if (!(clip->track >= 4 || clip->hasAudio) || clip->duration <= 0.f ||
+        if (!(clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio) || clip->duration <= 0.f ||
             gPlayhead < clip->start - .0005f || gPlayhead >= clip->start + clip->duration - .0005f) continue;
         StellaAudioVoice *voice = AudioVoiceForClip(clip);
-        if (!voice || !voice->loaded) continue;
+        if (!voice) continue;
         int slot = (int)(voice - gAudioVoices);
         if (slot < 0 || slot >= STELLA_AUDIO_VOICES) continue;
         active[slot] = true;
         voice->wasActive = true;
+        if (!voice->loaded) continue; /* async load still in flight */
 
         float sourceTime = fmaxf(0.f, clip->sourceOffset + gPlayhead - clip->start);
         float fade = 1.f;
@@ -264,13 +495,18 @@ static void AudioPlaybackTick(bool playing) {
                 SeekMusicStream(voice->music, sourceTime);
                 PlayMusicStream(voice->music);
             }
-            /* Raylib's streaming music buffers must be pumped on the same frame
-               that PlayMusicStream starts, then once per UI frame thereafter. */
+#if !defined(_WIN32)
             UpdateMusicStream(voice->music);
+#endif
             float actual = GetMusicTimePlayed(voice->music);
-            /* Keep audio aligned with the timeline clock; a 220ms tolerance was
-               visibly late on cuts and after scrubbing. Avoid tiny seeks that
-               can cause audible zippering, but correct meaningful drift. */
+            if (!gAudioClockValid && isfinite(actual)) {
+                float masterAt = clip->start + actual - clip->sourceOffset;
+                if (masterAt >= clip->start - .1f && masterAt <= clip->start + clip->duration + .1f) {
+                    gAudioClockPlayhead = masterAt;
+                    gAudioClockUpdatedAt = GetTime();
+                    gAudioClockValid = true;
+                }
+            }
             if (fabsf(actual - sourceTime) > .10f) SeekMusicStream(voice->music, sourceTime);
         } else {
             if (streamPlaying) PauseMusicStream(voice->music);
@@ -288,22 +524,47 @@ static void AudioPlaybackTick(bool playing) {
 
     for (int i = 0; i < STELLA_AUDIO_VOICES; i++) {
         StellaAudioVoice *voice = &gAudioVoices[i];
-        if (!voice->loaded && !voice->failed) continue;
+        if (!voice->loaded && !voice->loading && !voice->failed) continue;
         bool clipStillExists = false;
         for (int clipIndex = 0; clipIndex < gTimelineClipCount; clipIndex++) {
-            if (strcmp(gTimelineClips[clipIndex].id, voice->clipId) == 0) { clipStillExists = true; break; }
+            if (StellaAudioHash(gTimelineClips[clipIndex].id) == voice->clipHash &&
+                strcmp(gTimelineClips[clipIndex].id, voice->clipId) == 0) {
+                clipStillExists = true; break;
+            }
         }
         if (!clipStillExists) { AudioVoiceRelease(voice); continue; }
         if (voice->loaded && !active[i] && IsMusicStreamPlaying(voice->music)) PauseMusicStream(voice->music);
-        voice->wasActive = active[i] || voice->failed;
+        voice->wasActive = active[i] || voice->failed || voice->loading;
     }
+#if defined(_WIN32)
+    if (audioLockHeld) LeaveCriticalSection(&gAudioStateLock);
+#endif
 }
 
 static void AudioPlaybackShutdown(void) {
-    for (int i = 0; i < STELLA_AUDIO_VOICES; i++) AudioVoiceRelease(&gAudioVoices[i]);
-    if (gAudioReady && IsAudioDeviceReady()) CloseAudioDevice();
+#if defined(_WIN32)
+    if (gAudioWorkersReady) {
+        InterlockedExchange(&gAudioWorkersStop, 1);
+        WakeAllConditionVariable(&gAudioLoadCondition);
+        if (gAudioLoaderThread) { WaitForSingleObject(gAudioLoaderThread, INFINITE); CloseHandle(gAudioLoaderThread); gAudioLoaderThread = NULL; }
+        if (gAudioPumpThread) { WaitForSingleObject(gAudioPumpThread, INFINITE); CloseHandle(gAudioPumpThread); gAudioPumpThread = NULL; }
+        EnterCriticalSection(&gAudioStateLock);
+        AudioCollectLoadResultsLocked();
+        for (int i = 0; i < STELLA_AUDIO_VOICES; i++) AudioVoiceRelease(&gAudioVoices[i]);
+        if (gAudioReady && IsAudioDeviceReady()) CloseAudioDevice();
+        LeaveCriticalSection(&gAudioStateLock);
+        gAudioWorkersReady = false;
+        DeleteCriticalSection(&gAudioLoadLock);
+        DeleteCriticalSection(&gAudioStateLock);
+    } else
+#endif
+    {
+        for (int i = 0; i < STELLA_AUDIO_VOICES; i++) AudioVoiceRelease(&gAudioVoices[i]);
+        if (gAudioReady && IsAudioDeviceReady()) CloseAudioDevice();
+    }
     gAudioReady = false;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* UI: top bar                                                         */
@@ -456,8 +717,13 @@ int main(void) {
     InitWindow(1600, 967, "Stella");   /* borderless custom title bar; 967 px tall => Transform fits */
     InitAudioDevice();
     gAudioReady = IsAudioDeviceReady();
-    if (gAudioReady) SetMasterVolume(.92f);
-    else snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio device unavailable; check Windows output device");
+    if (gAudioReady) {
+        SetMasterVolume(.92f);
+#if defined(_WIN32)
+        if (!AudioPlaybackStartWorkers())
+            snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio background workers unavailable; using synchronous audio fallback");
+#endif
+    } else snprintf(gBackendMessage, sizeof(gBackendMessage), "Audio device unavailable; check Windows output device");
     Vector2 dpiScale = GetWindowScaleDPI();
     gDpiScale = fmaxf(1.f, fminf(3.f, fmaxf(dpiScale.x, dpiScale.y)));
     LoadUiIcons();
@@ -674,17 +940,25 @@ int main(void) {
         }
         if (gTimelinePlaying) {
             float end = TimelineDuration();
-            playbackRemainder += gDt;
             const float frameDuration = 1.f / (float)fmaxf(1, gPreviewFps);
-            if (playbackRemainder >= frameDuration) {
-                float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
-                playbackRemainder -= advance;
-                gPlayhead += advance;
-                if (gPlayhead >= end) {
-                    gPlayhead = end; gTimelinePlaying = false; playbackRemainder = 0.f;
+            float previousPlayhead = gPlayhead;
+            if (gAudioClockValid && GetTime() - gAudioClockUpdatedAt < .15) {
+                /* Audio owns the transport clock while a stream is active.
+                   This removes the old wall-clock/audio seek-chase feedback loop. */
+                gPlayhead = gAudioClockPlayhead;
+                playbackRemainder = 0.f;
+            } else {
+                playbackRemainder += gDt;
+                if (playbackRemainder >= frameDuration) {
+                    float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
+                    playbackRemainder -= advance;
+                    gPlayhead += advance;
                 }
-                gPreviewDirty = true;
             }
+            if (gPlayhead >= end) {
+                gPlayhead = end; gTimelinePlaying = false; playbackRemainder = 0.f;
+            }
+            if (fabsf(gPlayhead - previousPlayhead) >= frameDuration * .5f) gPreviewDirty = true;
         } else playbackRemainder = 0.f;
         AudioPlaybackTick(gTimelinePlaying);
         gWheelDelta = GetMouseWheelMove();
@@ -712,7 +986,7 @@ int main(void) {
             PlutoTimelineEndPropertyEdit();
         }
         PlutoTextAutoUpdateTick();
-        if (gPreviewDirty && !gPreviewTaskId) {
+        if (gPreviewDirty && gPreviewInFlightCount < STELLA_PREVIEW_REQUESTS) {
             gPreviewDebounce += gDt;
             bool responsiveEdit = gTimelinePropertyEditOpen || gKeyframeDragClip >= 0 ||
                 gValueDragging || gRotDrag || gSlDrag[0];
@@ -744,6 +1018,7 @@ int main(void) {
                        gHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
     }
     AudioPlaybackShutdown();
+    PlutoReleasePreviewPbos();
     PlutoUnloadMedia();
     UnloadUiIcons();
     CloseWindow();

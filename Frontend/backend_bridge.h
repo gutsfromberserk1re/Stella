@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -18,6 +19,9 @@ typedef char *(__cdecl *PlutoBackendPollFn)(void);
 typedef void(__cdecl *PlutoBackendFreeFn)(char *value);
 typedef int32_t(__cdecl *PlutoBackendCopyPreviewFn)(uint64_t requestId, uint8_t *destination, size_t capacity,
                                                     uint32_t *width, uint32_t *height, size_t *byteLength, double *at);
+typedef int32_t(__cdecl *PlutoBackendTakePreviewFn)(uint64_t requestId, const uint8_t **pixels, size_t *byteLength,
+                                                    uint32_t *width, uint32_t *height, double *at, void **owner);
+typedef void(__cdecl *PlutoBackendReleasePreviewPixelsFn)(void *owner);
 
 typedef struct {
     HMODULE module;
@@ -26,6 +30,8 @@ typedef struct {
     PlutoBackendPollFn poll;
     PlutoBackendFreeFn release;
     PlutoBackendCopyPreviewFn copyPreview;
+    PlutoBackendTakePreviewFn takePreview;
+    PlutoBackendReleasePreviewPixelsFn releasePreviewPixels;
 } PlutoBackend;
 
 static PlutoBackend gBackend;
@@ -45,6 +51,8 @@ static bool PlutoBackendLoad(void) {
     gBackend.poll = (PlutoBackendPollFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_poll");
     gBackend.release = (PlutoBackendFreeFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_free");
     gBackend.copyPreview = (PlutoBackendCopyPreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_copy_preview_frame");
+    gBackend.takePreview = (PlutoBackendTakePreviewFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_take_preview_frame");
+    gBackend.releasePreviewPixels = (PlutoBackendReleasePreviewPixelsFn)(void *)GetProcAddress(gBackend.module, "pluto_backend_release_preview_pixels");
     if (!gBackend.request || !gBackend.submit || !gBackend.poll || !gBackend.release || !gBackend.copyPreview) {
         FreeLibrary(gBackend.module);
         gBackend = (PlutoBackend){0};
@@ -89,11 +97,266 @@ static bool PlutoJsonNumber(const char *json, const char *key, double *out) {
     return true;
 }
 
+static int PlutoFindPreviewRequest(uint64_t requestId) {
+    for (int i = 0; i < STELLA_PREVIEW_REQUESTS; i++)
+        if (gPreviewRequests[i].id == requestId && requestId) return i;
+    return -1;
+}
+
+static bool PlutoPreviewPathInFlight(const char *path) {
+    if (!path || !*path) return false;
+    for (int i = 0; i < STELLA_PREVIEW_REQUESTS; i++)
+        if (gPreviewRequests[i].id && gPreviewRequests[i].textPath[0] &&
+            strcmp(gPreviewRequests[i].textPath, path) == 0) return true;
+    return false;
+}
+
+static void PlutoRefreshPreviewRequestMirrors(void) {
+    gPreviewTaskId = 0;
+    gPreviewTextPathInFlight[0] = 0;
+    for (int i = 0; i < STELLA_PREVIEW_REQUESTS; i++) {
+        StellaPreviewRequest *request = &gPreviewRequests[i];
+        if (!request->id) continue;
+        if (request->id > gPreviewTaskId) gPreviewTaskId = request->id;
+        if (!gPreviewTextPathInFlight[0] && request->textPath[0])
+            snprintf(gPreviewTextPathInFlight, sizeof(gPreviewTextPathInFlight), "%s", request->textPath);
+    }
+}
+
+static bool PlutoCompletePreviewRequest(uint64_t requestId, StellaPreviewRequest *completed) {
+    int slot = PlutoFindPreviewRequest(requestId);
+    if (slot < 0) return false;
+    if (completed) *completed = gPreviewRequests[slot];
+    memset(&gPreviewRequests[slot], 0, sizeof(gPreviewRequests[slot]));
+    if (gPreviewInFlightCount > 0) gPreviewInFlightCount--;
+    PlutoRefreshPreviewRequestMirrors();
+    return true;
+}
+
+
+/* Raylib uses an OpenGL texture for the preview. Upload pixels through a small
+   PBO ring so the driver can transfer bytes asynchronously instead of forcing
+   UpdateTexture to wait for the texture upload on the UI thread. This is not
+   WGPU/GL zero-copy: it removes the synchronous client-memory upload stall. */
+#if defined(_WIN32)
+typedef unsigned int StellaGLenum;
+typedef unsigned int StellaGLuint;
+typedef int StellaGLint;
+typedef int StellaGLsizei;
+typedef unsigned int StellaGLbitfield;
+typedef ptrdiff_t StellaGLsizeiptr;
+typedef void *StellaGLsync;
+typedef void (APIENTRY *StellaPFNGLGENBUFFERSPROC)(StellaGLsizei, StellaGLuint *);
+typedef void (APIENTRY *StellaPFNGLDELETEBUFFERSPROC)(StellaGLsizei, const StellaGLuint *);
+typedef void (APIENTRY *StellaPFNGLBINDBUFFERPROC)(StellaGLenum, StellaGLuint);
+typedef void (APIENTRY *StellaPFNGLBUFFERDATAPROC)(StellaGLenum, StellaGLsizeiptr, const void *, StellaGLenum);
+typedef StellaGLsync (APIENTRY *StellaPFNGLFENCESYNCPROC)(StellaGLenum, StellaGLbitfield);
+typedef StellaGLenum (APIENTRY *StellaPFNGLCLIENTWAITSYNCPROC)(StellaGLsync, StellaGLbitfield, uint64_t);
+typedef void (APIENTRY *StellaPFNGLDELETESYNCPROC)(StellaGLsync);
+typedef void (APIENTRY *StellaPFNGLGETINTEGERVPROC)(StellaGLenum, StellaGLint *);
+typedef void (APIENTRY *StellaPFNGLBINDTEXTUREPROC)(StellaGLenum, StellaGLuint);
+typedef void (APIENTRY *StellaPFNGLTEXSUBIMAGE2DPROC)(StellaGLenum, StellaGLint, StellaGLint, StellaGLint,
+                                                       StellaGLsizei, StellaGLsizei, StellaGLenum, StellaGLenum, const void *);
+typedef void (APIENTRY *StellaPFNGLACTIVETEXTUREPROC)(StellaGLenum);
+typedef void (APIENTRY *StellaPFNGLPIXELSTOREIPROC)(StellaGLenum, StellaGLint);
+
+enum {
+    STELLA_GL_PIXEL_UNPACK_BUFFER = 0x88EC,
+    STELLA_GL_PIXEL_UNPACK_BUFFER_BINDING = 0x88EF,
+    STELLA_GL_STREAM_DRAW = 0x88E0,
+    STELLA_GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117,
+    STELLA_GL_ALREADY_SIGNALED = 0x911A,
+    STELLA_GL_CONDITION_SATISFIED = 0x911C,
+    STELLA_GL_TIMEOUT_EXPIRED = 0x911B,
+    STELLA_GL_WAIT_FAILED = 0x911D,
+    STELLA_GL_TEXTURE0 = 0x84C0,
+    STELLA_GL_ACTIVE_TEXTURE = 0x84E0,
+    STELLA_GL_TEXTURE_BINDING_2D = 0x8069,
+    STELLA_GL_TEXTURE_2D = 0x0DE1,
+    STELLA_GL_RGBA = 0x1908,
+    STELLA_GL_UNSIGNED_BYTE = 0x1401,
+    STELLA_GL_UNPACK_ALIGNMENT = 0x0CF5
+};
+
+typedef struct {
+    StellaGLuint buffer;
+    StellaGLsync fence;
+    size_t capacity;
+    bool poisoned;
+} StellaPreviewPboSlot;
+
+static StellaPreviewPboSlot gPreviewPboSlots[3];
+static unsigned gPreviewPboNext;
+static bool gPreviewPboFunctionsLoaded;
+static bool gPreviewPboFunctionsAvailable;
+static StellaPFNGLGENBUFFERSPROC stella_glGenBuffers;
+static StellaPFNGLDELETEBUFFERSPROC stella_glDeleteBuffers;
+static StellaPFNGLBINDBUFFERPROC stella_glBindBuffer;
+static StellaPFNGLBUFFERDATAPROC stella_glBufferData;
+static StellaPFNGLFENCESYNCPROC stella_glFenceSync;
+static StellaPFNGLCLIENTWAITSYNCPROC stella_glClientWaitSync;
+static StellaPFNGLDELETESYNCPROC stella_glDeleteSync;
+static StellaPFNGLGETINTEGERVPROC stella_glGetIntegerv;
+static StellaPFNGLBINDTEXTUREPROC stella_glBindTexture;
+static StellaPFNGLTEXSUBIMAGE2DPROC stella_glTexSubImage2D;
+static StellaPFNGLACTIVETEXTUREPROC stella_glActiveTexture;
+static StellaPFNGLPIXELSTOREIPROC stella_glPixelStorei;
+
+static PROC PlutoGetGlProc(const char *name) {
+    PROC proc = wglGetProcAddress(name);
+    if (!proc || proc == (PROC)1 || proc == (PROC)2 || proc == (PROC)3 || proc == (PROC)-1) {
+        HMODULE gl = GetModuleHandleA("opengl32.dll");
+        proc = gl ? GetProcAddress(gl, name) : NULL;
+    }
+    return proc;
+}
+
+static void PlutoLoadPreviewPboFunctions(void) {
+    if (gPreviewPboFunctionsLoaded) return;
+    gPreviewPboFunctionsLoaded = true;
+#define STELLA_GL_LOAD(dst, type, name) dst = (type)(void *)PlutoGetGlProc(name)
+    STELLA_GL_LOAD(stella_glGenBuffers, StellaPFNGLGENBUFFERSPROC, "glGenBuffers");
+    STELLA_GL_LOAD(stella_glDeleteBuffers, StellaPFNGLDELETEBUFFERSPROC, "glDeleteBuffers");
+    STELLA_GL_LOAD(stella_glBindBuffer, StellaPFNGLBINDBUFFERPROC, "glBindBuffer");
+    STELLA_GL_LOAD(stella_glBufferData, StellaPFNGLBUFFERDATAPROC, "glBufferData");
+    STELLA_GL_LOAD(stella_glFenceSync, StellaPFNGLFENCESYNCPROC, "glFenceSync");
+    STELLA_GL_LOAD(stella_glClientWaitSync, StellaPFNGLCLIENTWAITSYNCPROC, "glClientWaitSync");
+    STELLA_GL_LOAD(stella_glDeleteSync, StellaPFNGLDELETESYNCPROC, "glDeleteSync");
+    STELLA_GL_LOAD(stella_glGetIntegerv, StellaPFNGLGETINTEGERVPROC, "glGetIntegerv");
+    STELLA_GL_LOAD(stella_glBindTexture, StellaPFNGLBINDTEXTUREPROC, "glBindTexture");
+    STELLA_GL_LOAD(stella_glTexSubImage2D, StellaPFNGLTEXSUBIMAGE2DPROC, "glTexSubImage2D");
+    STELLA_GL_LOAD(stella_glActiveTexture, StellaPFNGLACTIVETEXTUREPROC, "glActiveTexture");
+    STELLA_GL_LOAD(stella_glPixelStorei, StellaPFNGLPIXELSTOREIPROC, "glPixelStorei");
+#undef STELLA_GL_LOAD
+    gPreviewPboFunctionsAvailable = stella_glGenBuffers && stella_glDeleteBuffers && stella_glBindBuffer &&
+        stella_glBufferData && stella_glFenceSync && stella_glClientWaitSync && stella_glDeleteSync &&
+        stella_glGetIntegerv && stella_glBindTexture && stella_glTexSubImage2D && stella_glActiveTexture;
+}
+
+static bool PlutoUploadPreviewTexturePbo(Texture2D texture, const uint8_t *pixels, size_t byteCount) {
+    PlutoLoadPreviewPboFunctions();
+    if (!gPreviewPboFunctionsAvailable || !texture.id || !pixels || byteCount == 0) return false;
+
+    /* Poll fences without waiting. A busy ring falls back to Raylib's upload
+       rather than stalling the UI thread. */
+    StellaPreviewPboSlot *slot = NULL;
+    for (unsigned offset = 0; offset < 3; offset++) {
+        unsigned index = (gPreviewPboNext + offset) % 3;
+        StellaPreviewPboSlot *candidate = &gPreviewPboSlots[index];
+        if (candidate->poisoned) continue;
+        if (candidate->fence) {
+            StellaGLenum wait = stella_glClientWaitSync(candidate->fence, 0, 0);
+            if (wait == STELLA_GL_ALREADY_SIGNALED || wait == STELLA_GL_CONDITION_SATISFIED) {
+                stella_glDeleteSync(candidate->fence);
+                candidate->fence = NULL;
+            } else {
+                continue;
+            }
+        }
+        slot = candidate;
+        gPreviewPboNext = (index + 1) % 3;
+        break;
+    }
+    if (!slot) return false;
+
+    if (!slot->buffer) stella_glGenBuffers(1, &slot->buffer);
+    if (!slot->buffer) return false;
+
+    StellaGLint previousActive = STELLA_GL_TEXTURE0;
+    StellaGLint previousTexture = 0;
+    StellaGLint previousPbo = 0;
+    StellaGLint previousUnpackAlignment = 4;
+    stella_glGetIntegerv(STELLA_GL_ACTIVE_TEXTURE, &previousActive);
+    stella_glActiveTexture(STELLA_GL_TEXTURE0);
+    stella_glGetIntegerv(STELLA_GL_TEXTURE_BINDING_2D, &previousTexture);
+    stella_glGetIntegerv(STELLA_GL_PIXEL_UNPACK_BUFFER_BINDING, &previousPbo);
+    stella_glGetIntegerv(STELLA_GL_UNPACK_ALIGNMENT, &previousUnpackAlignment);
+
+    stella_glBindTexture(STELLA_GL_TEXTURE_2D, texture.id);
+    stella_glBindBuffer(STELLA_GL_PIXEL_UNPACK_BUFFER, slot->buffer);
+    /* Orphaning gives the driver fresh storage if an older transfer is still
+       consuming the previous allocation associated with this PBO name. */
+    stella_glBufferData(STELLA_GL_PIXEL_UNPACK_BUFFER, (StellaGLsizeiptr)byteCount, pixels, STELLA_GL_STREAM_DRAW);
+    slot->capacity = byteCount;
+    if (stella_glPixelStorei) stella_glPixelStorei(STELLA_GL_UNPACK_ALIGNMENT, 1);
+    stella_glTexSubImage2D(STELLA_GL_TEXTURE_2D, 0, 0, 0, texture.width, texture.height,
+                           STELLA_GL_RGBA, STELLA_GL_UNSIGNED_BYTE, NULL);
+    slot->fence = stella_glFenceSync(STELLA_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+    if (stella_glPixelStorei) stella_glPixelStorei(STELLA_GL_UNPACK_ALIGNMENT, previousUnpackAlignment);
+    stella_glBindBuffer(STELLA_GL_PIXEL_UNPACK_BUFFER, (StellaGLuint)previousPbo);
+    stella_glBindTexture(STELLA_GL_TEXTURE_2D, (StellaGLuint)previousTexture);
+    stella_glActiveTexture((StellaGLenum)previousActive);
+    if (!slot->fence) {
+        /* Without a completion fence we cannot safely recycle this storage.
+           Quarantine the slot and let the caller use the synchronous fallback. */
+        slot->poisoned = true;
+        return false;
+    }
+    return true;
+}
+
+static void PlutoReleasePreviewPbos(void) {
+    if (!gPreviewPboFunctionsAvailable) return;
+    for (int i = 0; i < 3; i++) {
+        if (gPreviewPboSlots[i].fence) stella_glDeleteSync(gPreviewPboSlots[i].fence);
+        if (gPreviewPboSlots[i].buffer) stella_glDeleteBuffers(1, &gPreviewPboSlots[i].buffer);
+        memset(&gPreviewPboSlots[i], 0, sizeof(gPreviewPboSlots[i]));
+    }
+}
+#else
+static bool PlutoUploadPreviewTexturePbo(Texture2D texture, const uint8_t *pixels, size_t byteCount) {
+    (void)texture; (void)pixels; (void)byteCount; return false;
+}
+static void PlutoReleasePreviewPbos(void) { }
+#endif
+
+static bool PlutoUploadPreviewTexture(Texture2D texture, const uint8_t *pixels, size_t byteCount) {
+    if (PlutoUploadPreviewTexturePbo(texture, pixels, byteCount)) return true;
+    UpdateTexture(texture, pixels);
+    return true;
+}
+
 static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
-    if (!gBackend.copyPreview || !requestId) return false;
+    if (!requestId) return false;
     uint32_t width = 0, height = 0;
     size_t required = 0;
     double at = 0.0;
+
+    /* Fast path: transfer the backend-owned frame allocation directly to the
+       synchronous Raylib upload. This avoids copying 3.7-8 MB into a second C
+       buffer before UpdateTexture/LoadTextureFromImage. */
+    if (gBackend.takePreview && gBackend.releasePreviewPixels) {
+        const uint8_t *pixels = NULL;
+        void *owner = NULL;
+        int32_t taken = gBackend.takePreview(requestId, &pixels, &required,
+                                             &width, &height, &at, &owner);
+        if (taken != 1 || !pixels || !owner || !width || !height ||
+            required != (size_t)width * height * 4u) {
+            if (owner) gBackend.releasePreviewPixels(owner);
+            return false;
+        }
+        bool uploaded = true;
+        if (gPreviewFrame.id && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
+            PlutoUploadPreviewTexture(gPreviewFrame, pixels, required);
+        } else {
+            Image image = {(void *)pixels, (int)width, (int)height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+            Texture2D next = LoadTextureFromImage(image);
+            if (!next.id) uploaded = false;
+            else {
+                if (gPreviewFrame.id) UnloadTexture(gPreviewFrame);
+                gPreviewFrame = next;
+                SetTextureFilter(gPreviewFrame, TEXTURE_FILTER_BILINEAR);
+            }
+        }
+        gBackend.releasePreviewPixels(owner);
+        if (!uploaded) return false;
+        if (displayedAt) *displayedAt = at;
+        return true;
+    }
+
+    /* Compatibility fallback for older backend DLLs that only expose copy. */
+    if (!gBackend.copyPreview) return false;
     int32_t copied = gBackend.copyPreview(requestId, gPreviewPixels, gPreviewPixelCapacity,
                                           &width, &height, &required, &at);
     if (copied == -1 && required > 0) {
@@ -106,7 +369,7 @@ static bool PlutoUploadPreviewFrame(uint64_t requestId, double *displayedAt) {
     }
     if (copied != 1 || !width || !height || required != (size_t)width * height * 4u) return false;
     if (gPreviewFrame.id && gPreviewFrame.width == (int)width && gPreviewFrame.height == (int)height) {
-        UpdateTexture(gPreviewFrame, gPreviewPixels);
+        PlutoUploadPreviewTexture(gPreviewFrame, gPreviewPixels, required);
     } else {
         Image image = {gPreviewPixels, (int)width, (int)height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
         Texture2D next = LoadTextureFromImage(image);
@@ -268,16 +531,16 @@ static float PlutoReadNumber(const char *begin, const char *end, const char *pat
 }
 
 static int PlutoTrackIndex(const char *name) {
-    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2", "a3", "a4", "a5", "a6"};
-    for (int i = 0; i < 4 + TIMELINE_MAX_AUDIO_TRACKS; i++)
+    static const char *names[] = {"v1", "v2", "v3", "v4", "v5", "v6", "a1", "a2", "a3", "a4", "a5", "a6"};
+    for (int i = 0; i < TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS; i++)
         if (strcmp(name, names[i]) == 0) return i;
     return 0;
 }
 
 static const char *PlutoTrackName(int track) {
-    static const char *names[] = {"v1", "v2", "v3", "v4", "a1", "a2", "a3", "a4", "a5", "a6"};
+    static const char *names[] = {"v1", "v2", "v3", "v4", "v5", "v6", "a1", "a2", "a3", "a4", "a5", "a6"};
     if (track < 0) track = 0;
-    if (track >= 4 + TIMELINE_MAX_AUDIO_TRACKS) track = 4 + TIMELINE_MAX_AUDIO_TRACKS - 1;
+    if (track >= TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS) track = TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
     return names[track];
 }
 
@@ -452,7 +715,7 @@ static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) {
     PlutoJsonEscape(media->path, path, sizeof(path));
     PlutoJsonEscape(media->name, label, sizeof(label));
     snprintf(id, sizeof(id), "clip-%llu", (unsigned long long)gClipSerial++);
-    if ((strcmp(media->kind, "audio") == 0) != (track >= 4)) track = strcmp(media->kind, "audio") == 0 ? 4 : 0;
+    if ((strcmp(media->kind, "audio") == 0) != (track >= TIMELINE_MAX_VIDEO_TRACKS)) track = strcmp(media->kind, "audio") == 0 ? TIMELINE_MAX_VIDEO_TRACKS : 0;
     snprintf(request, sizeof(request),
              "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"%s\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"%s\",\"hasAudio\":%s,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{}}}",
              id, PlutoTrackName(track), fmaxf(0.f, start), fmaxf(.05f, media->duration), label, path,
@@ -476,7 +739,7 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
         }
     } while (idInUse);
     int n = snprintf(request, sizeof(request),
-        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v4\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Title\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
+        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Title\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
         id, fmaxf(0.f, start), fmaxf(.05f, duration), escapedPath, fmaxf(.05f, duration), textJson);
     if (n <= 0 || (size_t)n >= sizeof(request) || !PlutoTimelineCall(request)) return false;
     for (int i = 0; i < gTimelineClipCount; i++) {
@@ -652,29 +915,32 @@ static void PlutoPollBackend(void) {
         if (!event) break;
         if (strstr(event, "\"command\":\"preview_frame\"")) {
             double requestId = 0.0;
+            StellaPreviewRequest completedRequest = {0};
             bool matchingRequest = PlutoJsonNumber(event, "requestId", &requestId) &&
-                                   gPreviewTaskId && (uint64_t)requestId == gPreviewTaskId;
+                                   PlutoCompletePreviewRequest((uint64_t)requestId, &completedRequest);
             if (matchingRequest) {
-                gPreviewTaskId = 0;
-                gPreviewTextPathInFlight[0] = 0;
+                const float requestAt = completedRequest.at;
+                const int requestRes = completedRequest.resolution;
+                const int requestFps = completedRequest.fps > 0 ? completedRequest.fps : gPreviewFps;
+                const double requestStartedAt = completedRequest.startedAt;
                 bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
                 float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
                 bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
                 bool newerInDirection = gPreviewDisplayedAt < 0.f ||
-                    (forward ? gPreviewRequestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
-                             : gPreviewRequestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
-                bool movingFrameFresh = fabsf(gPreviewRequestAt - gPlayhead) <= previewLag && newerInDirection;
-                bool currentRequest = gPreviewRequestRes == gPreviewRes &&
+                    (forward ? requestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
+                             : requestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
+                bool movingFrameFresh = fabsf(requestAt - gPlayhead) <= previewLag && newerInDirection;
+                bool currentRequest = requestRes == gPreviewRes && requestFps == gPreviewFps &&
                     (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
-                     fabsf(gPreviewRequestAt - gPlayhead) <= (0.5f / 30.f)));
+                     fabsf(requestAt - gPlayhead) <= (0.5f / (float)fmaxf(1, requestFps))));
                 if (strstr(event, "\"ok\":true")) {
                     double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
                     bool frameMatchesRequest =
                         PlutoJsonNumber(event, "at", &renderedAt) &&
                         PlutoJsonNumber(event, "height", &renderedHeight) &&
                         PlutoJsonNumber(event, "frameId", &frameIdNumber) &&
-                        fabs(renderedAt - gPreviewRequestAt) <= (0.5 / (double)fmaxf(1, gPreviewFps)) &&
-                        (int)renderedHeight == gPreviewRes;
+                        fabs(renderedAt - requestAt) <= (0.5 / (double)fmaxf(1, requestFps)) &&
+                        (int)renderedHeight == requestRes;
                     if (currentRequest && frameMatchesRequest) {
                         double uploadedAt = renderedAt;
                         double uploadStartedAt = GetTime();
@@ -682,6 +948,11 @@ static void PlutoPollBackend(void) {
                             snprintf(gBackendMessage, sizeof(gBackendMessage), "Could not upload preview frame");
                         } else {
                             gPreviewDisplayedAt = (float)uploadedAt;
+                            /* F3 end-to-end latency must follow the frame actually
+                               displayed, not whichever worker happened to finish last. */
+                            gPreviewRequestAt = requestAt;
+                            gPreviewRequestRes = requestRes;
+                            gPreviewRequestStartedAt = requestStartedAt;
                             double now = GetTime();
                             {   /* Phase 1 stats: feed the F3 overlay on every displayed frame. */
                                 double q = 0.0, su = 0.0, dc = 0.0, bk = 0.0;
@@ -694,15 +965,17 @@ static void PlutoPollBackend(void) {
                                 PlutoJsonNumber(event, "hwDecode", &gPerfHwDecode);
                                 PlutoJsonNumber(event, "path", &gPerfPath);
                                 PlutoJsonNumber(event, "fallbackReason", &gPerfFallbackReason);
-                                double xf = 0.0, cv = 0.0, cp = 0.0, pb = 0.0;
+                                double xf = 0.0, cv = 0.0, cp = 0.0, rb = 0.0, pb = 0.0;
                                 PlutoJsonNumber(event, "transferMs", &xf);
                                 PlutoJsonNumber(event, "convertMs", &cv);
                                 PlutoJsonNumber(event, "compositeMs", &cp);
+                                PlutoJsonNumber(event, "readbackMs", &rb);
                                 PlutoJsonNumber(event, "publishMs", &pb);
                                 const double a = gPerfShownFrames ? 0.1 : 1.0;
                                 gPerfTransferMs += (xf - gPerfTransferMs) * a;
                                 gPerfConvertMs += (cv - gPerfConvertMs) * a;
                                 gPerfCompositeMs += (cp - gPerfCompositeMs) * a;
+                                gPerfReadbackMs += (rb - gPerfReadbackMs) * a;
                                 gPerfPublishMs += (pb - gPerfPublishMs) * a;
                                 gPerfQueueMs += (q - gPerfQueueMs) * a;
                                 gPerfSetupMs += (su - gPerfSetupMs) * a;
@@ -710,7 +983,7 @@ static void PlutoPollBackend(void) {
                                 gPerfBackendMs += (bk - gPerfBackendMs) * a;
                                 gPerfRingDepth += (rd - gPerfRingDepth) * a;
                                 gPerfUploadMs += ((now - uploadStartedAt) * 1000.0 - gPerfUploadMs) * a;
-                                gPerfEndToEndMs += ((now - gPreviewRequestStartedAt) * 1000.0 - gPerfEndToEndMs) * a;
+                                gPerfEndToEndMs += ((now - requestStartedAt) * 1000.0 - gPerfEndToEndMs) * a;
                                 PerfNoteInterval(now);
                                 gPerfLastShownAt = now;
                                 gPerfShownFrames++; gPerfShownInWindow++;
@@ -728,7 +1001,7 @@ static void PlutoPollBackend(void) {
                                 char timing[384];
                                 snprintf(timing, sizeof(timing),
                                     "[Stella preview] end-to-end=%.1fms queue=%.1fms setup=%.1fms decode=%.1fms (xfer=%.1f convert=%.1f) composite=%.1fms publish=%.1fms upload=%.1fms backend=%.1fms path=%s\n",
-                                    (now - gPreviewRequestStartedAt) * 1000.0, queueMs, setupMs, decodeMs,
+                                    (now - requestStartedAt) * 1000.0, queueMs, setupMs, decodeMs,
                                     gPerfTransferMs, gPerfConvertMs, gPerfCompositeMs, gPerfPublishMs,
                                     (now - uploadStartedAt) * 1000.0, renderMs, gPerfPath >= 1.5 ? "FFMPEG-FALLBACK" : "native");
                                 OutputDebugStringA(timing);
@@ -739,7 +1012,7 @@ static void PlutoPollBackend(void) {
                            the playhead advanced slightly while FFmpeg rendered this one.
                            Reject older frames so the picture cannot visibly run backward. */
                         gPreviewDirty = previewMoving &&
-                            fabsf(gPreviewRequestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
+                            fabsf(requestAt - gPlayhead) > (0.5f / (float)fmaxf(1, gPreviewFps));
                     } else {
                         gPerfDiscardedFrames++;
                         gPreviewDirty = true;
@@ -799,11 +1072,17 @@ static void PlutoUnloadMedia(void) {
     free(gPreviewPixels);
     gPreviewPixels = NULL;
     gPreviewPixelCapacity = 0;
-    gPreviewTextPathInFlight[0] = 0;
+    memset(gPreviewRequests, 0, sizeof(gPreviewRequests));
+    gPreviewInFlightCount = 0;
+    PlutoRefreshPreviewRequestMirrors();
 }
 
 static uint64_t PlutoRequestPreview(void) {
-    if (!gBackend.submit || gPreviewTaskId) return 0;
+    if (!gBackend.submit || gPreviewInFlightCount >= STELLA_PREVIEW_REQUESTS) return 0;
+    int requestSlot = -1;
+    for (int i = 0; i < STELLA_PREVIEW_REQUESTS; i++)
+        if (!gPreviewRequests[i].id) { requestSlot = i; break; }
+    if (requestSlot < 0) return 0;
     char request[192];
     /* "playing" enables decode-ahead; "stepping" (arrow keys) makes the backend cache the
        frames before a seek target so repeated reverse steps do not each re-seek (Yoru). */
@@ -813,13 +1092,21 @@ static uint64_t PlutoRequestPreview(void) {
              gTimelinePlaying ? "true" : "false", gPreviewNavigating ? "true" : "false");
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
-        gPreviewTaskId = taskId;
-        snprintf(gPreviewTextPathInFlight, sizeof(gPreviewTextPathInFlight), "%s", gTextOutputPath);
+        StellaPreviewRequest *slot = &gPreviewRequests[requestSlot];
+        memset(slot, 0, sizeof(*slot));
+        slot->id = taskId;
+        slot->at = gPlayhead;
+        slot->resolution = gPreviewRes;
+        slot->fps = gPreviewFps;
+        slot->startedAt = GetTime();
+        snprintf(slot->textPath, sizeof(slot->textPath), "%s", gTextOutputPath);
+        gPreviewInFlightCount++;
         gPreviewRequestAt = gPlayhead;
         gPreviewRequestRes = gPreviewRes;
-        gPreviewRequestStartedAt = GetTime();
+        gPreviewRequestStartedAt = slot->startedAt;
+        PlutoRefreshPreviewRequestMirrors();
     }
-    return gPreviewTaskId;
+    return taskId;
 }
 
 static void PlutoRequestExport(void) {

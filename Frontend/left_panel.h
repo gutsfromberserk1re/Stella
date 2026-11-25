@@ -190,7 +190,7 @@ static void DurRow(int gi, const char *label) {
 static bool PlutoSelectedClipHasAudio(void) {
     if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) return false;
     const TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
-    return clip->track >= 4 || clip->hasAudio;
+    return clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio;
 }
 
 static void AudioView(void) {

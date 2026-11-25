@@ -55,3 +55,38 @@ The WGPU compositor still performs a blocking GPU readback so the existing Rayli
 - Corrected the exact missing-field and misplaced-field issues from the reported `cargo test` failure.
 - Static checks confirm `FrameKey` has only its intended three key fields and `VideoDecoder` owns the two stream color fields.
 - Cargo is not installed in this execution environment, so the Rust tests still need to be rerun in Windows GitHub Actions. No successful compile is being claimed here.
+
+
+## Preview pipeline update (November 2026)
+
+The request/render path is no longer a one-frame UI ping-pong:
+
+- The frontend keeps a bounded three-request window. Each outstanding request records its own playhead, resolution, FPS, start time, and title-image path, so out-of-order worker completions can be matched to the correct UI request and stale frames are rejected.
+- Two preview render workers can process independent requests. The per-clip FFmpeg decoder coordinator is shared between them: each timeline clip gets one persistent decoder thread and a bounded request queue, while independent visible clips decode concurrently. Decoder prefetch is interrupted as soon as a newer request for that clip arrives.
+- Preview workers share a revisioned `Arc<Timeline>` snapshot. A timeline revision is bumped after successful timeline mutations, replacing per-preview full-timeline structural equality checks and repeated timeline JSON conversion on the UI thread.
+- Every clip retains its own sequential FFmpeg decoder, while the decoded-frame LRU is shared across clip workers by media path, source frame, and output width. Its total preview budget is capped at 128 MiB rather than multiplying a cache per clip.
+- The preview compositor now writes into reusable output vectors. Pixel-row conversion uses a persistent Rayon pool rather than creating/joining OS threads for every decoded frame.
+- The UI can take ownership of the completed Rust pixel buffer and return the allocation to the Rust buffer pool after presentation. This removes the extra full-frame copy into a second C buffer. On Windows, same-size texture updates use the PBO staging path described below; unsupported drivers and non-Windows builds retain Raylib's regular upload path. The older copy API remains available as a compatibility fallback.
+- During playback, the active audio stream is used as the playhead master when available; video-only playback retains the wall-clock fallback.
+- Frame-cache width changes force a seek at the requested source timestamp, avoiding the one-frame-ahead result when animated scale changes the decoder output width.
+
+## Preview pipeline follow-up: asynchronous GPU/audio presentation
+
+The next bottleneck pass addresses the blocking presentation work left by the first pipeline update:
+
+- WGPU preview readback uses three per-resolution staging buffers. Preview workers submit the composite and return a receiver immediately; a dedicated `Device::poll(Maintain::Poll)` thread drives `map_async`, and a non-blocking completion worker polls every outstanding receiver and publishes whichever frame is ready first under its original request ID. One slow map no longer head-of-line-blocks later completed frames. The interactive preview path no longer calls `Maintain::Wait`. The synchronous wrapper remains for export callers.
+- F3 reports GPU submission time separately from asynchronous readback-completion time, so submission and map/readback are no longer folded into one opaque composite number.
+- On Windows, Raylib/OpenGL presentation uses a three-slot pixel-unpack-buffer ring with non-blocking GL sync-fence polling. A busy ring falls back to Raylib's normal `UpdateTexture` rather than waiting. This avoids one additional client-memory upload stall on the common same-size preview path. It is asynchronous staging, not zero-copy interop.
+- Windows audio stream creation runs on a dedicated loader thread. A separate short-interval worker pumps `UpdateMusicStream`; the UI uses a try-lock for play/pause/seek/volume updates and falls back to its wall clock if the pump owns the stream lock for that tick. Load results carry clip and path identities so stale completions are discarded safely. Non-Windows and worker-startup-failure builds retain the synchronous fallback.
+- Hardware decode's automatic threshold now uses coded pixel area (defaulting on at 1280x720-equivalent area) rather than a width-only 1920px check. `STELLA_HWDEC=0|1` still forces software/hardware for driver-specific A/B tests; GPU-to-CPU frame transfer can still make hardware decode slower on some machines.
+- The compositor can skip uploading/drawing lower layers when a higher layer is proven to be fully opaque and fully cover the output canvas. This is conservative: it requires cached opaque-alpha classification, full opacity, no crop, no corner distortion, no transition, and geometry that covers every output pixel. Source decoding still happens before this proof, so this pass saves GPU texture uploads and fragment work, not decoder work.
+
+### Remaining limitation: true WGPU/OpenGL zero-copy
+
+- WGPU and Raylib currently own separate graphics backends/contexts. The project does not yet have a supported shared-texture import/export path between the selected WGPU adapter and Raylib's OpenGL context. The PBO ring is an asynchronous CPU-to-GL staging path; it does not remove the WGPU readback or CPU-backed pixel buffer. A real zero-copy path requires selecting and implementing a compatible cross-API interop route (and a fallback for adapters/drivers that do not support it), not merely passing a texture handle between APIs.
+
+### Verification status
+
+- Source-level changes and archive integrity are checked for this patch.
+- Cargo/Rust and the Windows Raylib/Clay build toolchain are not installed in this container, so Rust tests and the Windows application build cannot be run here. The Windows GitHub Actions build and F3 playback comparison remain necessary before treating any throughput improvement as measured.
+- Benchmark at the same resolution, project, playhead, and hardware-decode override. Compare `decodeWaitMs`, `compositeMs`, the new `readbackMs`, upload timing, frame-interval median/p95, and displayed FPS. Do not treat source-level changes as a measured FPS claim.

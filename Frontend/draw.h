@@ -831,8 +831,8 @@ static void DrawCustom(Cust *cu, Rectangle r) {
     case K_CLIP: {
         int clipIndex = cu->i >> 1;
         TimelineClipUi *clip = clipIndex >= 0 && clipIndex < gTimelineClipCount ? &gTimelineClips[clipIndex] : NULL;
-        bool audioOnly = clip && clip->track >= 4;
-        bool hasAudio = clip && (clip->track >= 4 || clip->hasAudio);
+        bool audioOnly = clip && clip->track >= TIMELINE_MAX_VIDEO_TRACKS;
+        bool hasAudio = clip && (clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio);
         const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
         Texture2D wave = {0};
@@ -1097,7 +1097,7 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
     if (gMediaDropPreviewVisible && gMediaDropPreview.width > 0.f) {
         Rectangle ghost = gMediaDropPreview;
         bool audioGhost = gMediaDropPreviewClip >= 0
-            ? (gMediaDropPreviewClip < gTimelineClipCount && gTimelineClips[gMediaDropPreviewClip].track >= 4)
+            ? (gMediaDropPreviewClip < gTimelineClipCount && gTimelineClips[gMediaDropPreviewClip].track >= TIMELINE_MAX_VIDEO_TRACKS)
             : (gMediaDropPreviewMedia >= 0 && gMediaDropPreviewMedia < gImportedCount && strcmp(gImported[gMediaDropPreviewMedia].kind, "audio") == 0);
         int mediaIndex = gMediaDropPreviewClip >= 0 && gMediaDropPreviewClip < gTimelineClipCount
             ? gTimelineClips[gMediaDropPreviewClip].mediaIndex : gMediaDropPreviewMedia;
@@ -1244,7 +1244,7 @@ static void DrawPerfOverlay(void) {
     snprintf(line[2], sizeof(line[2]), "queue %.1f   setup %.1f   decode wait %.1f", gPerfQueueMs, gPerfSetupMs, gPerfDecodeMs);
     snprintf(line[3], sizeof(line[3]), "  of which: hw transfer %.1f   convert+scale %.1f", gPerfTransferMs, gPerfConvertMs);
     snprintf(line[4], sizeof(line[4]), "backend %.1f   upload %.1f   decoded-ahead %.1f frames", gPerfBackendMs, gPerfUploadMs, gPerfRingDepth);
-    snprintf(line[5], sizeof(line[5]), "gpu composite+readback %.1f   publish %.1f", gPerfCompositeMs, gPerfPublishMs);
+    snprintf(line[5], sizeof(line[5]), "gpu submit %.1f   async readback %.1f   publish %.1f", gPerfCompositeMs, gPerfReadbackMs, gPerfPublishMs);
     snprintf(line[6], sizeof(line[6]), "frames shown %u   discarded %u", gPerfShownFrames, gPerfDiscardedFrames);
     if (gPerfPath >= 1.5)
         snprintf(line[7], sizeof(line[7]), "decode: %s   PATH: FFMPEG FALLBACK (%s)   F3 hides", gPerfHwDecode >= .5 ? "HW" : "SW", (reason >= 0 && reason <= 6) ? reasons[reason] : "?");

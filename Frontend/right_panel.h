@@ -1370,7 +1370,7 @@ static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon,
 }
 
 static int TransitionNextClip(int from) {
-    if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track > 3) return -1;
+    if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track >= TIMELINE_MAX_VIDEO_TRACKS) return -1;
     float end = gTimelineClips[from].start + gTimelineClips[from].duration;
     int best = -1;
     for (int i = 0; i < gTimelineClipCount; i++) {
@@ -1799,19 +1799,20 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
     CreateDirectoryA(folder, NULL);
 
     if (clipId && *clipId) {
-        char slot0[MAX_PATH], slot1[MAX_PATH];
+        char slots[4][MAX_PATH];
         unsigned long long hash = PlutoTextPathHash(clipId);
-        if (snprintf(slot0, sizeof(slot0), "%s\\title-%016llx-0.tga", folder, hash) >= (int)sizeof(slot0) ||
-            snprintf(slot1, sizeof(slot1), "%s\\title-%016llx-1.tga", folder, hash) >= (int)sizeof(slot1)) return false;
-        /* The worker reads one preview at a time. Never rewrite the TGA path
-           used by that in-flight request; coalesce further edits into the
-           other slot until the worker returns. */
+        for (int i = 0; i < 4; i++)
+            if (snprintf(slots[i], sizeof(slots[i]), "%s\\title-%016llx-%d.tga", folder, hash, i) >= (int)sizeof(slots[i])) return false;
+        /* Three preview requests may be decoding simultaneously. Give every
+           in-flight title image a protected file and write edits into a fourth
+           slot that no worker is currently reading. */
         const char *chosen = NULL;
-        if (gPreviewTextPathInFlight[0] && strcmp(gPreviewTextPathInFlight, slot0) == 0) chosen = slot1;
-        else if (gPreviewTextPathInFlight[0] && strcmp(gPreviewTextPathInFlight, slot1) == 0) chosen = slot0;
-        else if (gTextOutputPath[0] && strcmp(gTextOutputPath, slot0) == 0) chosen = slot0;
-        else if (gTextOutputPath[0] && strcmp(gTextOutputPath, slot1) == 0) chosen = slot1;
-        else chosen = slot0;
+        if (gPreviewInFlightCount > 0) {
+            for (int i = 0; i < 4; i++) if (!PlutoPreviewPathInFlight(slots[i])) { chosen = slots[i]; break; }
+        } else {
+            for (int i = 0; i < 4; i++) if (gTextOutputPath[0] && strcmp(gTextOutputPath, slots[i]) == 0) { chosen = slots[i]; break; }
+        }
+        if (!chosen) chosen = slots[0];
         int n = snprintf(path, capacity, "%s", chosen);
         return n > 0 && (size_t)n < capacity;
     }
@@ -1827,16 +1828,16 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
     return n > 0 && (size_t)n < capacity;
 #else
     if (clipId && *clipId) {
-        char slot0[256], slot1[256];
+        char slots[4][256];
         unsigned long long hash = PlutoTextPathHash(clipId);
-        snprintf(slot0, sizeof(slot0), "Stella-title-%016llx-0.tga", hash);
-        snprintf(slot1, sizeof(slot1), "Stella-title-%016llx-1.tga", hash);
+        for (int i = 0; i < 4; i++) snprintf(slots[i], sizeof(slots[i]), "Stella-title-%016llx-%d.tga", hash, i);
         const char *chosen = NULL;
-        if (gPreviewTextPathInFlight[0] && strcmp(gPreviewTextPathInFlight, slot0) == 0) chosen = slot1;
-        else if (gPreviewTextPathInFlight[0] && strcmp(gPreviewTextPathInFlight, slot1) == 0) chosen = slot0;
-        else if (gTextOutputPath[0] && strcmp(gTextOutputPath, slot0) == 0) chosen = slot0;
-        else if (gTextOutputPath[0] && strcmp(gTextOutputPath, slot1) == 0) chosen = slot1;
-        else chosen = slot0;
+        if (gPreviewInFlightCount > 0) {
+            for (int i = 0; i < 4; i++) if (!PlutoPreviewPathInFlight(slots[i])) { chosen = slots[i]; break; }
+        } else {
+            for (int i = 0; i < 4; i++) if (gTextOutputPath[0] && strcmp(gTextOutputPath, slots[i]) == 0) { chosen = slots[i]; break; }
+        }
+        if (!chosen) chosen = slots[0];
         int n = snprintf(path, capacity, "%s", chosen);
         return n > 0 && (size_t)n < capacity;
     }
