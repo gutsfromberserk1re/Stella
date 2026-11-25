@@ -10,7 +10,7 @@
 
 ## Build
 
-The minimal HAL accessor is tied to upstream `wgpu`/`wgpu-hal` tag `v0.19.4`. The backend pins `wgpu` and `wgpu-hal` to `0.19.4`, and `glow` to the same `0.13.1` native-handle types used by that HAL release. Run this before local Windows Cargo builds; CI already runs it:
+The minimal HAL accessor is tied to upstream WGPU tag `v0.19.4`. The preparation script path-patches **`wgpu-core`, `wgpu-hal`, and `wgpu-types` together** from that one checkout, and makes the `cfg_aliases` build dependency standalone in both `wgpu-core` and `wgpu-hal`. This is required: patching only HAL mixes its path dependency on local `wgpu-types` with the registry `wgpu-core`/`wgpu-types` crates, producing duplicate Rust types and a cascade of `E0308` errors. The backend pins `wgpu` and `wgpu-hal` to `0.19.4`, and `glow` to the same `0.13.1` native-handle types used by that HAL release. Run this before local Windows Cargo builds; CI already runs it:
 
 ```powershell
 ./Backend/scripts/prepare-wgpu-gl-share.ps1

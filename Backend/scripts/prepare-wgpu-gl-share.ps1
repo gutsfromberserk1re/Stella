@@ -3,6 +3,8 @@ $backendRoot = Split-Path -Parent $PSScriptRoot
 $repoRoot = Split-Path -Parent $backendRoot
 $checkout = Join-Path $backendRoot '.interop\wgpu-0.19.4'
 $halRoot = Join-Path $checkout 'wgpu-hal'
+$coreRoot = Join-Path $checkout 'wgpu-core'
+$typesRoot = Join-Path $checkout 'wgpu-types'
 $configDir = Join-Path $repoRoot '.cargo'
 $configPath = Join-Path $configDir 'config.toml'
 
@@ -13,20 +15,42 @@ if (-not (Test-Path (Join-Path $halRoot 'src/gles/wgl.rs'))) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the wgpu v0.19.4 source required for the WGL interop accessor patch.' }
 }
 
-# The vendored wgpu-hal manifest normally inherits cfg_aliases from the
-# upstream WGPU workspace. When Cargo resolves this path patch from Stella's
-# nested Backend workspace, that inherited workspace dependency can be
-# resolved against the wrong workspace root. Make the leaf manifest
-# standalone with the exact cfg_aliases major/minor used by wgpu v0.19.4.
-$halManifest = Join-Path $halRoot 'Cargo.toml'
-$halManifestText = Get-Content -Raw $halManifest
-if ($halManifestText -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
-    $halManifestText = [regex]::Replace($halManifestText,
-        '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$', 'cfg_aliases = "0.1"', 1)
-    Set-Content -Path $halManifest -Value $halManifestText -NoNewline
+# wgpu-core and wgpu-hal both inherit cfg_aliases from the upstream WGPU
+# workspace. Cargo is resolving these path-patched crates from Stella's
+# separate Backend workspace, so make both build dependencies standalone.
+# Keep the exact cfg_aliases 0.1 line used by the v0.19.4 source family.
+function Set-StandaloneCfgAliases([string]$manifestPath, [string]$crateName) {
+    if (-not (Test-Path $manifestPath)) {
+        throw "The pinned WGPU checkout is missing $crateName/Cargo.toml."
+    }
+    $manifestText = Get-Content -Raw $manifestPath
+    if ($manifestText -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
+        $manifestText = [regex]::Replace($manifestText,
+            '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$', 'cfg_aliases = "0.1"', 1)
+        Set-Content -Path $manifestPath -Value $manifestText -NoNewline
+    }
+    if ((Get-Content -Raw $manifestPath) -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
+        throw "Could not make $crateName cfg_aliases independent of workspace inheritance."
+    }
 }
-if ((Get-Content -Raw $halManifest) -match '(?m)^cfg_aliases\.workspace\s*=\s*true\s*$') {
-    throw 'Could not make the vendored wgpu-hal cfg_aliases dependency independent of workspace inheritance.'
+
+Set-StandaloneCfgAliases (Join-Path $halRoot 'Cargo.toml') 'wgpu-hal'
+Set-StandaloneCfgAliases (Join-Path $coreRoot 'Cargo.toml') 'wgpu-core'
+
+# These three packages are one tightly-coupled WGPU ABI family. The patched
+# wgpu-hal depends on the sibling wgpu-types by path; wgpu-core must also come
+# from this checkout so it uses those same sibling types and HAL. Finally,
+# patch wgpu-types itself so the published wgpu 0.19.4 crate cannot pull a
+# second registry copy (0.19.2) into the graph. Mixing path and registry
+# copies produces hundreds of impossible cross-crate type conversions.
+foreach ($requiredPath in @(
+    (Join-Path $coreRoot 'Cargo.toml'),
+    (Join-Path $halRoot 'Cargo.toml'),
+    (Join-Path $typesRoot 'Cargo.toml')
+)) {
+    if (-not (Test-Path $requiredPath)) {
+        throw "Pinned WGPU source family is incomplete; missing $requiredPath."
+    }
 }
 
 $modPath = Join-Path $halRoot 'src/gles/mod.rs'
@@ -213,10 +237,17 @@ impl super::Adapter {
 }
 
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+$corePath = (Resolve-Path $coreRoot).Path.Replace('\', '/')
 $halPath = (Resolve-Path $halRoot).Path.Replace('\', '/')
+$typesPath = (Resolve-Path $typesRoot).Path.Replace('\', '/')
 @"
 [patch.crates-io]
+wgpu-core = { path = "$corePath" }
 wgpu-hal = { path = "$halPath" }
+wgpu-types = { path = "$typesPath" }
 "@ | Set-Content -Path $configPath
 
-Write-Host "Prepared patched wgpu-hal 0.19.4 at $halPath" -ForegroundColor Green
+Write-Host "Prepared one coherent WGPU v0.19.4 core/HAL/types source family:" -ForegroundColor Green
+Write-Host "  wgpu-core:  $corePath"
+Write-Host "  wgpu-hal:   $halPath"
+Write-Host "  wgpu-types: $typesPath"

@@ -14,8 +14,8 @@ serde_json = "1"
 
 # Native GPU preview compositor. FFmpeg remains responsible for codec decode/encode only.
 # Keep the public API, patched HAL, and native GL wrapper on one compatible release set.
-# The WGL interop build script patches wgpu-hal 0.19.4, and glow's native handle
-# types must be identical to the ones used inside that HAL build.
+# The WGL interop build script patches the matching wgpu-core / wgpu-hal /
+# wgpu-types 0.19.4 crate family. glow native handles must match that HAL build.
 wgpu = "=0.19.4"
 wgpu-hal = { version = "=0.19.4", default-features = false }
 pollster = "0.3"
