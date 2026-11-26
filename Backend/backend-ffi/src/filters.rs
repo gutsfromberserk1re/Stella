@@ -126,15 +126,18 @@ pub(crate) fn video_filters(clip: &Value, width: u32, height: u32, start: f64, l
     let vibrance = (n(color, "vibrance", 0.0) / 100.0).clamp(-1.0, 1.0);
     if vibrance.abs() > 0.001 { filters.push(format!("vibrance=intensity={vibrance:.4}")); }
 
-    let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0) as usize;
-    let hsl_key = hsl_index.to_string();
-    let hsl = &colors["hsl"][hsl_key.as_str()];
-    let hsl_hue = n(hsl, "hue", 0.0);
-    let hsl_saturation = (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0);
-    let hsl_intensity = (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5);
-    let hsl_range = ["a", "r", "r+y", "y", "g", "c", "b", "b+m", "m+r"][hsl_index];
-    if hsl_hue.abs() > 0.001 || hsl_saturation.abs() > 0.001 || hsl_intensity.abs() > 0.001 {
-        filters.push(format!("huesaturation=colors={hsl_range}:hue={hsl_hue:.3}:saturation={hsl_saturation:.4}:intensity={hsl_intensity:.4}:strength=100:lightness=1"));
+    // Apply every saved HSL band. `selected` is only the inspector's active
+    // swatch and must never decide which adjustments survive in the render.
+    let hsl_ranges = ["a", "r", "r+y", "y", "g", "c", "b", "b+m", "m+r"];
+    for (hsl_index, hsl_range) in hsl_ranges.iter().enumerate() {
+        let hsl_key = hsl_index.to_string();
+        let hsl = &colors["hsl"][hsl_key.as_str()];
+        let hsl_hue = n(hsl, "hue", 0.0);
+        let hsl_saturation = (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0);
+        let hsl_intensity = (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5);
+        if hsl_hue.abs() > 0.001 || hsl_saturation.abs() > 0.001 || hsl_intensity.abs() > 0.001 {
+            filters.push(format!("huesaturation=colors={hsl_range}:hue={hsl_hue:.3}:saturation={hsl_saturation:.4}:intensity={hsl_intensity:.4}:strength=100:lightness=1"));
+        }
     }
 
     /* Export-side color balance; preview evaluates the matching controls in WGSL below. */
@@ -412,6 +415,18 @@ mod tests {
         });
         let graph = audio_filters(&clip, 4.0, 4.0);
         assert!(graph.contains("volume=10.0000"), "unexpected audio filter chain: {graph}");
+    }
+
+    #[test]
+    fn video_export_applies_multiple_hsl_bands_not_only_the_selected_swatch() {
+        let clip = json!({"props": {"colors": {"hsl": {
+            "selected": 1,
+            "1": {"hue": 18.0, "saturation": 35.0},
+            "3": {"hue": -12.0, "lightness": 20.0}
+        }}}});
+        let (graph, _, _) = video_filters(&clip, 1920, 1080, 0.0, 2.0, None, None);
+        assert!(graph.contains("huesaturation=colors=r:hue=18.000:saturation=0.3500"), "red band missing: {graph}");
+        assert!(graph.contains("huesaturation=colors=y:hue=-12.000:saturation=0.0000:intensity=0.1000"), "yellow band missing: {graph}");
     }
 
     #[test]

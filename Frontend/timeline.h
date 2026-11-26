@@ -402,7 +402,7 @@ static int TimelineTrackUnderPointerForDrag(void) {
 static void TimelineBuildSnapCache(void) {
     gTimelineSnapPointCount = 0;
     for (int i = 0; i < gTimelineClipCount && gTimelineSnapPointCount + 1 < MAX_TIMELINE_CLIPS * 2; i++) {
-        if (!TimelineTrackIsVideo(gTimelineClips[i].track) || gTimelineClips[i].isSubtitle) continue;
+        if (gTimelineClips[i].isSubtitle) continue;
         gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start, i};
         gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start + gTimelineClips[i].duration, i};
     }
@@ -417,42 +417,63 @@ static void TimelinePrepareSnapCache(void) {
     }
 }
 
-static float TimelineSnapStart(float start, float duration, bool video, int movingIndex, float playhead, bool snapPlayhead, const char *excludeGroup) {
-    if (!video || !gTimelineSnap) return fmaxf(0.f, start);
+static float TimelineSnapStart(float start, float duration, int targetTrack, int movingIndex,
+                                float playhead, bool snapPlayhead, const char *excludeGroup,
+                                bool *snapEngaged) {
+    if (snapEngaged) *snapEngaged = false;
+    if (!gTimelineSnap || targetTrack < 0 || targetTrack >= TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS)
+        return fmaxf(0.f, start);
 
-    /* The magnet is proximity snapping only. The desired mouse position remains
-       the anchor; do not silently lock to the previous clip edge when snapping
-       is disabled. Dragging uses a prebuilt edge cache instead of rescanning all
-       clips on every pointer event. */
-    float snapThreshold = Clampf(13.f / fmaxf(1.f, TimelinePps()), .18f, .75f);
+    /* New media drops use the backend's fixed 250ms insertion-snap threshold;
+       clip moves use the zoom-aware threshold passed to timeline_move_clip. */
+    float snapThreshold = gMediaDragIndex >= 0 ? .25f : Clampf(13.f / fmaxf(1.f, TimelinePps()), .18f, .75f);
     float bestDistance = snapThreshold, snapped = fmaxf(0.f, start);
     if (gClipDragIndex >= 0 || gMediaDragIndex >= 0) {
         if (!gTimelineSnapCacheValid) TimelineBuildSnapCache();
         for (int i = 0; i < gTimelineSnapPointCount; i++) {
             TimelineSnapPoint point = gTimelineSnapPoints[i];
-            if (point.clipIndex == movingIndex ||
-                (excludeGroup && *excludeGroup &&
-                 strcmp(gTimelineClips[point.clipIndex].groupId, excludeGroup) == 0)) continue;
-            for (int edge = 0; edge < 2; edge++) {
-                float value = point.time - (edge ? duration : 0.f);
-                float distance = fabsf(value - start);
-                if (distance < bestDistance) { bestDistance = distance; snapped = fmaxf(0.f, value); }
+            int index = point.clipIndex;
+            if (index < 0 || index >= gTimelineClipCount || index == movingIndex ||
+                gTimelineClips[index].track == targetTrack || gTimelineClips[index].isSubtitle ||
+                (movingIndex >= 0 && movingIndex < gTimelineClipCount &&
+                 ((gTimelineClips[movingIndex].linkedId[0] &&
+                   strcmp(gTimelineClips[index].id, gTimelineClips[movingIndex].linkedId) == 0) ||
+                  (gTimelineClips[index].linkedId[0] &&
+                   strcmp(gTimelineClips[index].linkedId, gTimelineClips[movingIndex].id) == 0))) ||
+                (excludeGroup && *excludeGroup && strcmp(gTimelineClips[index].groupId, excludeGroup) == 0)) continue;
+            float distance = fabsf(point.time - start);
+            if (distance < bestDistance) {
+                bestDistance = distance; snapped = fmaxf(0.f, point.time);
+                if (snapEngaged) *snapEngaged = true;
+            }
+            float endAligned = point.time - duration;
+            distance = fabsf(endAligned - start);
+            if (distance < bestDistance) {
+                bestDistance = distance; snapped = fmaxf(0.f, endAligned);
+                if (snapEngaged) *snapEngaged = true;
             }
         }
         if (snapPlayhead) {
             for (int edge = 0; edge < 2; edge++) {
                 float value = playhead - (edge ? duration : 0.f);
                 float distance = fabsf(value - start);
-                if (distance < bestDistance) { bestDistance = distance; snapped = fmaxf(0.f, value); }
+                if (distance < bestDistance) {
+                    bestDistance = distance; snapped = fmaxf(0.f, value);
+                    if (snapEngaged) *snapEngaged = true;
+                }
             }
         }
         return snapped;
     }
 
-    /* Non-drag edits keep the uncached path so it always reflects the latest
-       project state. */
     for (int n = -1; n < gTimelineClipCount; n++) {
-        if (n == movingIndex || (n >= 0 && (!TimelineTrackIsVideo(gTimelineClips[n].track) || gTimelineClips[n].isSubtitle ||
+        if (n == movingIndex || (n >= 0 && (gTimelineClips[n].track == targetTrack ||
+            gTimelineClips[n].isSubtitle ||
+            (movingIndex >= 0 && movingIndex < gTimelineClipCount &&
+             ((gTimelineClips[movingIndex].linkedId[0] &&
+               strcmp(gTimelineClips[n].id, gTimelineClips[movingIndex].linkedId) == 0) ||
+              (gTimelineClips[n].linkedId[0] &&
+               strcmp(gTimelineClips[n].linkedId, gTimelineClips[movingIndex].id) == 0))) ||
             (excludeGroup && *excludeGroup && strcmp(gTimelineClips[n].groupId, excludeGroup) == 0)))) continue;
         float candidates[2]; int count = 0;
         if (n < 0) { if (snapPlayhead) candidates[count++] = playhead; }
@@ -460,37 +481,101 @@ static float TimelineSnapStart(float start, float duration, bool video, int movi
         for (int c = 0; c < count; c++) for (int edge = 0; edge < 2; edge++) {
             float value = candidates[c] - (edge ? duration : 0.f);
             float distance = fabsf(value - start);
-            if (distance < bestDistance) { bestDistance = distance; snapped = fmaxf(0.f, value); }
+            if (distance < bestDistance) {
+                bestDistance = distance; snapped = fmaxf(0.f, value);
+                if (snapEngaged) *snapEngaged = true;
+            }
         }
     }
     return snapped;
 }
 
-static bool TimelineTrackOverlaps(int track, float start, float duration, int excluded, const char *excludeGroup) {
-    for (int i = 0; i < gTimelineClipCount; i++) {
-        if (i == excluded || gTimelineClips[i].isSubtitle ||
-            (excludeGroup && *excludeGroup && strcmp(gTimelineClips[i].groupId, excludeGroup) == 0) ||
-            gTimelineClips[i].track != track) continue;
-        if (start < gTimelineClips[i].start + gTimelineClips[i].duration - .0001f &&
-            start + duration > gTimelineClips[i].start + .0001f) return true;
-    }
-    return false;
-}
+/* Mirrors Rust's lane-local magnetic insertion. If a clip/group is moved
+   within its source lane, project the surviving edges after closing only the
+   vacated interval(s) on that lane. Nearby cross-lane edges are handled by the
+   separate proximity snap; a remote V1 cut cannot pull a V2 clip across time. */
+static float TimelineMagneticStart(float start, float duration, int targetTrack, int movingIndex,
+                                   const char *excludeGroup) {
+    if (targetTrack < 0 || targetTrack >= TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS)
+        return fmaxf(0.f, start);
 
-static int TimelineClosestFreeTrack(int requested, float start, float duration, int excluded, const char *excludeGroup) {
-    int first = TimelineTrackIsVideo(requested) ? 0 : TIMELINE_MAX_VIDEO_TRACKS;
-    int last = TimelineTrackIsVideo(requested) ? TIMELINE_MAX_VIDEO_TRACKS - 1
-                                               : TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
-    int best = requested, bestDistance = 99;
-    for (int track = first; track <= last; track++) {
-        int distance = abs(track - requested);
-        bool tiePrefersHigherVideoLane = distance == bestDistance && TimelineTrackIsVideo(track) && track > best;
-        if ((distance < bestDistance || tiePrefersHigherVideoLane) && !TimelineTrackOverlaps(track, start, duration, excluded, excludeGroup)) {
-            best = track; bestDistance = distance;
+    float removedStarts[MAX_TIMELINE_CLIPS], removedEnds[MAX_TIMELINE_CLIPS];
+    int removedCount = 0;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        const TimelineClipUi *clip = &gTimelineClips[i];
+        bool moving = i == movingIndex || (excludeGroup && *excludeGroup &&
+            clip->groupId[0] && strcmp(clip->groupId, excludeGroup) == 0);
+        if (!moving || clip->track != targetTrack || clip->isSubtitle) continue;
+        removedStarts[removedCount] = clip->start;
+        removedEnds[removedCount] = clip->start + clip->duration;
+        removedCount++;
+    }
+    for (int i = 1; i < removedCount; i++) {
+        float begin = removedStarts[i], end = removedEnds[i];
+        int j = i - 1;
+        while (j >= 0 && removedStarts[j] > begin) {
+            removedStarts[j + 1] = removedStarts[j];
+            removedEnds[j + 1] = removedEnds[j];
+            j--;
+        }
+        removedStarts[j + 1] = begin;
+        removedEnds[j + 1] = end;
+    }
+    float mergedStarts[MAX_TIMELINE_CLIPS], mergedEnds[MAX_TIMELINE_CLIPS];
+    int mergedCount = 0;
+    for (int i = 0; i < removedCount; i++) {
+        if (mergedCount && removedStarts[i] <= mergedEnds[mergedCount - 1] + .0001f) {
+            mergedEnds[mergedCount - 1] = fmaxf(mergedEnds[mergedCount - 1], removedEnds[i]);
+        } else {
+            mergedStarts[mergedCount] = removedStarts[i];
+            mergedEnds[mergedCount] = removedEnds[i];
+            mergedCount++;
         }
     }
-    return best;
+
+    float bestStart = fmaxf(0.f, start), bestDistance = 1e30f;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        const TimelineClipUi *clip = &gTimelineClips[i];
+        bool moving = i == movingIndex || (excludeGroup && *excludeGroup &&
+            clip->groupId[0] && strcmp(clip->groupId, excludeGroup) == 0);
+        if (moving || clip->track != targetTrack || clip->isSubtitle) continue;
+        float shift = 0.f;
+        for (int r = 0; r < mergedCount; r++)
+            if (mergedEnds[r] <= clip->start + .0001f) shift += mergedEnds[r] - mergedStarts[r];
+        float projectedStart = fmaxf(0.f, clip->start - shift);
+        float projectedEnd = projectedStart + clip->duration;
+        float candidates[2] = {projectedEnd, projectedStart - duration};
+        for (int c = 0; c < 2; c++) {
+            float candidate = candidates[c];
+            if (!isfinite(candidate) || candidate < 0.f) continue;
+            bool startsInsideExisting = false;
+            for (int j = 0; j < gTimelineClipCount; j++) {
+                const TimelineClipUi *other = &gTimelineClips[j];
+                bool otherMoving = j == movingIndex || (excludeGroup && *excludeGroup &&
+                    other->groupId[0] && strcmp(other->groupId, excludeGroup) == 0);
+                if (otherMoving || other->track != targetTrack || other->isSubtitle) continue;
+                float otherShift = 0.f;
+                for (int r = 0; r < mergedCount; r++)
+                    if (mergedEnds[r] <= other->start + .0001f) otherShift += mergedEnds[r] - mergedStarts[r];
+                float otherStart = fmaxf(0.f, other->start - otherShift);
+                float otherEnd = otherStart + other->duration;
+                if (candidate > otherStart + .0001f && candidate < otherEnd - .0001f) {
+                    startsInsideExisting = true;
+                    break;
+                }
+            }
+            if (startsInsideExisting) continue;
+            float distance = fabsf(candidate - start);
+            if (distance < bestDistance - .00001f ||
+                (fabsf(distance - bestDistance) <= .00001f && candidate < bestStart)) {
+                bestDistance = distance;
+                bestStart = candidate;
+            }
+        }
+    }
+    return fmaxf(0.f, bestStart);
 }
+
 
 static const char *TimelineTrackLabel(int track) {
     static const char *labels[] = {"V1", "V2", "V3", "V4", "V5", "V6", "A1", "A2", "A3", "A4", "A5", "A6"};
@@ -776,9 +861,11 @@ static void TimelineClipLane(int track, float height) {
             ImportedMedia *media = &gImported[gMediaDragIndex];
             bool mediaIsAudio = strcmp(media->kind, "audio") == 0;
             if (mediaIsAudio == !TimelineTrackIsVideo(track)) {
-                float start = fmaxf(0.f, (GetMousePosition().x - lane.x - gTimelinePan) / pps);
-                start = TimelineSnapStart(start, media->duration, !mediaIsAudio, -1, 0.f, false, NULL);
-                int target = TimelineClosestFreeTrack(track, start, media->duration, -1, NULL);
+                float rawStart = fmaxf(0.f, (GetMousePosition().x - lane.x - gTimelinePan) / pps);
+                bool snapEngaged = false;
+                float start = TimelineSnapStart(rawStart, media->duration, track, -1, gPlayhead, false, NULL, &snapEngaged);
+                if (!snapEngaged) start = TimelineMagneticStart(start, media->duration, track, -1, NULL);
+                int target = track;
                 if (TimelineTrackIsVideo(target) && !TimelineVideoTrackIsVisible(target)) gTimelinePendingVideoTrack = target;
                 if (TimelineTrackIsAudio(target) && target > gTimelinePendingAudioTrack) gTimelinePendingAudioTrack = target;
                 Clay_BoundingBox targetBox = Clay_GetElementData(CLAY_IDI("TrackLane", target)).boundingBox;
@@ -928,11 +1015,14 @@ static void TimelineClipLane(int track, float height) {
                         (hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
                             ? hoveredTrack : gClipDragTrack);
                     Clay_BoundingBox targetLane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
-                    float start = fmaxf(0.f, (GetMousePosition().x - targetLane.x - gTimelinePan - gClipDragOffset) / pps);
-                    start = TimelineSnapStart(start, gTimelineClips[i].duration, true, i, gPlayhead, true,
-                                              gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
-                    int targetTrack = subtitleClip ? gTimelineClips[i].track : TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
-                                                               gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
+                    float rawStart = fmaxf(0.f, (GetMousePosition().x - targetLane.x - gTimelinePan - gClipDragOffset) / pps);
+                    bool snapEngaged = false;
+                    float start = TimelineSnapStart(rawStart, gTimelineClips[i].duration, requestedTrack, i, gPlayhead, true,
+                                                    gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL, &snapEngaged);
+                    if (!subtitleClip && !snapEngaged)
+                        start = TimelineMagneticStart(start, gTimelineClips[i].duration, requestedTrack, i,
+                                                      gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
+                    int targetTrack = subtitleClip ? gTimelineClips[i].track : requestedTrack;
                     if (TimelineTrackIsAudio(targetTrack) && targetTrack > gTimelinePendingAudioTrack) gTimelinePendingAudioTrack = targetTrack;
                     int displayTrack = subtitleClip ? TIMELINE_SUBTITLE_TRACK : targetTrack;
                     Clay_BoundingBox targetBox = Clay_GetElementData(CLAY_IDI("TrackLane", displayTrack)).boundingBox;
@@ -957,10 +1047,10 @@ static void TimelineClipLane(int track, float height) {
                     float start = targetLane.width > 0.f
                         ? fmaxf(0.f, (GetMousePosition().x - targetLane.x - gTimelinePan - gClipDragOffset) / pps)
                         : gTimelineClips[i].start;
-                    start = TimelineSnapStart(start, gTimelineClips[i].duration, true, i, gPlayhead, true,
-                                              gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
-                    int targetTrack = subtitleClip ? gTimelineClips[i].track : TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
-                                                               gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
+                    /* Send the raw pointer time to Rust. The preview above already
+                       shows its magnetic projection; Rust applies snapping, source-
+                       lane gap closing and destination-lane insertion exactly once. */
+                    int targetTrack = subtitleClip ? gTimelineClips[i].track : requestedTrack;
                     if (!PlutoTimelineMove(i, start, targetTrack)) {
                         gTimelineClips[i].start = gClipDragOrigStart;
                         gTimelineClips[i].track = gClipDragTrack;
@@ -1313,8 +1403,8 @@ static void Timeline(void) {
             if (audioTrack == (strcmp(media->kind, "audio") == 0)) {
                 Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", targetTrack)).boundingBox;
                 float start = lane.width > 0.f ? fmaxf(0.f, (mouse.x - lane.x - gTimelinePan) / pps) : 0.f;
-                start = TimelineSnapStart(start, media->duration, !audioTrack, -1, 0.f, false, NULL);
-                targetTrack = TimelineClosestFreeTrack(targetTrack, start, media->duration, -1, NULL);
+                /* Commit the raw drop time; timeline-core applies the same
+                   snapping/magnetic rules already shown in the drag preview. */
                 PlutoTimelineAddMedia(gMediaDragIndex, start, targetTrack);
             }
         }

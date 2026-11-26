@@ -16,7 +16,7 @@ struct Params {
     bal_s: vec4<f32>, // colour balance shadows    rgb
     bal_m: vec4<f32>, // colour balance midtones   rgb
     bal_h: vec4<f32>, // colour balance highlights rgb
-    hsl:   vec4<f32>, // hue_deg, sat(-1..1), lightness, range_index(0=all,1..8)
+    hsl:   array<vec4<f32>, 9>, // all + eight independent hue bands: hue_deg, sat(-1..1), lightness, reserved
     fx0:   vec4<f32>, // sharpen_amount, sharpen_radius_px, blur_value, blur_mode(0 off,1 gauss,2 motion,3 zoom)
     fx1:   vec4<f32>, // blur_angle_rad, vignette_amount(-1..1), vignette_mid, vignette_feather
     fx2:   vec4<f32>, // vignette_aspect, reserved, reserved, chroma_px
@@ -121,7 +121,8 @@ fn hue_rotate(c: vec3<f32>, deg: f32) -> vec3<f32> {
     return vec3<f32>(r, g, b);
 }
 
-// Centre hue (degrees) for hsl range index 1..8: r, r+y, y, g, c, b, b+m, m+r
+// Centre hue (degrees) for HSL bands 1..8: red, orange, yellow, green,
+// cyan, blue, violet, magenta. Band 0 is the global/all-colours adjustment.
 fn range_center(i: f32) -> f32 {
     if (i < 1.5) { return 0.0; }
     if (i < 2.5) { return 30.0; }
@@ -131,6 +132,16 @@ fn range_center(i: f32) -> f32 {
     if (i < 6.5) { return 240.0; }
     if (i < 7.5) { return 270.0; }
     return 330.0;
+}
+
+fn hsl_range_weight(source: vec3<f32>, center: f32) -> f32 {
+    let mx = max(source.r, max(source.g, source.b));
+    let mn = min(source.r, min(source.g, source.b));
+    var hue = degrees(atan2(1.7320508 * (source.g - source.b), 2.0 * source.r - source.g - source.b));
+    if (hue < 0.0) { hue = hue + 360.0; }
+    var distance = abs(hue - center);
+    distance = min(distance, 360.0 - distance);
+    return (1.0 - smoothstep(15.0, 45.0, distance)) * smoothstep(0.02, 0.15, mx - mn);
 }
 
 @fragment
@@ -284,22 +295,38 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         col = sat3(vec3<f32>(lv, lv, lv) + (col - vec3<f32>(lv, lv, lv)) * boost);
     }
 
-    // HSL for the selected range
-    if (abs(u.hsl.x) > 0.001 || abs(u.hsl.y) > 0.001 || abs(u.hsl.z) > 0.001) {
-        var w = 1.0;
-        if (u.hsl.w > 0.5) {
-            let mx = max(col.r, max(col.g, col.b));
-            let mn = min(col.r, min(col.g, col.b));
-            var hh = degrees(atan2(1.7320508 * (col.g - col.b), 2.0 * col.r - col.g - col.b));
-            if (hh < 0.0) { hh = hh + 360.0; }
-            var d = abs(hh - range_center(u.hsl.w));
-            d = min(d, 360.0 - d);
-            w = (1.0 - smoothstep(15.0, 45.0, d)) * smoothstep(0.02, 0.15, mx - mn);
-        }
-        let hr = hue_rotate(col, u.hsl.x * w);
+    // HSL mixer: the active inspector swatch is not a render filter. Apply
+    // the global band and all eight hue bands together on every frame. Build
+    // every mask from the same pre-HSL colour so one band's hue shift cannot
+    // move a pixel into/out of the next band's mask during this pass.
+    let hsl_source = col;
+    let w1 = hsl_range_weight(hsl_source, range_center(1.0));
+    let w2 = hsl_range_weight(hsl_source, range_center(2.0));
+    let w3 = hsl_range_weight(hsl_source, range_center(3.0));
+    let w4 = hsl_range_weight(hsl_source, range_center(4.0));
+    let w5 = hsl_range_weight(hsl_source, range_center(5.0));
+    let w6 = hsl_range_weight(hsl_source, range_center(6.0));
+    let w7 = hsl_range_weight(hsl_source, range_center(7.0));
+    let w8 = hsl_range_weight(hsl_source, range_center(8.0));
+    let total_weight = w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8;
+    let band_scale = min(total_weight, 1.0);
+    let band_hue = (u.hsl[1].x * w1 + u.hsl[2].x * w2 + u.hsl[3].x * w3 + u.hsl[4].x * w4
+        + u.hsl[5].x * w5 + u.hsl[6].x * w6 + u.hsl[7].x * w7 + u.hsl[8].x * w8)
+        / max(total_weight, 0.0001) * band_scale;
+    let band_saturation = (u.hsl[1].y * w1 + u.hsl[2].y * w2 + u.hsl[3].y * w3 + u.hsl[4].y * w4
+        + u.hsl[5].y * w5 + u.hsl[6].y * w6 + u.hsl[7].y * w7 + u.hsl[8].y * w8)
+        / max(total_weight, 0.0001) * band_scale;
+    let band_lightness = (u.hsl[1].z * w1 + u.hsl[2].z * w2 + u.hsl[3].z * w3 + u.hsl[4].z * w4
+        + u.hsl[5].z * w5 + u.hsl[6].z * w6 + u.hsl[7].z * w7 + u.hsl[8].z * w8)
+        / max(total_weight, 0.0001) * band_scale;
+    let hsl_hue = u.hsl[0].x + band_hue;
+    let hsl_saturation = u.hsl[0].y + band_saturation;
+    let hsl_lightness = u.hsl[0].z + band_lightness;
+    if (abs(hsl_hue) > 0.001 || abs(hsl_saturation) > 0.001 || abs(hsl_lightness) > 0.001) {
+        let hr = hue_rotate(col, hsl_hue);
         let lh = luma(hr);
-        var res = vec3<f32>(lh, lh, lh) + (hr - vec3<f32>(lh, lh, lh)) * (1.0 + u.hsl.y * w);
-        res = res + vec3<f32>(u.hsl.z * w, u.hsl.z * w, u.hsl.z * w);
+        var res = vec3<f32>(lh, lh, lh) + (hr - vec3<f32>(lh, lh, lh)) * max(0.0, 1.0 + hsl_saturation);
+        res = res + vec3<f32>(hsl_lightness, hsl_lightness, hsl_lightness);
         col = sat3(res);
     }
 

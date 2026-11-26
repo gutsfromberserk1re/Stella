@@ -6,8 +6,8 @@
 //! are mapped here once. `filters.rs` remains responsible for audio filters;
 //! active preview and final-export rendering do not use FFmpeg video filters.
 //!
-//! Layout rule: every field is a `[f32; 4]` so the Rust struct has exactly the
-//! same std140 layout as `Params` in preview.wgsl (no padding surprises).
+//! Layout rule: scalar parameter slots are `[f32; 4]`; the HSL mixer is nine
+//! consecutive vec4 slots. This matches the WGSL uniform layout exactly.
 use serde_json::Value;
 
 #[repr(C)]
@@ -23,7 +23,7 @@ pub struct LayerUniforms {
     pub bal_s: [f32; 4],
     pub bal_m: [f32; 4],
     pub bal_h: [f32; 4],
-    pub hsl: [f32; 4],   // hue_deg, sat, lightness, range_index
+    pub hsl: [[f32; 4]; 9], // all + eight independent hue bands: hue_deg, sat, lightness, reserved
     pub fx0: [f32; 4],   // sharpen_amount, sharpen_radius_px, blur_value, blur_mode
     pub fx1: [f32; 4],   // blur_angle, vignette_amount, vignette_mid, vignette_feather
     pub fx2: [f32; 4],   // vignette_aspect, reserved, reserved, chroma_px
@@ -106,7 +106,7 @@ impl LayerUniforms {
             bal_s: [0.0; 4],
             bal_m: [0.0; 4],
             bal_h: [0.0; 4],
-            hsl: [0.0, 0.0, 0.0, 0.0],
+            hsl: [[0.0; 4]; 9],
             fx0: [0.0, 2.5, 0.0, 0.0],
             fx1: [0.0, 0.0, 0.55, 0.5],
             fx2: [1.0, 0.0, 1.0, 0.0],
@@ -307,15 +307,19 @@ impl LayerUniforms {
         ];
 
         // ------------------------------------------------------------------ HSL
-        let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0);
-        let hsl_key = (hsl_index as usize).to_string();
-        let hsl = &colors["hsl"][hsl_key.as_str()];
-        u.hsl = [
-            n(hsl, "hue", 0.0) as f32,
-            (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
-            (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5) as f32,
-            hsl_index as f32,
-        ];
+        // The selected swatch is inspector UI state only. Every hue band's
+        // saved values must reach the renderer at once so changing the active
+        // swatch never disables the adjustments made to previous bands.
+        for index in 0..9 {
+            let hsl_key = index.to_string();
+            let hsl = &colors["hsl"][hsl_key.as_str()];
+            u.hsl[index] = [
+                n(hsl, "hue", 0.0) as f32,
+                (n(hsl, "saturation", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+                (n(hsl, "lightness", 0.0) / 200.0).clamp(-0.5, 0.5) as f32,
+                0.0,
+            ];
+        }
 
         // ------------------------------------------- colour balance (wheels etc.)
         // Colour wheels only affect their colour bands. Tonal lift/cut for
@@ -638,12 +642,33 @@ mod tests {
         assert!((u.fx10[1] - 30.0).abs() < 1e-5);
         assert!((u.fx10[2] - 0.5).abs() < 1e-5);
         assert!(u.bal_s[0] > 0.2);
-        assert_eq!(u.hsl[3], 3.0);
-        assert_eq!(u.hsl[0], 20.0);
+        assert_eq!(u.hsl[3][0], 20.0);
+        assert_eq!(u.hsl[3][1], 0.5);
+        assert_eq!(u.hsl[3][2], 0.1);
         assert_eq!(u.fx0[3], 1.0);
         assert!((u.fx0[2] - 8.0).abs() < 1e-5);
         assert_eq!(u.fx4[0], 20.0);
         assert_eq!(u.geo1[2], 1.0);
+    }
+
+    #[test]
+    fn every_hsl_band_reaches_preview_uniforms_independent_of_selected_swatch() {
+        let mut hsl = serde_json::Map::new();
+        hsl.insert("selected".into(), json!(1));
+        for index in 0..9 {
+            hsl.insert(index.to_string(), json!({
+                "hue": (index as f64) * 7.0 - 21.0,
+                "saturation": (index as f64) * 10.0,
+                "lightness": (index as f64) * -5.0
+            }));
+        }
+        let props = json!({"colors": {"hsl": Value::Object(hsl)}});
+        let uniforms = LayerUniforms::from_props(&props, 0.0);
+        for index in 0..9 {
+            assert!((uniforms.hsl[index][0] - (index as f32 * 7.0 - 21.0)).abs() < 1e-5);
+            assert!((uniforms.hsl[index][1] - (index as f32 * 0.1)).abs() < 1e-5);
+            assert!((uniforms.hsl[index][2] - (index as f32 * -0.025)).abs() < 1e-5);
+        }
     }
 
     #[test]
