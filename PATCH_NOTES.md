@@ -19,3 +19,7 @@ This source update covers the timeline, preview, color, effects, text, subtitle,
 ## Verification
 
 The source files and ZIP archive were checked for consistency and archive integrity. This environment does not contain Cargo/Rust, Raylib headers, or Clay headers, so the Rust tests and native application could not be compiled or run here. A local Windows build and playback/export pass are still required.
+
+## CI compile fix — Clay horizontal layout
+- Replaced the undefined `ROW` layout shorthand in the Subtitles empty-state and cue rows with Clay's explicit `CLAY_LEFT_TO_RIGHT` layout direction.
+- Checked the frontend sources for any remaining `ROW` references; none remain.

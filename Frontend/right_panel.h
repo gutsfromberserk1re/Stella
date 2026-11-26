@@ -2880,7 +2880,7 @@ static void TextView(void) {
                                  gSubtitleCardOpen, false, true))
             gSubtitleCardOpen = !gSubtitleCardOpen;
         if (gSubtitleCardOpen) {
-            CLAY(CLAY_ID("SubtitleEmptyState"), {.layout = {ROW, .sizing = {GROW, FIX(78)},
+            CLAY(CLAY_ID("SubtitleEmptyState"), {.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(78)},
                                                          .padding = {12, 12, 12, 12}, .childAlignment = AL_Y, .childGap = 9},
                                                   .backgroundColor = C_RCARD,
                                                   .cornerRadius = {0.f, 0.f, 16.f, 16.f}}) {
@@ -2917,7 +2917,7 @@ static void TextView(void) {
                             gTimelinePlaying = false;
                             gPreviewDirty = true;
                         }
-                        CLAY(cueId, {.layout = {ROW, .sizing = {GROW, FIX(34)}, .padding = {9, 7, 7, 7}, .childAlignment = AL_Y, .childGap = 8},
+                        CLAY(cueId, {.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(34)}, .padding = {9, 7, 7, 7}, .childAlignment = AL_Y, .childGap = 8},
                                       .backgroundColor = BtnBg(RGB(31, 32, 37), RGB(43, 45, 52), cueHover),
                                       .cornerRadius = CLAY_CORNER_RADIUS(8),
                                       .border = {.color = Mix(C_RCARDB, RGB(74, 77, 85), cueHover.hover * .4f),
