@@ -76,8 +76,8 @@ static TIMELINE_REVISION: AtomicU64 = AtomicU64::new(1);
 /// actually changed, and playback frames just clone the `Arc`.
 static PREVIEW_SNAPSHOT: OnceLock<Mutex<Option<(u64, Arc<Timeline>)>>> = OnceLock::new();
 
-const PREVIEW_WORKERS: usize = 2;
-const MAX_PREVIEW_IN_FLIGHT: usize = 3;
+const PREVIEW_WORKERS: usize = 1;
+const MAX_PREVIEW_IN_FLIGHT: usize = 1;
 const MAX_STORED_PREVIEW_FRAMES: usize = 8;
 
 struct PreviewFrame {
@@ -571,6 +571,7 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, proxy_tas
                 result
             }
             "export_project" => export_project(&request, id),
+            "generate_subtitles" => generate_subtitles(&request, id),
             "" => Err("Background command is required".into()),
             other => Err(format!("Unsupported background command: {other}")),
         };
@@ -1008,6 +1009,106 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     }))
 }
 
+fn parse_srt_timestamp(value: &str) -> Option<f64> {
+    let value = value.trim().replace(',', ".");
+    let mut parts = value.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hours < 0.0 || minutes < 0.0 || seconds < 0.0 || minutes >= 60.0 || seconds >= 60.0 {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn parse_srt_cues(source: &str, clip_duration: f64, clip_start: f64) -> Vec<Value> {
+    let normalized = source.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    let mut cues = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+
+    let mut flush_block = |lines: &[&str], cues: &mut Vec<Value>| {
+        if lines.is_empty() { return; }
+        // Search for the timestamp instead of assuming a numeric cue index.
+        let Some(timing_index) = lines.iter().position(|line| line.contains("-->")) else { return; };
+        let Some((from, to)) = lines[timing_index].split_once("-->") else { return; };
+        let Some(start) = parse_srt_timestamp(from) else { return; };
+        let Some(end) = parse_srt_timestamp(to.split_whitespace().next().unwrap_or_default()) else { return; };
+        let text = lines[timing_index + 1..].iter().map(|line| line.trim())
+            .filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n").trim().to_owned();
+        let start = start.clamp(0.0, clip_duration.max(0.0));
+        let end = end.clamp(0.0, clip_duration.max(0.0));
+        if text.is_empty() || end <= start + 0.015 { return; }
+        cues.push(json!({"start": clip_start + start, "end": clip_start + end, "text": text}));
+    };
+
+    // SRT files can use blank lines containing spaces; normalize those too.
+    for line in normalized.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            flush_block(&block, &mut cues);
+            block.clear();
+        } else {
+            block.push(line);
+        }
+    }
+    cues
+}
+
+fn generate_subtitles(request: &Value, request_id: u64) -> Result<Value, String> {
+    use std::path::{Path, PathBuf};
+    let source = request["path"].as_str().filter(|value| !value.is_empty())
+        .ok_or("Subtitle source path is required")?;
+    let whisper_cli = request["whisperPath"].as_str().filter(|value| !value.is_empty())
+        .ok_or("Select the whisper-cli executable first")?;
+    let model = request["modelPath"].as_str().filter(|value| !value.is_empty())
+        .ok_or("Select a Whisper model first")?;
+    let source_offset = request["sourceOffset"].as_f64().unwrap_or(0.0).max(0.0);
+    let duration = request["duration"].as_f64().unwrap_or(0.0);
+    let clip_start = request["clipStart"].as_f64().unwrap_or(0.0).max(0.0);
+    if !Path::new(source).is_file() { return Err("The source video file could not be found".into()); }
+    if !Path::new(whisper_cli).is_file() { return Err("The selected whisper-cli executable could not be found".into()); }
+    if !Path::new(model).is_file() { return Err("The selected Whisper model could not be found".into()); }
+    if !duration.is_finite() || duration <= 0.02 { return Err("The selected video clip has no usable duration".into()); }
+
+    let cache_dir = std::env::temp_dir().join("stella-subtitles");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Could not create subtitle cache: {e}"))?;
+    let base: PathBuf = cache_dir.join(format!("subtitle-{request_id}"));
+    let wav = base.with_extension("wav");
+    let srt = base.with_extension("srt");
+    let ffmpeg = multimedia_binary("ffmpeg");
+    let extract = media_command(ffmpeg)
+        .arg("-hide_banner").arg("-loglevel").arg("error")
+        .arg("-i").arg(source)
+        .arg("-ss").arg(format!("{source_offset:.6}"))
+        .arg("-t").arg(format!("{duration:.6}"))
+        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y"])
+        .arg(&wav)
+        .output()
+        .map_err(|e| format!("Could not start FFmpeg for subtitle audio: {e}"))?;
+    if !extract.status.success() {
+        let _ = std::fs::remove_file(&wav);
+        let detail = String::from_utf8_lossy(&extract.stderr).trim().to_owned();
+        return Err(if detail.is_empty() { "Could not extract audio from this video".into() } else { detail });
+    }
+
+    let whisper = media_command(whisper_cli)
+        .arg("-m").arg(model)
+        .arg("-f").arg(&wav)
+        .arg("-osrt").arg("-of").arg(&base)
+        .arg("-np")
+        .output()
+        .map_err(|e| format!("Could not start Whisper: {e}"))?;
+    let _ = std::fs::remove_file(&wav);
+    if !whisper.status.success() {
+        let detail = String::from_utf8_lossy(&whisper.stderr).trim().to_owned();
+        return Err(if detail.is_empty() { "Whisper failed to transcribe this clip".into() } else { detail });
+    }
+    let srt_text = std::fs::read_to_string(&srt)
+        .map_err(|e| format!("Whisper completed but its subtitle file could not be read: {e}"))?;
+    let cues = parse_srt_cues(&srt_text, duration, clip_start);
+    if cues.is_empty() { return Err("Whisper did not detect any speech in the selected clip".into()); }
+    Ok(json!({"cues": cues, "cueCount": cues.len(), "clipStart": clip_start, "duration": duration}))
+}
+
 fn multimedia_binary(name: &str) -> std::path::PathBuf {
     use std::path::PathBuf;
     let filename = if cfg!(windows) {
@@ -1156,7 +1257,10 @@ fn transition_between(left: &Clip, right: &Clip) -> Option<(String, f64)> {
 /// adjacent entries in a globally sorted multi-lane list. An overlay clip on
 /// V2 must not break a transition between two consecutive clips on V1.
 fn same_track_neighbor_indices(clips: &[&Clip]) -> Vec<(usize, usize)> {
-    let mut order: Vec<usize> = (0..clips.len()).collect();
+    let mut order: Vec<usize> = (0..clips.len()).filter(|index| {
+        clips[*index].extra.get("props").and_then(|p| p.get("text"))
+            .and_then(|text| text.get("isSubtitle")).and_then(Value::as_bool) != Some(true)
+    }).collect();
     order.sort_by(|left, right| {
         clips[*left].track.sort_index().cmp(&clips[*right].track.sort_index())
             .then_with(|| clips[*left].start.total_cmp(&clips[*right].start))
@@ -1165,6 +1269,17 @@ fn same_track_neighbor_indices(clips: &[&Clip]) -> Vec<(usize, usize)> {
     order.windows(2).filter_map(|pair| {
         (clips[pair[0]].track == clips[pair[1]].track).then_some((pair[0], pair[1]))
     }).collect()
+}
+
+/// Shared compositing order for preview and export. Subtitles are always above
+/// every ordinary visual layer, including clips stored on the V6 backing lane.
+fn composite_clip_order(a: &&Clip, b: &&Clip) -> std::cmp::Ordering {
+    let is_subtitle = |clip: &Clip| clip.extra.get("props").and_then(|p| p.get("text"))
+        .and_then(|t| t.get("isSubtitle")).and_then(Value::as_bool).unwrap_or(false);
+    is_subtitle(a).cmp(&is_subtitle(b))
+        .then_with(|| a.track.sort_index().cmp(&b.track.sort_index()))
+        .then_with(|| a.start.total_cmp(&b.start))
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 fn transition_preroll_source_time(source_offset: f64, duration: f64, elapsed: f64) -> f64 {
@@ -1432,10 +1547,7 @@ fn render_wgpu_export_frame(
     let mut ordered_video: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
         clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
     }).collect();
-    ordered_video.sort_by(|a, b| {
-        a.track.sort_index().cmp(&b.track.sort_index())
-            .then_with(|| a.start.total_cmp(&b.start))
-    });
+    ordered_video.sort_by(composite_clip_order);
 
     let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
     let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
@@ -1463,10 +1575,7 @@ fn render_wgpu_export_frame(
             active.push(*clip);
         }
     }
-    active.sort_by(|a, b| {
-        a.track.sort_index().cmp(&b.track.sort_index())
-            .then_with(|| a.start.total_cmp(&b.start))
-    });
+    active.sort_by(composite_clip_order);
 
     let max_source_width = export_source_width(width, height);
     let mut decoded_frames = Vec::with_capacity(active.len());
@@ -1947,10 +2056,7 @@ impl PreviewEngine {
         let mut ordered_video: Vec<&Clip> = timeline.clips.iter().filter(|clip| {
             clip.track.is_video() && clip.extra.get("kind").and_then(Value::as_str) != Some("audio")
         }).collect();
-        ordered_video.sort_by(|a, b| {
-            let rank = |track: TrackId| track.sort_index();
-            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
-        });
+        ordered_video.sort_by(composite_clip_order);
         let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
         let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
         for (left_index, right_index) in same_track_neighbor_indices(&ordered_video) {
@@ -1994,10 +2100,7 @@ impl PreviewEngine {
 
         // Keep compositing order stable for every layer. Within one track, the
         // incoming clip must sit above the outgoing clip during its transition.
-        active.sort_by(|a, b| {
-            let rank = |track: TrackId| track.sort_index();
-            rank(a.track).cmp(&rank(b.track)).then_with(|| a.start.total_cmp(&b.start))
-        });
+        active.sort_by(composite_clip_order);
 
         // Video keyframes and still-image layers both use the same WGPU
         // uniforms/compositor. Still images are loaded once by the decode worker.
@@ -2255,6 +2358,67 @@ fn dispatch(request: Value) -> Result<Value, String> {
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
+        "timeline_add_clips" => {
+            let before = timeline.clone();
+            let clips: Vec<Clip> =
+                serde_json::from_value(request["clips"].clone()).map_err(|e| e.to_string())?;
+            if clips.is_empty() { return Err("At least one clip is required".into()); }
+            for clip in clips {
+                timeline.add_clip(clip).map_err(|e| format!("{e:?}"))?;
+            }
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_delete_clips" => {
+            let before = timeline.clone();
+            let ids = request["ids"].as_array().ok_or("Clip ids are required")?;
+            if ids.is_empty() { return Err("At least one clip id is required".into()); }
+            for id in ids {
+                let id = id.as_str().ok_or("Clip ids must be strings")?;
+                timeline.delete_clip(id).map_err(|e| format!("{e:?}"))?;
+            }
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_replace_subtitles" => {
+            let source_id = request["sourceClipId"].as_str().filter(|value| !value.is_empty())
+                .ok_or("Subtitle source clip id is required")?;
+            let source_clip = timeline.clips.iter().find(|clip| clip.id == source_id)
+                .ok_or("The source video clip no longer exists")?;
+            if !source_clip.track.is_video() || source_clip.extra.get("kind").and_then(Value::as_str) == Some("audio") {
+                return Err("Subtitle source must be a video clip".into());
+            }
+            let clips: Vec<Clip> = serde_json::from_value(request["clips"].clone())
+                .map_err(|e| e.to_string())?;
+            if clips.is_empty() { return Err("At least one subtitle cue is required".into()); }
+            for clip in &clips {
+                let is_subtitle = clip.extra.get("props").and_then(|p| p.get("text"))
+                    .and_then(|t| t.get("isSubtitle")).and_then(Value::as_bool) == Some(true);
+                let belongs_to_source = clip.extra.get("props").and_then(|p| p.get("text"))
+                    .and_then(|t| t.get("sourceClipId")).and_then(Value::as_str) == Some(source_id);
+                if !is_subtitle || !belongs_to_source {
+                    return Err("Subtitle cue metadata does not match its source clip".into());
+                }
+            }
+            let before = timeline.clone();
+            let old_ids: Vec<String> = timeline.clips.iter().filter(|clip| {
+                clip.extra.get("props").and_then(|p| p.get("text"))
+                    .and_then(|t| t.get("isSubtitle")).and_then(Value::as_bool) == Some(true)
+                    && clip.extra.get("props").and_then(|p| p.get("text"))
+                        .and_then(|t| t.get("sourceClipId")).and_then(Value::as_str) == Some(source_id)
+            }).map(|clip| clip.id.clone()).collect();
+            let replacement = (|| -> Result<(), String> {
+                for id in old_ids { timeline.delete_clip(&id).map_err(|e| format!("{e:?}"))?; }
+                for clip in clips { timeline.add_clip(clip).map_err(|e| format!("{e:?}"))?; }
+                Ok(())
+            })();
+            if let Err(error) = replacement {
+                *timeline = before;
+                return Err(error);
+            }
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
         "timeline_update_title_clip" => {
             let live = request["live"].as_bool().unwrap_or(false);
             let before = begin_history_change(backend, &timeline, live)?;
@@ -2298,6 +2462,26 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let id = request["id"].as_str().ok_or("Clip id is required")?;
             let audio_id = request["audioId"].as_str().ok_or("Audio clip id is required")?;
             timeline.separate_audio(id, audio_id.to_owned()).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_link_clips" => {
+            let before = timeline.clone();
+            let video_id = request["videoId"].as_str().ok_or("Video clip id is required")?;
+            let audio_id = request["audioId"].as_str().ok_or("Audio clip id is required")?;
+            timeline.link_clips(video_id, audio_id).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_relink_clip" => {
+            let before = timeline.clone();
+            let id = request["id"].as_str().ok_or("Clip id is required")?;
+            let path = request["path"].as_str().ok_or("Media path is required")?;
+            let label = request["label"].as_str().unwrap_or_default();
+            let duration = request["sourceDuration"].as_f64().ok_or("Media duration is required")?;
+            let kind = request["kind"].as_str().unwrap_or_default();
+            let has_audio = request["hasAudio"].as_bool().unwrap_or(false);
+            timeline.relink_clip(id, path, label, duration, kind, has_audio).map_err(|e| format!("{e:?}"))?;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
@@ -3207,6 +3391,19 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_compositing_is_above_every_video_lane() {
+        let mut video = test_clip("v6-video");
+        video.track = TrackId::V6;
+        let mut subtitle = test_clip("caption");
+        subtitle.track = TrackId::V6;
+        subtitle.extra.insert("props".into(), json!({"text": {"isSubtitle": true}}));
+        let mut ordered = vec![&subtitle, &video];
+        ordered.sort_by(composite_clip_order);
+        assert_eq!(ordered[0].id, "v6-video");
+        assert_eq!(ordered[1].id, "caption");
+    }
+
+    #[test]
     fn relative_property_paths_remain_supported() {
         let mut clip = test_clip("relative-path-test");
         set_clip_property(&mut clip, "audio.fadeInDuration", json!(1.25)).unwrap();
@@ -3215,4 +3412,34 @@ mod tests {
             Some(1.25)
         );
     }
+
+    #[test]
+    fn parses_srt_cues_and_applies_timeline_offset() {
+        let srt = "1\n00:00:00,500 --> 00:00:01,750\nHello\nworld\n\n2\n00:00:02,000 --> 00:00:03,000\nSecond cue\n";
+        let cues = parse_srt_cues(srt, 5.0, 12.0);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0]["start"].as_f64(), Some(12.5));
+        assert_eq!(cues[0]["end"].as_f64(), Some(13.75));
+        assert_eq!(cues[0]["text"].as_str(), Some("Hello\nworld"));
+    }
+
+    #[test]
+    fn srt_parser_accepts_whitespace_only_blank_lines_and_optional_cue_ids() {
+        let srt = "speaker-a\n00:00:00,250 --> 00:00:01,500\nFirst line\nsecond line\n   \n00:00:01,600 --> 00:00:02,000\nNext\n";
+        let cues = parse_srt_cues(srt, 3.0, 10.0);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0]["start"].as_f64(), Some(10.25));
+        assert_eq!(cues[0]["text"].as_str(), Some("First line\nsecond line"));
+        assert_eq!(cues[1]["text"].as_str(), Some("Next"));
+    }
+
+    #[test]
+    fn srt_cues_outside_trimmed_duration_are_clamped() {
+        let srt = "1\n00:00:04,000 --> 00:00:08,000\nTrimmed\n";
+        let cues = parse_srt_cues(srt, 5.0, 3.0);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0]["start"].as_f64(), Some(7.0));
+        assert_eq!(cues[0]["end"].as_f64(), Some(8.0));
+    }
+
 }

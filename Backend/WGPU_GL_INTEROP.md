@@ -10,7 +10,7 @@
 
 ## Build
 
-The minimal HAL accessor is tied to upstream WGPU tag `v0.19.4`. The preparation script path-patches **`wgpu-core`, `wgpu-hal`, and `wgpu-types` together** from that one checkout, and makes the `cfg_aliases` build dependency standalone in both `wgpu-core` and `wgpu-hal`. This is required: patching only HAL mixes its path dependency on local `wgpu-types` with the registry `wgpu-core`/`wgpu-types` crates, producing duplicate Rust types and a cascade of `E0308` errors. The backend pins `wgpu` and `wgpu-hal` to `0.19.4`, and `glow` to the same `0.13.1` native-handle types used by that HAL release. Run this before local Windows Cargo builds; CI already runs it:
+The minimal HAL accessor is tied to upstream WGPU tag `v0.19.4`. The preparation script path-patches **`wgpu-core`, `wgpu-hal`, `wgpu-types`, and `naga` together** from that one checkout, and makes the `cfg_aliases` build dependency standalone in both `wgpu-core` and `wgpu-hal`. This is required: patching only HAL mixes its path dependency on local `wgpu-types` with the registry `wgpu-core`/`wgpu-types` crates, producing duplicate Rust types and a cascade of `E0308` errors. The backend pins `wgpu` and `wgpu-hal` to `0.19.4`, and `glow` to the same `0.13.1` native-handle types used by that HAL release. Run this before local Windows Cargo builds; CI already runs it:
 
 ```powershell
 ./Backend/scripts/prepare-wgpu-gl-share.ps1
@@ -28,13 +28,19 @@ The script creates `Backend/.interop/wgpu-0.19.4` and root `.cargo/config.toml`;
 
 ### Vendored WGPU warning hygiene
 
-The preparation script registers WGPU 0.19.4's legacy custom cfg names with
-`cargo:rustc-check-cfg` from the two upstream build scripts. It applies
-`unused_qualifications` and `mismatched_lifetime_syntaxes` allowances only after
-the upstream crate-root `warn` attributes in `wgpu-core` and `wgpu-hal`, where
-Cargo manifest lint settings alone did not override those explicit warnings.
-It also replaces four deprecated primitive `MAX`/`MIN` paths with identical
-associated constants. These are warning-only compatibility edits: no WGPU
-behavior, validation, synchronization, or platform/backend code is removed.
-Warnings in Stella's own active code remain visible; retained legacy FFmpeg
-preview helpers carry local `dead_code` annotations instead of being deleted.
+The preparation script keeps `wgpu-core`, `wgpu-hal`, `wgpu-types`, and Naga on
+the same pinned v0.19.4 source family. It registers the legacy custom `cfg`
+names used by WGPU, Naga's test-only `validate` cfg value, and the `impl-default`
+cfg emitted by `winapi::STRUCT!`. It applies style-only lint allowances inside
+the vendored WGPU/Naga crates only; Stella's own warnings remain enabled.
+
+The script also makes warning-only compatibility fixes where semantics are
+clear: deprecated primitive sentinel constants become their equivalent
+associated constants, Naga's deprecated `IndexMap::remove` becomes
+`swap_remove` to preserve the existing swap-removal behavior, and an unused DX12 CBV register
+increment after its final clone is removed. Naga's WGSL local-handle arena is
+retained and locally annotated because it documents/holds stable handles and
+source spans for diagnostics. The old `cfg_aliases` build-script macro warning
+is scoped to the two WGPU build scripts. No backend, shader validation,
+synchronization, or rendering feature is removed, and no blanket warning or
+error suppression is applied to Stella's own crates.

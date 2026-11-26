@@ -27,6 +27,9 @@ struct Params {
     fx7:   vec4<f32>, // halftone_angle_rad, burn_amount, burn_warmth, burn_spread
     fx8:   vec4<f32>, // burn_flicker, leak_amount, leak_warmth, leak_position
     fx9:   vec4<f32>, // sine_wave_amplitude_px, frequency_cycles, speed_hz, reserved
+    tone0: vec4<f32>, // exposure_ev, brightness_add, shadows, highlights
+    tone1: vec4<f32>, // blacks, whites, reserved, reserved
+    fx10:  vec4<f32>, // grain_amount, grain_size_px, roughness, reserved
 };
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
@@ -252,10 +255,25 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     // ---------------------------------------------------------- colour grading
-    // exposure/brightness + contrast + saturation (ffmpeg eq)
-    col = (col - vec3<f32>(0.5, 0.5, 0.5)) * u.light.y + vec3<f32>(0.5, 0.5, 0.5) + vec3<f32>(u.light.x, u.light.x, u.light.x);
+    // Exposure is a real stop-based multiplier; brightness remains a gentle
+    // additive trim. Apply contrast around middle grey before saturation.
+    col = col * exp2(clamp(u.tone0.x, -4.0, 4.0));
+    col = (col - vec3<f32>(0.5, 0.5, 0.5)) * u.light.y
+        + vec3<f32>(0.5 + u.tone0.y, 0.5 + u.tone0.y, 0.5 + u.tone0.y);
     let lm = luma(col);
     col = sat3(vec3<f32>(lm, lm, lm) + (col - vec3<f32>(lm, lm, lm)) * u.light.z);
+    // Separate tonal ranges. These smooth masks make blacks/whites distinct
+    // from the broader shadows/highlights controls and prevent abrupt clipping.
+    let tone_luma = luma(col);
+    let shadow_mask = 1.0 - smoothstep(0.10, 0.62, tone_luma);
+    let highlight_mask = smoothstep(0.38, 0.94, tone_luma);
+    let black_mask = 1.0 - smoothstep(0.015, 0.30, tone_luma);
+    let white_mask = smoothstep(0.70, 0.995, tone_luma);
+    let tonal_adjust = u.tone0.z * shadow_mask * 0.18
+        + u.tone0.w * highlight_mask * 0.18
+        + u.tone1.x * black_mask * 0.16
+        + u.tone1.y * white_mask * 0.16;
+    col = sat3(col + vec3<f32>(tonal_adjust, tonal_adjust, tonal_adjust));
 
     // vibrance: boosts low-saturation pixels more
     if (abs(u.light.w) > 0.001) {
@@ -349,6 +367,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let radius = clamp(0.14 + u.fx8.z * 0.38, 0.14, 0.52);
         let hot = max(0.0, 1.0 - abs(lin.x - u.fx8.w) / radius);
         col = sat3(col + vec3<f32>(u.fx8.y, u.fx8.y * (0.25 + u.fx8.z * 0.2), u.fx8.y * (1.0 - u.fx8.z) * 0.25) * hot);
+    }
+
+    // Stable, frame-independent film grain. Pixel size and roughness control
+    // the noise cell scale and distribution without introducing temporal crawl.
+    if (u.fx10.x > 0.0001) {
+        let grain_size = max(1.0, u.fx10.y);
+        let cell = floor(in.uv * tgt / grain_size);
+        let seed = dot(cell, vec2<f32>(12.9898, 78.233));
+        let random_value = fract(sin(seed) * 43758.5453) * 2.0 - 1.0;
+        let rough = mix(0.55, 1.35, u.fx10.z);
+        let grain = random_value * u.fx10.x * rough;
+        col = sat3(col + vec3<f32>(grain, grain, grain));
     }
 
     // Incoming transition masks are evaluated on the GPU with the same

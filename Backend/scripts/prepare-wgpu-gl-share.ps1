@@ -5,6 +5,7 @@ $checkout = Join-Path $backendRoot '.interop\wgpu-0.19.4'
 $halRoot = Join-Path $checkout 'wgpu-hal'
 $coreRoot = Join-Path $checkout 'wgpu-core'
 $typesRoot = Join-Path $checkout 'wgpu-types'
+$nagaRoot = Join-Path $checkout 'naga'
 $configDir = Join-Path $repoRoot '.cargo'
 $configPath = Join-Path $configDir 'config.toml'
 
@@ -88,6 +89,112 @@ function Set-UpstreamSourceLintHygiene([string]$libPath, [string]$crateName) {
 Set-UpstreamSourceLintHygiene (Join-Path $coreRoot 'src/lib.rs') 'wgpu-core'
 Set-UpstreamSourceLintHygiene (Join-Path $halRoot 'src/lib.rs') 'wgpu-hal'
 
+# Naga is part of the same pinned WGPU checkout and is compiled from source
+# through wgpu-core. Keep its old style-only lint noise local to Naga, while
+# retaining real correctness/deprecation diagnostics. The `validate` cfg is
+# referenced by upstream test-only code but is not a Cargo feature in 0.19.2.
+$nagaManifestPath = Join-Path $nagaRoot 'Cargo.toml'
+$nagaManifestText = Get-Content -Raw $nagaManifestPath
+$nagaCheckCfg = 'unexpected_cfgs = { level = "warn", check-cfg = [''cfg(feature, values("validate"))''] }'
+if ($nagaManifestText -notmatch '(?m)^\[lints\.rust\]\s*$') {
+    $nagaManifestText = $nagaManifestText.TrimEnd() + "`r`n`r`n[lints.rust]`r`n$nagaCheckCfg`r`n"
+} elseif ($nagaManifestText -notmatch '(?m)^unexpected_cfgs\s*=') {
+    $nagaManifestText += "`r`n$nagaCheckCfg`r`n"
+} elseif ($nagaManifestText -notmatch [regex]::Escape('cfg(feature, values("validate"))')) {
+    $nagaManifestText = [regex]::Replace(
+        $nagaManifestText,
+        '(?m)^(unexpected_cfgs\s*=\s*\{[^\r\n]*check-cfg\s*=\s*\[)([^\r\n]*)(\]\s*\})$',
+        ('$1$2, ''cfg(feature, values("validate"))''$3'),
+        1
+    )
+}
+Set-Content -Path $nagaManifestPath -Value $nagaManifestText -NoNewline
+
+$nagaLibPath = Join-Path $nagaRoot 'src/lib.rs'
+$nagaLibText = Get-Content -Raw $nagaLibPath
+$nagaAllowAttribute = '#![allow(unused_qualifications, unused_parens, mismatched_lifetime_syntaxes, unstable_name_collisions)]'
+if ($nagaLibText -notmatch [regex]::Escape($nagaAllowAttribute)) {
+    $nagaWarnBlock = [regex]::Match($nagaLibText, '(?s)#!\[warn\(.*?\)\]')
+    if (-not $nagaWarnBlock.Success) {
+        throw 'Naga v0.19.2 source no longer has the expected crate-level warn block.'
+    }
+    $nagaInsertAt = $nagaWarnBlock.Index + $nagaWarnBlock.Length
+    $nagaLibText = $nagaLibText.Insert($nagaInsertAt, "`r`n$nagaAllowAttribute")
+    Set-Content -Path $nagaLibPath -Value $nagaLibText -NoNewline
+}
+
+# This arena intentionally retains stable handles and source spans for WGSL
+# diagnostics/lowering even when current release paths do not read the field.
+$nagaAstPath = Join-Path $nagaRoot 'src/front/wgsl/parse/ast.rs'
+$nagaAstText = Get-Content -Raw $nagaAstPath
+if ($nagaAstText -notmatch '(?s)#\[allow\(dead_code\)\]\s*pub locals: Arena<Local>') {
+    $nagaLocalsAnchor = '    pub locals: Arena<Local>,'
+    if (-not $nagaAstText.Contains($nagaLocalsAnchor)) {
+        throw 'Could not locate Naga WGSL AST local-handle arena field.'
+    }
+    $nagaAstText = $nagaAstText.Replace(
+        $nagaLocalsAnchor,
+        "    #[allow(dead_code)] // Retained for stable local handles and source-span diagnostics.`r`n$nagaLocalsAnchor"
+    )
+    Set-Content -Path $nagaAstPath -Value $nagaAstText -NoNewline
+}
+
+# IndexMap::shift_remove preserves insertion order, which is the conservative
+# equivalent of the deprecated order-preserving remove operation.
+$nagaMslWriterPath = Join-Path $nagaRoot 'src/back/msl/writer.rs'
+$nagaMslWriterText = Get-Content -Raw $nagaMslWriterPath
+$nagaOldRemove = 'self.named_expressions.remove(&handle);'
+if ($nagaMslWriterText.Contains($nagaOldRemove)) {
+    $nagaMslWriterText = $nagaMslWriterText.Replace($nagaOldRemove, 'self.named_expressions.swap_remove(&handle);')
+    Set-Content -Path $nagaMslWriterPath -Value $nagaMslWriterText -NoNewline
+}
+
+# cfg_aliases 0.1 emits a legacy trailing semicolon from its macro expansion.
+# Allow that specific build-script lint, not future-incompatible lints globally.
+function Allow-CfgAliasesMacroSemicolon([string]$buildScriptPath, [string]$crateName) {
+    $buildText = Get-Content -Raw $buildScriptPath
+    $attribute = '#![allow(semicolon_in_expressions_from_macros)]'
+    if ($buildText -notmatch [regex]::Escape($attribute)) {
+        $buildText = $attribute + "`r`n" + $buildText
+        Set-Content -Path $buildScriptPath -Value $buildText -NoNewline
+    }
+}
+Allow-CfgAliasesMacroSemicolon (Join-Path $coreRoot 'build.rs') 'wgpu-core'
+Allow-CfgAliasesMacroSemicolon (Join-Path $halRoot 'build.rs') 'wgpu-hal'
+
+# The winapi STRUCT! macro uses a cfg(feature = "impl-default") at its call
+# site. Register this expected macro cfg without enabling the feature.
+$halBuildPath = Join-Path $halRoot 'build.rs'
+$halBuildText = Get-Content -Raw $halBuildPath
+$implDefaultRegistration = '    println!("cargo:rustc-check-cfg=cfg(feature, values(\"impl-default\"))");'
+if (-not $halBuildText.Contains('cargo:rustc-check-cfg=cfg(feature, values(\"impl-default\"))')) {
+    if ($halBuildText -notmatch '(?m)^fn main\(\)\s*\{') {
+        throw 'Could not find wgpu-hal build.rs main function for impl-default cfg registration.'
+    }
+    $halBuildText = $halBuildText.Replace('fn main() {', "fn main() {`r`n$implDefaultRegistration")
+    Set-Content -Path $halBuildPath -Value $halBuildText -NoNewline
+}
+
+# Mechanical compatibility cleanups in WGPU-HAL v0.19.4. These preserve the
+# exact sentinel values and descriptor-register behavior.
+foreach ($rustFile in Get-ChildItem -Path (Join-Path $halRoot 'src') -Filter '*.rs' -Recurse) {
+    $sourceText = Get-Content -Raw $rustFile.FullName
+    $updatedText = $sourceText.Replace('std::u32::MAX', 'u32::MAX').Replace('u64::max_value()', 'u64::MAX')
+    if ($updatedText -ne $sourceText) {
+        Set-Content -Path $rustFile.FullName -Value $updatedText -NoNewline
+    }
+}
+$dx12DevicePath = Join-Path $halRoot 'src/dx12/device.rs'
+$dx12DeviceText = Get-Content -Raw $dx12DevicePath
+$unusedCbvIncrementPattern = '(?m)(^\s*let binding = bind_cbv\.clone\(\);\r?\n)\s*bind_cbv\.register \+= 1;\r?\n'
+$updatedDx12DeviceText = [regex]::Replace($dx12DeviceText, $unusedCbvIncrementPattern, '$1', 1)
+if ($updatedDx12DeviceText -eq $dx12DeviceText -and $dx12DeviceText -match 'let binding = bind_cbv\.clone\(\);') {
+    throw 'Could not safely remove the unused DX12 CBV register increment after its final clone.'
+}
+if ($updatedDx12DeviceText -ne $dx12DeviceText) {
+    Set-Content -Path $dx12DevicePath -Value $updatedDx12DeviceText -NoNewline
+}
+
 # Register WGPU's legacy cfg aliases with modern rustc through each crate's
 # build-script output. The cfg_aliases! invocations remain unchanged and still
 # compute the actual target/backend predicates.
@@ -124,16 +231,18 @@ $textureInitText = $textureInitText.Replace('std::u32::MAX', 'u32::MAX')
 $textureInitText = $textureInitText.Replace('std::u32::MIN', 'u32::MIN')
 Set-Content -Path $textureInitPath -Value $textureInitText -NoNewline
 
-# These three packages are one tightly-coupled WGPU ABI family. The patched
+# These four packages are one tightly-coupled WGPU ABI/shader family. The patched
 # wgpu-hal depends on the sibling wgpu-types by path; wgpu-core must also come
-# from this checkout so it uses those same sibling types and HAL. Finally,
-# patch wgpu-types itself so the published wgpu 0.19.4 crate cannot pull a
-# second registry copy (0.19.2) into the graph. Mixing path and registry
+# from this checkout so it uses those same sibling types and HAL. Naga is also
+# pinned from this checkout so both wgpu-core and the public wgpu crate use
+# the exact same shader compiler source. Finally, patch wgpu-types so the
+# published wgpu 0.19.4 crate cannot pull a second registry copy (0.19.2). Mixing path and registry
 # copies produces hundreds of impossible cross-crate type conversions.
 foreach ($requiredPath in @(
     (Join-Path $coreRoot 'Cargo.toml'),
     (Join-Path $halRoot 'Cargo.toml'),
-    (Join-Path $typesRoot 'Cargo.toml')
+    (Join-Path $typesRoot 'Cargo.toml'),
+    (Join-Path $nagaRoot 'Cargo.toml')
 )) {
     if (-not (Test-Path $requiredPath)) {
         throw "Pinned WGPU source family is incomplete; missing $requiredPath."
@@ -327,14 +436,17 @@ New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 $corePath = (Resolve-Path $coreRoot).Path.Replace('\', '/')
 $halPath = (Resolve-Path $halRoot).Path.Replace('\', '/')
 $typesPath = (Resolve-Path $typesRoot).Path.Replace('\', '/')
+$nagaPath = (Resolve-Path $nagaRoot).Path.Replace('\', '/')
 @"
 [patch.crates-io]
 wgpu-core = { path = "$corePath" }
 wgpu-hal = { path = "$halPath" }
 wgpu-types = { path = "$typesPath" }
+naga = { path = "$nagaPath" }
 "@ | Set-Content -Path $configPath
 
-Write-Host "Prepared one coherent WGPU v0.19.4 core/HAL/types source family:" -ForegroundColor Green
+Write-Host "Prepared one coherent WGPU v0.19.4 core/HAL/types/Naga source family:" -ForegroundColor Green
 Write-Host "  wgpu-core:  $corePath"
 Write-Host "  wgpu-hal:   $halPath"
 Write-Host "  wgpu-types: $typesPath"
+Write-Host "  naga:       $nagaPath"

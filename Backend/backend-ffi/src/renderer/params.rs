@@ -34,6 +34,9 @@ pub struct LayerUniforms {
     pub fx7: [f32; 4],   // halftone_angle, burn_amount, burn_warmth, burn_spread
     pub fx8: [f32; 4],   // burn_flicker, leak_amount, leak_warmth, leak_position
     pub fx9: [f32; 4],   // sine_wave_amplitude_px, frequency_cycles, speed_hz, reserved
+    pub tone0: [f32; 4], // exposure_ev, brightness_add, shadows, highlights
+    pub tone1: [f32; 4], // blacks, whites, reserved, reserved
+    pub fx10: [f32; 4],  // grain_amount, grain_size_px, roughness, reserved
 }
 
 fn n(value: &Value, key: &str, fallback: f64) -> f64 {
@@ -114,6 +117,9 @@ impl LayerUniforms {
             fx7: [0.0, 0.0, 0.0, 0.5],
             fx8: [0.0, 0.0, 0.0, 0.0],
             fx9: [0.0; 4],
+            tone0: [0.0, 0.0, 0.0, 0.0],
+            tone1: [0.0; 4],
+            fx10: [0.0; 4],
         }
     }
 
@@ -265,8 +271,14 @@ impl LayerUniforms {
         }
 
         // ---------------------------------------------------------------- light
-        let mut brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
-        let mut contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
+        // Exposure is stored in the inspector's -100..100 range. Convert it
+        // to +/-4 photographic stops instead of adding it directly to RGB;
+        // the previous additive mapping made a value of +1 add 0.5 to every
+        // channel and clipped most footage to white.
+        let mut exposure_ev = (n(light, "exposure", 0.0) / 25.0).clamp(-4.0, 4.0);
+        let mut brightness = (n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-0.25, 0.25);
+        let mut contrast = (2.0_f64.powf((n(light, "contrast", 0.0) / 100.0
+            + n(detail, "clarity", 0.0) / 180.0).clamp(-2.0, 2.0))).clamp(0.25, 4.0);
         let mut saturation = (1.0 + n(color, "saturation", 0.0) / 100.0).clamp(0.0, 3.0);
         let vibrance = (n(color, "vibrance", 0.0) / 100.0).clamp(-1.0, 1.0);
         match preset {
@@ -274,6 +286,7 @@ impl LayerUniforms {
             "noir" => { saturation *= 1.0 - preset_intensity; contrast *= 1.0 + 0.2 * preset_intensity; brightness -= 0.02 * preset_intensity; }
             "fade" => { contrast *= 1.0 - 0.16 * preset_intensity; brightness += 0.08 * preset_intensity; saturation *= 1.0 - 0.2 * preset_intensity; }
             "cinema" => { contrast *= 1.0 + 0.15 * preset_intensity; saturation *= 1.0 - 0.15 * preset_intensity; }
+            "retro" => { contrast *= 1.0 - 0.12 * preset_intensity; saturation *= 1.0 - 0.18 * preset_intensity; brightness += 0.025 * preset_intensity; }
             "teal_orange" => { saturation *= 1.0 + 0.12 * preset_intensity; contrast *= 1.0 + 0.05 * preset_intensity; }
             "sepia" => { saturation *= 1.0 - 0.62 * preset_intensity; }
             "bleach" => { contrast *= 1.0 + 0.30 * preset_intensity; saturation *= 1.0 - 0.55 * preset_intensity; }
@@ -281,6 +294,17 @@ impl LayerUniforms {
             _ => {}
         }
         u.light = [brightness as f32, contrast as f32, saturation as f32, vibrance as f32];
+        u.tone0 = [
+            exposure_ev as f32,
+            brightness as f32,
+            (n(light, "shadows", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+            (n(light, "highlights", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+        ];
+        u.tone1 = [
+            (n(light, "blacks", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+            (n(light, "whites", 0.0) / 100.0).clamp(-1.0, 1.0) as f32,
+            0.0, 0.0,
+        ];
 
         // ------------------------------------------------------------------ HSL
         let hsl_index = n(&colors["hsl"], "selected", 0.0).round().clamp(0.0, 8.0);
@@ -294,12 +318,10 @@ impl LayerUniforms {
         ];
 
         // ------------------------------------------- colour balance (wheels etc.)
-        // Same maths as filters.rs: [shadows rgb, midtones rgb, highlights rgb].
+        // Colour wheels only affect their colour bands. Tonal lift/cut for
+        // shadows/highlights/blacks/whites is handled independently in the
+        // shader, so those sliders no longer masquerade as colour balance.
         let mut balance = [0.0_f64; 9];
-        let shadow_lift = ((n(light, "shadows", 0.0) + n(light, "blacks", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
-        let highlight_gain = ((n(light, "highlights", 0.0) + n(light, "whites", 0.0)) / 100.0 * 0.2).clamp(-0.4, 0.4);
-        for channel in 0..3 { balance[channel] += shadow_lift; }
-        for channel in 6..9 { balance[channel] += highlight_gain; }
         let temperature = (n(color, "temperature", 0.0) / 100.0).clamp(-1.0, 1.0);
         for band in [0usize, 3, 6] {
             balance[band] += temperature;
@@ -319,6 +341,7 @@ impl LayerUniforms {
         match preset {
             "warm" => for band in [0usize, 3, 6] { balance[band] += 0.12 * preset_intensity; balance[band + 2] -= 0.10 * preset_intensity; },
             "cool" => for band in [0usize, 3, 6] { balance[band] -= 0.08 * preset_intensity; balance[band + 2] += 0.12 * preset_intensity; },
+            "retro" => for band in [0usize, 3, 6] { balance[band] += 0.045 * preset_intensity; balance[band + 1] += 0.015 * preset_intensity; balance[band + 2] -= 0.035 * preset_intensity; },
             "teal_orange" => {
                 balance[0] -= 0.08 * preset_intensity; balance[1] += 0.025 * preset_intensity; balance[2] += 0.15 * preset_intensity;
                 balance[3] += 0.025 * preset_intensity; balance[4] += 0.02 * preset_intensity;
@@ -350,11 +373,13 @@ impl LayerUniforms {
         let blur_angle = 0.0_f64;
         if on(effects, "blur") {
             let b = &effects["blur"];
-            // Gaussian blur is the single supported mode so preview and export
-            // use the same kernel family and the same strength mapping.
-            let amount = n(b, "amount", 0.0);
-            blur_mode = 1.0;
-            blur_value = (amount * 0.08).max(0.1);
+            let amount = n(b, "amount", 0.0).clamp(0.0, 100.0);
+            let mode = b["mode"].as_str().unwrap_or("gaussian");
+            match mode {
+                "motion" => { blur_mode = 2.0; blur_value = amount * 0.12; }
+                "zoom" => { blur_mode = 3.0; blur_value = amount / 100.0 * 0.12; }
+                _ => { blur_mode = 1.0; blur_value = (amount * 0.08).max(0.1); }
+            }
         }
         u.fx0 = [sharpen.min(3.0) as f32, sharpen_radius as f32, blur_value as f32, blur_mode as f32];
 
@@ -448,6 +473,17 @@ impl LayerUniforms {
                 n(waves, "amount", 12.0).clamp(0.0, 100.0) as f32,
                 n(waves, "frequency", 3.5).clamp(1.0, 24.0) as f32,
                 n(waves, "speed", 1.2).clamp(0.0, 10.0) as f32,
+                0.0,
+            ]
+        } else {
+            [0.0; 4]
+        };
+        u.fx10 = if on(effects, "grain") {
+            let grain = &effects["grain"];
+            [
+                (n(grain, "amount", 35.0).clamp(0.0, 100.0) / 100.0 * 0.16) as f32,
+                n(grain, "size", 30.0).clamp(1.0, 100.0) as f32,
+                (n(grain, "roughness", 50.0).clamp(0.0, 100.0) / 100.0) as f32,
                 0.0,
             ]
         } else {
@@ -588,14 +624,19 @@ mod tests {
                        "grading": {"shadows": {"hue": 0.0, "amount": 100.0}},
                        "hsl": {"selected": 3, "3": {"hue": 20.0, "saturation": 50.0, "lightness": 20.0}}},
             "effects": {"blur": {"enabled": true, "amount": 100.0, "mode": "gaussian"},
+                        "grain": {"enabled": true, "amount": 80.0, "size": 30.0, "roughness": 50.0},
                         "pixelate": {"enabled": true, "size": 20.0, "blend": 100.0},
                         "mirror": {"enabled": true}}
         });
         let u = LayerUniforms::from_props(&props, 0.0);
-        assert!((u.light[0] - 0.5).abs() < 1e-6);
-        assert!((u.light[1] - 1.5).abs() < 1e-6);
+        assert_eq!(u.light[0], 0.0);
+        assert!((u.light[1] - 2.0_f32.sqrt()).abs() < 1e-5);
         assert_eq!(u.light[2], 0.0);
         assert!((u.light[3] - 0.4).abs() < 1e-6);
+        assert!((u.tone0[0] - 0.04).abs() < 1e-6, "+1 exposure must be a gentle 0.04-stop lift");
+        assert!((u.fx10[0] - 0.128).abs() < 1e-5);
+        assert!((u.fx10[1] - 30.0).abs() < 1e-5);
+        assert!((u.fx10[2] - 0.5).abs() < 1e-5);
         assert!(u.bal_s[0] > 0.2);
         assert_eq!(u.hsl[3], 3.0);
         assert_eq!(u.hsl[0], 20.0);
@@ -639,7 +680,6 @@ mod tests {
     fn retired_effects_do_not_change_preview_uniforms() {
         let neutral = LayerUniforms::from_props(&Value::Null, 0.5);
         let legacy = json!({"effects": {
-            "grain": {"enabled": true, "amount": 80.0},
             "lens": {"enabled": true, "amount": 100.0},
             "fisheye": {"enabled": true, "amount": 100.0},
             "glitch": {"enabled": true, "amount": 100.0},
@@ -653,6 +693,31 @@ mod tests {
         assert_eq!(actual.fx6[0..2], neutral.fx6[0..2]);
     }
 
+
+    #[test]
+    fn light_controls_have_separate_exposure_contrast_and_tonal_range_values() {
+        let props = json!({"colors": {"light": {
+            "exposure": 1.0, "contrast": 50.0, "shadows": 40.0,
+            "highlights": -30.0, "blacks": 20.0, "whites": -15.0
+        }}});
+        let u = LayerUniforms::from_props(&props, 0.0);
+        assert!((u.tone0[0] - 0.04).abs() < 1e-6);
+        assert!((u.light[1] - 2.0_f32.sqrt()).abs() < 1e-5);
+        assert!((u.tone0[2] - 0.4).abs() < 1e-6);
+        assert!((u.tone0[3] + 0.3).abs() < 1e-6);
+        assert!((u.tone1[0] - 0.2).abs() < 1e-6);
+        assert!((u.tone1[1] + 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn retro_preset_changes_the_same_uniform_path_as_other_presets() {
+        let props = json!({"effects": {"preset": {"id": "retro", "intensity": 100.0}}});
+        let u = LayerUniforms::from_props(&props, 0.0);
+        assert!(u.light[1] < 1.0);
+        assert!(u.light[2] < 1.0);
+        assert!(u.tone0[1] > 0.0);
+        assert!(u.bal_s[0] > 0.0);
+    }
 
     #[test]
     fn new_transition_kinds_map_to_distinct_gpu_modes() {

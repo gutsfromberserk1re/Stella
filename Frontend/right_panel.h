@@ -27,8 +27,8 @@ static float SlDefault(int gi) {
 }
 
 /* Effects with editable preview/export parameters. Expansion and enabled
-   state are intentionally independent: clicking a row opens its controls,
-   while the trailing plus/minus button enables or disables the effect. */
+   state are intentionally independent: the card header opens/closes controls;
+   the Enabled switch inside the card body changes whether the effect is applied. */
 #define VIDEO_FX_COUNT 2
 static float gFxV[VIDEO_FX_COUNT][3] = {{.3f, .5f, .5f}, {.3f, .5f, .5f}};
 static float gFxSent[VIDEO_FX_COUNT][3] = {{.3f, .5f, .5f}, {.3f, .5f, .5f}};
@@ -44,13 +44,13 @@ static bool gFxOn[VIDEO_FX_COUNT];
 static bool gFxSlDrag[VIDEO_FX_COUNT][3];
 static int gFxOpen = -1;
 static bool gVfxOpen = false, gFiltOpen = false;
-static const char *gExtraFxNames[] = {"Gaussian Blur", "Vignette", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror", "Sine Waves"};
-static const char *gExtraFxKeys[] = {"blur", "vignette", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror", "sineWaves"};
+static const char *gExtraFxNames[] = {"Gaussian Blur", "Grain", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror", "Sine Waves"};
+static const char *gExtraFxKeys[] = {"blur", "grain", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror", "sineWaves"};
 #define EXTRA_FX_COUNT 11
 typedef struct { const char *label, *field, *suffix; float min, max, initial; } ExtraFxParamDef;
 static const ExtraFxParamDef gExtraFxParams[EXTRA_FX_COUNT][4] = {
-    {{"Amount", "amount", "%", 0.f, 100.f, 22.f}},
-    {{"Amount", "amount", "%", 0.f, 100.f, 50.f}, {"Midpoint", "midpoint", "%", 0.f, 100.f, 50.f}, {"Roundness", "roundness", "%", 0.f, 100.f, 0.f}, {"Feather", "feather", "%", 0.f, 100.f, 65.f}},
+    {{"Amount", "amount", "%", 0.f, 100.f, 25.f}},
+    {{"Amount", "amount", "", 0.f, 100.f, 35.f}, {"Size", "size", "", 1.f, 100.f, 30.f}, {"Roughness", "roughness", "", 0.f, 100.f, 50.f}},
     {{"Amount", "amount", "%", 0.f, 100.f, 45.f}, {"Radius", "radius", "px", 1.f, 23.f, 5.f}, {"Threshold", "threshold", "%", 0.f, 100.f, 10.f}},
     {{"Spacing", "spacing", "px", 1.f, 20.f, 4.f}, {"Amount", "amount", "%", 0.f, 100.f, 32.f}},
     {{"Amount", "amount", "%", 0.f, 100.f, 18.f}, {"Frequency", "frequency", "Hz", .5f, 30.f, 8.f}, {"Smoothness", "smoothness", "%", 0.f, 100.f, 35.f}},
@@ -61,13 +61,14 @@ static const ExtraFxParamDef gExtraFxParams[EXTRA_FX_COUNT][4] = {
     {{0}},
     {{"Amount", "amount", "px", 0.f, 100.f, 12.f}, {"Frequency", "frequency", "", 1.f, 24.f, 3.5f}, {"Speed", "speed", "Hz", 0.f, 10.f, 1.2f}}
 };
-static const int gExtraFxParamCount[EXTRA_FX_COUNT] = {1, 4, 3, 2, 3, 4, 3, 2, 3, 0, 3};
+static const int gExtraFxParamCount[EXTRA_FX_COUNT] = {1, 3, 3, 2, 3, 4, 3, 2, 3, 0, 3};
 static float gExtraFxV[EXTRA_FX_COUNT][4];
 static float gExtraFxSent[EXTRA_FX_COUNT][4];
 static bool gExtraFxSlDrag[EXTRA_FX_COUNT][4];
 static bool gExtraFxOn[EXTRA_FX_COUNT];
 static int gExtraFxOpen = -1;
-static float gExtraFxBodyHeight[EXTRA_FX_COUNT] = {100.f, 250.f, 205.f, 155.f, 205.f, 250.f, 205.f, 155.f, 205.f, 88.f, 205.f};
+static float gExtraFxBodyHeight[EXTRA_FX_COUNT] = {180.f, 205.f, 205.f, 155.f, 205.f, 250.f, 205.f, 155.f, 205.f, 88.f, 205.f};
+static int gBlurMode; /* 0 Gaussian, 1 Motion, 2 Zoom */
 static int gFilter;
 
 static int PlutoTextColorChannel(float value) {
@@ -170,7 +171,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         {"props.colors.detail.sharpness", "props.colors.detail.clarity", "props.colors.detail.vignette"}
     };
     static const char *wheelNames[3] = {"shadows", "tint", "highlights"};
-    static const char *presetNames[6] = {"none", "vivid", "noir", "fade", "warm", "cool"};
+    static const char *presetNames[8] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro"};
     static const char *effectNames[2] = {"chromatic", "pixelate"};
     static const char *audioPaths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
 
@@ -248,6 +249,12 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         }
     }
     gExtraFxOpen = -1;
+    char blurMode[24] = {0};
+    gBlurMode = 0;
+    if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.blur.mode", blurMode, sizeof(blurMode))) {
+        if (strcmp(blurMode, "motion") == 0) gBlurMode = 1;
+        else if (strcmp(blurMode, "zoom") == 0) gBlurMode = 2;
+    }
     for (int i = 0; i < EXTRA_FX_COUNT; i++) {
         char path[128]; snprintf(path, sizeof(path), "props.effects.%s.enabled", gExtraFxKeys[i]);
         gExtraFxOn[i] = false; PlutoJsonBoolPath(clipBegin, clipEnd, path, &gExtraFxOn[i]);
@@ -264,16 +271,29 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     char preset[32] = {0};
     gFilter = 0;
     if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.preset.id", preset, sizeof(preset)))
-        for (int i = 0; i < 6; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
+        for (int i = 0; i < 8; i++) if (strcmp(preset, presetNames[i]) == 0) gFilter = i;
     gFilterIntensity = gFilterIntensitySent = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.effects.preset.intensity", 100.f) / 100.f, 0.f, 1.f);
     strcpy(gTransitionType, "none");
     gTransitionDuration = PlutoReadNumber(clipBegin, clipEnd, "props.transitionOut.duration", 1.f);
     PlutoJsonStringPath(clipBegin, clipEnd, "props.transitionOut.type", gTransitionType, sizeof(gTransitionType));
 
     gTextTitleSelected = false;
+    gTextIsSubtitle = false;
+    gTextFontPath[0] = 0;
+    snprintf(gTextFontName, sizeof(gTextFontName), "System");
     PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.isTitle", &gTextTitleSelected);
+    PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.isSubtitle", &gTextIsSubtitle);
+    gTextSubtitleSourceId[0] = 0;
     if (gTextTitleSelected) {
+        if (gTextIsSubtitle)
+            PlutoJsonStringPath(clipBegin, clipEnd, "props.text.sourceClipId", gTextSubtitleSourceId, sizeof(gTextSubtitleSourceId));
         PlutoJsonStringPath(clipBegin, clipEnd, "props.text.content", gTextContent, sizeof(gTextContent));
+        PlutoJsonStringPath(clipBegin, clipEnd, "props.text.fontName", gTextFontName, sizeof(gTextFontName));
+        PlutoJsonStringPath(clipBegin, clipEnd, "props.text.fontPath", gTextFontPath, sizeof(gTextFontPath));
+        if (gTextFontPath[0] && !FileExists(gTextFontPath)) {
+            gTextFontPath[0] = 0;
+            snprintf(gTextFontName, sizeof(gTextFontName), "System");
+        }
         gTextFontSize = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.fontSize", 96.f));
         gTextFontSize = (int)Clampf((float)gTextFontSize, 8.f, 180.f);
         gTextColorIndex = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.color", 0.f));
@@ -292,11 +312,16 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
         gTextBoxH = Clampf(PlutoReadNumber(clipBegin, clipEnd, "props.text.boxH", .32f), .001f, 1.f);
         gTextAutoFit = false;
         PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.autoFit", &gTextAutoFit);
-        gTextDuration = Clampf(PlutoReadNumber(clipBegin, clipEnd, "dur", gTextDuration), .5f, 30.f);
+        gTextDuration = Clampf(PlutoReadNumber(clipBegin, clipEnd, "dur", gTextDuration), gTextIsSubtitle ? .05f : .5f, 30.f);
         gTextBold = true; gTextItalic = false; gTextUnderline = false;
         gTextFontFamily = (int)roundf(PlutoReadNumber(clipBegin, clipEnd, "props.text.fontFamily", 0.f));
         if (gTextFontFamily < 0 || gTextFontFamily > 3) gTextFontFamily = 0;
+        if (!gTextFontName[0] || (strcmp(gTextFontName, "System") == 0 && gTextFontFamily != 0)) {
+            static const char *legacyFontNames[4] = {"System", "Arial", "Georgia", "Monospace"};
+            snprintf(gTextFontName, sizeof(gTextFontName), "%s", legacyFontNames[gTextFontFamily]);
+        }
         gTextFontMenuOpen = false;
+        gTextFontMenuScroll = 0.f;
         PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.bold", &gTextBold);
         PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.italic", &gTextItalic);
         PlutoJsonBoolPath(clipBegin, clipEnd, "props.text.underline", &gTextUnderline);
@@ -1182,16 +1207,18 @@ static void ColorsView(void) {
 
 /* ---------------- effects tab ---------------- */
 typedef struct { Clay_Color a, b, sun; } FilterP;
-static const FilterP kFilters[6] = {
+static const FilterP kFilters[8] = {
     {{236,110,96,255},  {84,66,208,255},  {250,226,140,255}},
     {{255,150,40,255},  {70,88,232,255},  {255,222,120,255}},
     {{158,158,164,255}, {38,38,44,255},   {240,240,244,255}},
     {{232,160,136,255}, {120,98,192,255}, {250,226,150,255}},
     {{60,176,204,255},  {38,48,124,255},  {250,236,170,255}},
     {{128,196,112,255}, {28,86,80,255},   {250,236,160,255}},
+    {{239,151,112,255}, {49,67,117,255},  {255,226,152,255}},
+    {{231,164,111,255}, {84,66,121,255},  {255,228,160,255}},
 };
-static const char *kFilterNames[6] = {"Original", "Vivid", "Noir", "Fade", "Warm", "Cool"};
-static const char *kFilterIds[6] = {"none", "vivid", "noir", "fade", "warm", "cool"};
+static const char *kFilterNames[8] = {"None", "Vivid", "Noir", "Fade", "Warm", "Cool", "Cinema", "Retro"};
+static const char *kFilterIds[8] = {"none", "vivid", "noir", "fade", "warm", "cool", "cinema", "retro"};
 
 static void FilterThumb(int i) {
     Clay_ElementId id = CLAY_IDI("Flt", i);
@@ -1341,8 +1368,11 @@ static void ExtraFxCommit(int i, bool includeParameters) {
                                      ",{\"path\":\"props.effects.%s.%s\",\"value\":%.4f}",
                                      gExtraFxKeys[i], def->field, value);
         }
-        if (i == 0) used += (size_t)snprintf(updates + used, sizeof(updates) - used,
-                                              ",{\"path\":\"props.effects.blur.mode\",\"value\":\"gaussian\"}");
+        if (i == 0) {
+            const char *mode = gBlurMode == 1 ? "motion" : gBlurMode == 2 ? "zoom" : "gaussian";
+            used += (size_t)snprintf(updates + used, sizeof(updates) - used,
+                                     ",{\"path\":\"props.effects.blur.mode\",\"value\":\"%s\"}", mode);
+        }
     }
     if (used + 2 < sizeof(updates)) { updates[used++] = ']'; updates[used] = 0; PlutoTimelineSetPropertiesJson(updates); }
 }
@@ -1393,6 +1423,43 @@ static void ExtraFxBody(int i) {
                                       .backgroundColor = C_RCARD,
                                       .cornerRadius = {0.f, 0.f, 18.f, 18.f}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(1)}}, .backgroundColor = C_RCARDB}) {}
+        CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(26)}, .childAlignment = AL_Y}}) {
+            Clay_ElementId swid = CLAY_IDI("FxExtraEnabled", i);
+            Bs sb = Interact(swid);
+            if (sb.clicked) {
+                gExtraFxOn[i] = !gExtraFxOn[i];
+                ExtraFxCommit(i, gExtraFxOn[i]);
+            }
+            float enabledAnim = Anim(swid.id + 5u, gExtraFxOn[i] ? 1.f : 0.f, 22.f);
+            CLAY(swid, {.layout = {.sizing = {FIT, FIT}, .childGap = 10, .childAlignment = AL_Y}}) {
+                CLAY_AUTO_ID({.layout = {.sizing = {FIX(38), FIX(22)}},
+                              .custom = {.customData = NC(K_SWITCH, C_CARD, C_CARD, C_CARD, enabledAnim,
+                                                          sb.hover - sb.press * 1.5f, 0)}}) {}
+                Tx("Enabled", 13.5f, Mix(C_MUTED, C_DIM, sb.hover), 0);
+            }
+            HSPACE
+        }
+        if (i == 0) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childGap = 5}}) {
+                const char *modes[3] = {"Gaussian", "Motion", "Zoom"};
+                for (int mode = 0; mode < 3; mode++) {
+                    Clay_ElementId modeId = CLAY_IDI("BlurMode", mode);
+                    Bs modeButton = Interact(modeId);
+                    if (modeButton.clicked) {
+                        gBlurMode = mode;
+                        const char *stored = mode == 1 ? "motion" : mode == 2 ? "zoom" : "gaussian";
+                        char updates[128];
+                        snprintf(updates, sizeof(updates), "[{\"path\":\"props.effects.blur.mode\",\"value\":\"%s\"}]", stored);
+                        PlutoTimelineSetPropertiesJson(updates);
+                    }
+                    CLAY(modeId, {.layout = {.sizing = {GROW, GROW}, .childAlignment = AL_C},
+                                  .backgroundColor = gBlurMode == mode ? RGB(37, 38, 43) : RGB(19, 20, 23),
+                                  .cornerRadius = CLAY_CORNER_RADIUS(8)}) {
+                        Tx(modes[mode], 12.5f, gBlurMode == mode ? C_TEXT : C_MUTED, 0);
+                    }
+                }
+            }
+        }
         if (gExtraFxParamCount[i] == 0) {
             Tx("Flips the clip horizontally.", 13.5f, C_MUTED, 0);
         } else {
@@ -1416,20 +1483,10 @@ static void ExtraFxBody(int i) {
     }
 }
 
+static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon, bool open, bool modified, bool connected);
+
 static void ExtraFxRow(int i) {
     Clay_ElementId header = CLAY_IDI("FxExtraHdr", i);
-    Clay_ElementId toggle = CLAY_IDI("FxExtraToggle", i);
-    Bs hb = Interact(header);
-    Bs tb = Interact(toggle);
-    bool open = gExtraFxOpen == i;
-    /* The enable control is a sibling of the accordion header; don't let its
-       click bubble into the header's expand/collapse action. */
-    bool toggleHovered = Clay_PointerOver(toggle);
-    if (hb.clicked && !toggleHovered) gExtraFxOpen = open ? -1 : i;
-    if (tb.clicked) {
-        gExtraFxOn[i] = !gExtraFxOn[i];
-        ExtraFxCommit(i, gExtraFxOn[i]);
-    }
     bool targetOpen = gExtraFxOpen == i;
     float openAnim = EaseIO(AnimLin(header.id + 0x319u, targetOpen ? 1.f : 0.f, 0.2f));
     float measured = Clay_GetElementData(CLAY_IDI("FxExtraBody", i)).boundingBox.height;
@@ -1439,30 +1496,12 @@ static void ExtraFxRow(int i) {
                                       .backgroundColor = C_RCARD,
                                       .cornerRadius = CLAY_CORNER_RADIUS(16),
                                       .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
-        CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(48)}, .childGap = 0, .childAlignment = AL_Y}}) {
-            CLAY(header, {.layout = {.sizing = {GROW, GROW}, .padding = {15, 12, 0, 0}, .childGap = 12, .childAlignment = AL_Y},
-                          .backgroundColor = Mix(C_RCARD, RGB(38, 40, 46), hb.hover * .5f),
-                          .cornerRadius = {16.f, 16.f, 16.f, 16.f}}) {
-                Icon(I_SPARKLE, 21, C_ICON);
-                Tx(gExtraFxNames[i], 16, C_TEXT, 0);
-                HSPACE
-                if (gExtraFxOn[i]) {
-                    CLAY_AUTO_ID({.layout = {.sizing = {FIX(6), FIX(6)}}, .backgroundColor = RGB(114, 213, 227), .cornerRadius = CLAY_CORNER_RADIUS(3)}) {}
-                    GAPX(3)
-                }
-                Icon(targetOpen ? I_CHEV_UP : I_CHEV_DN, 12, C_DIM);
-            }
-            CLAY(toggle, {.layout = {.sizing = {FIX(38), FIX(48)}, .childAlignment = AL_C},
-                          .backgroundColor = Mix(C_RCARD, RGB(38, 40, 46), tb.hover * .5f)}) {
-                CLAY_AUTO_ID({.layout = {.sizing = {FIX(20), FIX(20)}, .childAlignment = AL_C},
-                              .cornerRadius = CLAY_CORNER_RADIUS(10),
-                              .border = {.color = Mix(RGB(74, 77, 85), RGB(130, 134, 144), tb.hover), .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                    IconV(I_PLUS, 11, gExtraFxOn[i] ? C_TEXT : C_DIM, gExtraFxOn[i] ? 0.f : 1.f);
-                }
-            }
-        }
+        if (EffectsSectionHeader(header, gExtraFxNames[i], I_SPARKLE,
+                                 targetOpen, gExtraFxOn[i], true))
+            gExtraFxOpen = targetOpen ? -1 : i;
         if (wrapHeight >= 1.f) {
-            CLAY(CLAY_IDI("FxExtraBodyWrap", i), {.layout = {COLM, .sizing = {GROW, FIX(wrapHeight)}}, .clip = {.vertical = true}}) {
+            CLAY(CLAY_IDI("FxExtraBodyWrap", i), {.layout = {COLM, .sizing = {GROW, FIX(wrapHeight)}},
+                                                   .clip = {.vertical = true}}) {
                 ExtraFxBody(i);
             }
         }
@@ -1683,7 +1722,7 @@ static void EffectsView(void) {
         }
         }
 
-        /* Filters: six practical presets, no category pills or hidden rows. */
+        /* Filters: eight practical presets, no category pills or hidden rows. */
         CLAY(CLAY_ID("FiltersCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId filtersId = CLAY_ID("FiltersHdr");
         float filtersOpen = EaseIO(AnimLin(filtersId.id, gFiltOpen ? 1.f : 0.f, 0.2f));
@@ -1715,11 +1754,13 @@ static void EffectsView(void) {
                         }
                     }
                     for (int row = 0; row < 2; row++) {
-                        CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIX(78)}, .childGap = 8}}) {
-                            for (int col = 0; col < 3; col++) FilterThumb(row * 3 + col);
+                        CLAY(CLAY_IDI("FltRow", row), {.layout = {.sizing = {GROW, FIX(78)}, .childGap = 7}}) {
+                            for (int col = 0; col < 4; col++) FilterThumb(row * 4 + col);
                         }
                     }
                     FilterIntensityControl();
+                    ExtraFxRow(0);
+                    ExtraFxRow(1);
                 }
             }
         }
@@ -1730,7 +1771,7 @@ static void EffectsView(void) {
            one bordered card so the expanded rows stay visually connected. */
         bool anyVideoEffect = false;
         for (int i = 0; i < VIDEO_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gFxOn[i];
-        for (int i = 0; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
+        for (int i = 2; i < EXTRA_FX_COUNT; i++) anyVideoEffect = anyVideoEffect || gExtraFxOn[i];
         CLAY(CLAY_ID("VfxCol"), {.layout = {COLM, .sizing = {GROW, FIT}}}) {
         Clay_ElementId vfxId = CLAY_ID("VfxHdr");
         float vfxOpen = EaseIO(AnimLin(vfxId.id, gVfxOpen ? 1.f : 0.f, 0.2f));
@@ -1765,7 +1806,7 @@ static void EffectsView(void) {
                             }
                         }
                     }
-                    for (int i = 0; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
+                    for (int i = 2; i < EXTRA_FX_COUNT; i++) ExtraFxRow(i);
                 }
             }
         }
@@ -1886,6 +1927,92 @@ static int PlutoTextFontSlot(void) {
     return (gTextBold ? 7 : 3) + family;
 }
 
+static Font PlutoTextFontAt(int px) {
+    if (gTextFontPath[0] && FileExists(gTextFontPath)) return FontPxFromPath(gTextFontPath, px);
+    return FontPx(PlutoTextFontSlot(), px);
+}
+
+#ifdef _WIN32
+static bool PlutoFontPathIsAbsolute(const wchar_t *path) {
+    return path && path[0] && ((path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) ||
+                              (path[0] == L'\\' && path[1] == L'\\'));
+}
+
+static void PlutoFontAddSystemEntry(const wchar_t *rawName, const wchar_t *rawPath) {
+    if (!rawName || !rawPath || !*rawPath || gSystemFontCount >= STELLA_MAX_SYSTEM_FONTS) return;
+    wchar_t name[256], path[1024], expanded[1024], windowsDir[MAX_PATH], candidate[1024];
+    wcsncpy(name, rawName, 255); name[255] = 0;
+    wchar_t *suffix = wcsstr(name, L" (TrueType)"); if (suffix) *suffix = 0;
+    suffix = wcsstr(name, L" (OpenType)"); if (suffix) *suffix = 0;
+    if (!name[0]) return;
+    if (wcslen(rawPath) >= 1024) return;
+    wcscpy(path, rawPath);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        DWORD needed = ExpandEnvironmentStringsW(rawPath, expanded, 1024);
+        if (needed > 0 && needed < 1024) wcscpy(path, expanded);
+    }
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES && !PlutoFontPathIsAbsolute(path)) {
+        UINT n = GetWindowsDirectoryW(windowsDir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            swprintf(candidate, 1024, L"%ls\\Fonts\\%ls", windowsDir, path);
+            if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) wcscpy(path, candidate);
+        }
+    }
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES && !PlutoFontPathIsAbsolute(path)) {
+        wchar_t localAppData[1024]; DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, 1024);
+        if (n > 0 && n < 1024) {
+            swprintf(candidate, 1024, L"%ls\\Microsoft\\Windows\\Fonts\\%ls", localAppData, path);
+            if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) wcscpy(path, candidate);
+        }
+    }
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
+    const wchar_t *extension = wcsrchr(path, L'.');
+    if (!extension || (_wcsicmp(extension, L".ttf") != 0 && _wcsicmp(extension, L".otf") != 0)) return;
+    char utfName[96], utfPath[1024];
+    int nameBytes = WideCharToMultiByte(CP_UTF8, 0, name, -1, utfName, sizeof(utfName), NULL, NULL);
+    int pathBytes = WideCharToMultiByte(CP_UTF8, 0, path, -1, utfPath, sizeof(utfPath), NULL, NULL);
+    if (nameBytes <= 1 || pathBytes <= 1) return;
+    for (int i = 0; i < gSystemFontCount; i++)
+        if (_stricmp(gSystemFonts[i].path, utfPath) == 0) return;
+    StellaSystemFont *entry = &gSystemFonts[gSystemFontCount++];
+    snprintf(entry->name, sizeof(entry->name), "%s", utfName);
+    snprintf(entry->path, sizeof(entry->path), "%s", utfPath);
+}
+
+static void PlutoFontReadRegistryKey(HKEY root, const wchar_t *subKey) {
+    HKEY key = NULL;
+    if (RegOpenKeyExW(root, subKey, 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+    for (DWORD index = 0; index < 4096 && gSystemFontCount < STELLA_MAX_SYSTEM_FONTS; index++) {
+        wchar_t valueName[256] = {0}; wchar_t valueData[1024] = {0};
+        DWORD nameChars = (DWORD)(sizeof(valueName) / sizeof(valueName[0]));
+        DWORD dataBytes = (DWORD)sizeof(valueData), type = 0;
+        LONG result = RegEnumValueW(key, index, valueName, &nameChars, NULL, &type,
+                                    (LPBYTE)valueData, &dataBytes);
+        if (result == ERROR_NO_MORE_ITEMS) break;
+        if (result != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ && type != REG_MULTI_SZ)) continue;
+        if (valueData[0]) PlutoFontAddSystemEntry(valueName, valueData);
+    }
+    RegCloseKey(key);
+}
+
+static int PlutoCompareSystemFonts(const void *a, const void *b) {
+    const StellaSystemFont *fa = (const StellaSystemFont *)a;
+    const StellaSystemFont *fb = (const StellaSystemFont *)b;
+    return _stricmp(fa->name, fb->name);
+}
+#endif
+
+static void PlutoEnumerateSystemFonts(void) {
+    gSystemFontCount = 0;
+#ifdef _WIN32
+    PlutoFontReadRegistryKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+    PlutoFontReadRegistryKey(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+    PlutoFontReadRegistryKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Fonts");
+    if (gSystemFontCount > 1)
+        qsort(gSystemFonts, (size_t)gSystemFontCount, sizeof(gSystemFonts[0]), PlutoCompareSystemFonts);
+#endif
+}
+
 /* Keep title-frame caret geometry in the same 1920x1080 reference space as
    the rasterized title and its WGPU transform. This is an editor-only overlay. */
 static void PlutoDrawTextCaret(void) {
@@ -1898,7 +2025,7 @@ static void PlutoDrawTextCaret(void) {
     const float padY = fmaxf(4.f, boxH * .09f);
     const float availableW = fmaxf(1.f, boxW - 2.f * padX);
     const float availableH = fmaxf(1.f, boxH - 2.f * padY);
-    Font font = FontPx(PlutoTextFontSlot(), 180);
+    Font font = PlutoTextFontAt(180);
     int fontSize = (int)Clampf((float)gTextFontSize, 8.f, 180.f);
     char lines[STELLA_TEXT_MAX_LINES][STELLA_TEXT_MAX] = {{0}};
     int count = PlutoTextBuildLines(font, fontSize, availableW, lines);
@@ -1952,9 +2079,8 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
         unsigned long long hash = PlutoTextPathHash(clipId);
         for (int i = 0; i < 4; i++)
             if (snprintf(slots[i], sizeof(slots[i]), "%s\\title-%016llx-%d.tga", folder, hash, i) >= (int)sizeof(slots[i])) return false;
-        /* Three preview requests may be decoding simultaneously. Give every
-           in-flight title image a protected file and write edits into a fourth
-           slot that no worker is currently reading. */
+        /* Preview decode is asynchronous. Protect any title image currently
+           being read and write edits into a different slot. */
         const char *chosen = NULL;
         if (gPreviewInFlightCount > 0) {
             for (int i = 0; i < 4; i++) if (!PlutoPreviewPathInFlight(slots[i])) { chosen = slots[i]; break; }
@@ -2030,6 +2156,7 @@ static uint64_t PlutoTextFitSignature(void) {
         hash ^= textBytes[byteIndex]; hash *= 1099511628211ull;
     }
     TEXT_FIT_HASH_BYTES(gTextFontFamily);
+    for (size_t fontByte = 0; fontByte < sizeof(gTextFontPath); fontByte++) { hash ^= (unsigned char)gTextFontPath[fontByte]; hash *= 1099511628211ull; }
     TEXT_FIT_HASH_BYTES(gTextBold);
     TEXT_FIT_HASH_BYTES(gTextBoxW);
     TEXT_FIT_HASH_BYTES(gTextBoxH);
@@ -2053,7 +2180,7 @@ static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity, bool forceNe
     float availableW = fmaxf(1.f, boxW - 2.f * padX);
     float availableH = fmaxf(1.f, boxH - 2.f * padY);
 
-    Font font = FontPx(PlutoTextFontSlot(), 180);
+    Font font = PlutoTextFontAt(180);
     int fontSize = (int)Clampf((float)gTextFontSize, 8.f, 180.f);
     char lines[STELLA_TEXT_MAX_LINES][STELLA_TEXT_MAX] = {{0}};
     int lineCount = 1;
@@ -2149,7 +2276,11 @@ static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity, bool forceNe
 
 static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     char escaped[STELLA_TEXT_MAX * 6 + 16];
+    char escapedFontName[640], escapedFontPath[6144], escapedSourceId[512];
     PlutoJsonEscape(gTextContent, escaped, sizeof(escaped));
+    PlutoJsonEscape(gTextFontName, escapedFontName, sizeof(escapedFontName));
+    PlutoJsonEscape(gTextFontPath, escapedFontPath, sizeof(escapedFontPath));
+    PlutoJsonEscape(gTextIsSubtitle ? gTextSubtitleSourceId : "", escapedSourceId, sizeof(escapedSourceId));
     float sourceAspect = (gTextBoxW * 1920.f) / fmaxf(1.f, gTextBoxH * 1080.f);
     const float targetAspect = 1920.f / 1080.f;
     float fitX = 1.f, fitY = 1.f;
@@ -2162,7 +2293,7 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     float posX = (effectiveX - .5f) * 1920.f;
     float posY = (effectiveY - .5f) * 1080.f;
     int n = snprintf(out, capacity,
-        "{\"isTitle\":true,\"content\":\"%s\",\"fontSize\":%d,\"fontFamily\":%d,\"color\":%d,\"align\":%d,"
+        "{\"isTitle\":true,\"isSubtitle\":%s,\"sourceClipId\":\"%s\",\"content\":\"%s\",\"fontSize\":%d,\"fontFamily\":%d,\"fontName\":\"%s\",\"fontPath\":\"%s\",\"color\":%d,\"align\":%d,"
         "\"bold\":%s,\"italic\":%s,\"underline\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"autoFit\":%s,"
         "\"x\":%.5f,\"y\":%.5f,\"boxW\":%.5f,\"boxH\":%.5f,"
         "\"layout\":{\"position\":{\"x\":%.5f,\"y\":%.5f},\"scale\":{\"w\":%.5f,\"h\":%.5f}},"
@@ -2170,7 +2301,8 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
         "\"outlineR\":%u,\"outlineG\":%u,\"outlineB\":%u,\"outlineA\":%u,"
         "\"shadowR\":%u,\"shadowG\":%u,\"shadowB\":%u,\"shadowA\":%u,"
         "\"backgroundR\":%u,\"backgroundG\":%u,\"backgroundB\":%u,\"backgroundA\":%u}",
-        escaped, gTextFontSize, gTextFontFamily, gTextColorIndex, gTextAlign,
+        gTextIsSubtitle ? "true" : "false", escapedSourceId, escaped, gTextFontSize, gTextFontFamily,
+        escapedFontName, escapedFontPath, gTextColorIndex, gTextAlign,
         gTextBold ? "true" : "false", gTextItalic ? "true" : "false", gTextUnderline ? "true" : "false",
         gTextOutline ? "true" : "false", gTextShadow ? "true" : "false",
         gTextBackground ? "true" : "false", gTextAutoFit ? "true" : "false",
@@ -2185,6 +2317,142 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
         (unsigned)gTextAppearance[3].r, (unsigned)gTextAppearance[3].g,
         (unsigned)gTextAppearance[3].b, (unsigned)gTextAppearance[3].a);
     return n > 0 && (size_t)n < capacity;
+}
+
+static bool PlutoAppendSubtitleCue(char *request, size_t capacity, size_t *used,
+                                   const char *text, float start, float end, bool firstCue, char *lastId, size_t idCapacity) {
+    if (!text || !*text || !isfinite(start) || !isfinite(end) || end - start < .04f ||
+        !request || !used || *used >= capacity) return false;
+    snprintf(gTextContent, sizeof(gTextContent), "%s", text);
+    gTextIsSubtitle = true;
+    snprintf(gTextSubtitleSourceId, sizeof(gTextSubtitleSourceId), "%s", gSubtitleSourceClipId);
+    gTextFontFamily = 0; gTextFontPath[0] = 0;
+    snprintf(gTextFontName, sizeof(gTextFontName), "System");
+    gTextFontSize = 54; gTextAutoFit = true;
+    gTextBold = true; gTextItalic = false; gTextUnderline = false;
+    gTextOutline = true; gTextShadow = true; gTextBackground = true;
+    gTextAlign = 1; gTextPosX = .5f; gTextPosY = .865f;
+    gTextBoxW = .92f; gTextBoxH = .16f;
+    gTextAppearance[0] = (Color){250, 250, 252, 255};
+    gTextAppearance[1] = (Color){7, 8, 10, 245};
+    gTextAppearance[2] = (Color){0, 0, 0, 190};
+    gTextAppearance[3] = (Color){8, 9, 12, 148};
+    for (int i = 0; i < 4; i++)
+        gTextWheelPuck[i] = gTextWheelPuckT[i] = PlutoTextColorToWheel(gTextAppearance[i]);
+    char path[1024], props[8192], escapedPath[6144], id[64];
+    if (!PlutoTextWriteImage(path, sizeof(path), true) || !PlutoTextBuildPropsJson(props, sizeof(props))) return false;
+    PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
+    bool idTaken = false;
+    do {
+        snprintf(id, sizeof(id), "subtitle-%llu", (unsigned long long)gClipSerial++);
+        idTaken = false;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            if (strcmp(gTimelineClips[i].id, id) == 0) { idTaken = true; break; }
+        }
+    } while (idTaken);
+    int n = snprintf(request + *used, capacity - *used,
+        "%s{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Subtitle\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}",
+        firstCue ? "" : ",", id, fmaxf(0.f, start), fmaxf(.05f, end - start), escapedPath,
+        fmaxf(.05f, end - start), props);
+    if (n <= 0 || (size_t)n >= capacity - *used) return false;
+    *used += (size_t)n;
+    if (lastId && idCapacity) snprintf(lastId, idCapacity, "%s", id);
+    return true;
+}
+
+static void PlutoSubtitleHandleResult(const char *event) {
+    if (!event) return;
+    const char *eventEnd = event + strlen(event), *arrayBegin = NULL, *arrayEnd = NULL;
+    if (!gSubtitleSourceClipId[0] ||
+        !PlutoJsonMemberRange(event, eventEnd, "cues", &arrayBegin, &arrayEnd) ||
+        arrayBegin >= arrayEnd || *arrayBegin != '[') {
+        strcpy(gBackendMessage, "Whisper returned no readable subtitle cues");
+        gSubtitleSourceClipId[0] = 0;
+        return;
+    }
+    size_t requestCapacity = 4u * 1024u * 1024u, requestUsed = 0;
+    char *request = (char *)malloc(requestCapacity);
+    if (!request) {
+        strcpy(gBackendMessage, "Not enough memory to build subtitle clips");
+        gSubtitleSourceClipId[0] = 0;
+        return;
+    }
+    char escapedSourceId[512];
+    PlutoJsonEscape(gSubtitleSourceClipId, escapedSourceId, sizeof(escapedSourceId));
+    int requestLength = snprintf(request, requestCapacity,
+        "{\"command\":\"timeline_replace_subtitles\",\"sourceClipId\":\"%s\",\"clips\":[",
+        escapedSourceId);
+    if (requestLength <= 0 || (size_t)requestLength >= requestCapacity) {
+        free(request); gSubtitleSourceClipId[0] = 0;
+        strcpy(gBackendMessage, "Could not prepare subtitle clips");
+        return;
+    }
+    requestUsed = (size_t)requestLength;
+    int existingFromSource = 0;
+    for (int i = 0; i < gTimelineClipCount; i++)
+        if (gTimelineClips[i].isSubtitle && strcmp(gTimelineClips[i].subtitleSourceId, gSubtitleSourceClipId) == 0)
+            existingFromSource++;
+    int availableSlots = MAX_TIMELINE_CLIPS - (gTimelineClipCount - existingFromSource);
+    int cueLimit = availableSlots < 400 ? availableSlots : 400;
+    if (cueLimit < 1) {
+        free(request);
+        gSubtitleSourceClipId[0] = 0;
+        gSubtitleGenerating = false;
+        strcpy(gBackendMessage, "The timeline is full; remove some clips before generating subtitles");
+        return;
+    }
+    int created = 0;
+    char lastSubtitleId[64] = {0};
+    const char *p = arrayBegin + 1, *limit = arrayEnd - 1;
+    while (p < limit && created < cueLimit) {
+        if (*p == ',' || *p == ' ' || *p == '\r' || *p == '\n' || *p == '\t') { p++; continue; }
+        if (*p != '{') break;
+        const char *begin = p, *end = NULL;
+        int depth = 0; bool inString = false, escaped = false;
+        for (; p < limit; p++) {
+            char c = *p;
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') inString = true;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) { end = p + 1; p++; break; }
+        }
+        if (!end) break;
+        char text[STELLA_TEXT_MAX] = {0}; double start = 0.0, finish = 0.0;
+        if (PlutoJsonStringRange(begin, end, "text", text, sizeof(text)) &&
+            PlutoJsonNumberRange(begin, end, "start", &start) &&
+            PlutoJsonNumberRange(begin, end, "end", &finish) &&
+            PlutoAppendSubtitleCue(request, requestCapacity, &requestUsed, text,
+                                  (float)start, (float)finish, created == 0,
+                                  lastSubtitleId, sizeof(lastSubtitleId))) {
+            created++;
+        } else {
+            break;
+        }
+    }
+    if (created > 0) {
+        int closeLength = snprintf(request + requestUsed, requestCapacity - requestUsed, "]}");
+        if (closeLength > 0 && (size_t)closeLength < requestCapacity - requestUsed && PlutoTimelineCall(request)) {
+            for (int i = 0; i < gTimelineClipCount; i++)
+                if (strcmp(gTimelineClips[i].id, lastSubtitleId) == 0) { PlutoTimelineSelect(i); break; }
+        } else {
+            created = 0;
+            strcpy(gBackendMessage, "Could not add generated subtitle clips to the timeline");
+        }
+    }
+    free(request);
+    gSubtitleCueCount = created;
+    gSubtitleSourceClipId[0] = 0;
+    gSubtitleGenerating = false;
+    gRightTab = 3;
+    gSubtitleCardOpen = true;
+    gPreviewDirty = true;
+    if (created > 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "Generated %d subtitle cues", created);
+    else snprintf(gBackendMessage, sizeof(gBackendMessage), "No subtitle cues were generated");
 }
 
 static bool PlutoTextApply(bool forceNew, bool liveUpdate) {
@@ -2231,6 +2499,8 @@ static void PlutoTextCreateBox(float x, float y, float width, float height) {
        geometry for a newly dragged text frame. */
     PlutoTextAutoUpdateFlush();
     PlutoTimelineEndPropertyEdit();
+    gTextIsSubtitle = false;
+    gTextSubtitleSourceId[0] = 0;
     width = Clampf(width, .001f, 1.f);
     height = Clampf(height, .001f, 1.f);
     gTextBoxW = width;
@@ -2262,6 +2532,7 @@ static uint64_t PlutoTextRasterSignature(void) {
     TEXT_RASTER_HASH_BYTES(gTextItalic);
     TEXT_RASTER_HASH_BYTES(gTextUnderline);
     TEXT_RASTER_HASH_BYTES(gTextFontFamily);
+    for (size_t fontByte = 0; fontByte < sizeof(gTextFontPath); fontByte++) { hash ^= (unsigned char)gTextFontPath[fontByte]; hash *= 1099511628211ull; }
     TEXT_RASTER_HASH_BYTES(gTextOutline);
     TEXT_RASTER_HASH_BYTES(gTextShadow);
     TEXT_RASTER_HASH_BYTES(gTextBackground);
@@ -2290,6 +2561,9 @@ static uint64_t PlutoTextStateSignature(void) {
     TEXT_HASH_BYTES(gTextItalic);
     TEXT_HASH_BYTES(gTextUnderline);
     TEXT_HASH_BYTES(gTextFontFamily);
+    for (size_t fontByte = 0; fontByte < sizeof(gTextFontPath); fontByte++) { hash ^= (unsigned char)gTextFontPath[fontByte]; hash *= 1099511628211ull; }
+    for (size_t nameByte = 0; nameByte < sizeof(gTextFontName); nameByte++) { hash ^= (unsigned char)gTextFontName[nameByte]; hash *= 1099511628211ull; }
+    TEXT_HASH_BYTES(gTextIsSubtitle);
     TEXT_HASH_BYTES(gTextOutline);
     TEXT_HASH_BYTES(gTextShadow);
     TEXT_HASH_BYTES(gTextBackground);
@@ -2687,6 +2961,35 @@ static void TextPosGrid(void) {
     }
 }
 
+static void DrawTextFontMenuOverlay(void) {
+    if (!gTextFontMenuOpen || gTextFontMenuRect.width <= 0.f) return;
+    Rectangle menu = gTextFontMenuRect;
+    Vector2 mouse = GetMousePosition();
+    const float rowHeight = 29.f, innerTop = menu.y + 4.f;
+    FillRR(menu, 10.f, (Color){25, 26, 30, 252});
+    StrokeRR(menu, 10.f, 1.f, (Color){64, 67, 76, 255});
+    int totalRows = gSystemFontCount + 1;
+    float contentHeight = (float)totalRows * rowHeight;
+    float maxScroll = fmaxf(0.f, contentHeight - (menu.height - 8.f));
+    gTextFontMenuScroll = Clampf(gTextFontMenuScroll, 0.f, maxScroll);
+    BeginScissorMode((int)menu.x + 3, (int)menu.y + 3, (int)menu.width - 6, (int)menu.height - 6);
+    for (int rowIndex = 0; rowIndex < totalRows; rowIndex++) {
+        float y = innerTop + (float)rowIndex * rowHeight - gTextFontMenuScroll;
+        if (y + rowHeight < menu.y || y > menu.y + menu.height) continue;
+        Rectangle row = {menu.x + 4.f, y, menu.width - 8.f, rowHeight};
+        bool isSelected = rowIndex == 0 ? (!gTextFontPath[0] && gTextFontFamily == 0) :
+            (gTextFontPath[0] && strcmp(gTextFontPath, gSystemFonts[rowIndex - 1].path) == 0);
+        bool hover = CheckCollisionPointRec(mouse, row);
+        if (hover || isSelected)
+            FillRR(row, 7.f, isSelected ? (Color){51, 54, 62, 255} : (Color){39, 41, 47, 255});
+        const char *name = rowIndex == 0 ? "System default" : gSystemFonts[rowIndex - 1].name;
+        TxtAt(0, name, row.x + 11.f, row.y + 7.f, 13.f,
+              isSelected ? (Color){242, 243, 246, 255} : (Color){184, 187, 195, 255});
+        if (isSelected) TxtAt(0, "✓", row.x + row.width - 22.f, row.y + 7.f, 13.f, (Color){228, 230, 235, 255});
+    }
+    EndScissorMode();
+}
+
 static void TextView(void) {
     /* A selected title owns its own open colour editor. Do not carry an open
        wheel across clips when the user changes selection in the timeline. */
@@ -2699,6 +3002,94 @@ static void TextView(void) {
         TextColorEditorReset();
     }
 
+    /* Subtitle generation owns its own card above manual text. Generated cues
+       are normal rendered title assets, grouped into the conditional S lane. */
+    int subtitleCount = 0, subtitleSource = -1;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        if (gTimelineClips[i].isSubtitle) subtitleCount++;
+        if (subtitleSource < 0 && strcmp(gTimelineClips[i].kind, "video") == 0 && gTimelineClips[i].hasAudio)
+            subtitleSource = i;
+    }
+    if (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
+        TimelineClipUi *selected = &gTimelineClips[gTimelineSelected];
+        if (strcmp(selected->kind, "video") == 0 && selected->hasAudio) {
+            subtitleSource = gTimelineSelected;
+        } else if (selected->isSubtitle && selected->subtitleSourceId[0]) {
+            for (int i = 0; i < gTimelineClipCount; i++) {
+                if (strcmp(gTimelineClips[i].id, selected->subtitleSourceId) == 0 &&
+                    strcmp(gTimelineClips[i].kind, "video") == 0 && gTimelineClips[i].hasAudio) {
+                    subtitleSource = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (gSubtitleGenerating && !gSubtitleCardOpen) gSubtitleCardOpen = true;
+    CLAY(CLAY_ID("SubtitleCard"), {.layout = {COLM, .sizing = {GROW, FIT}},
+                                   .backgroundColor = C_RCARD,
+                                   .cornerRadius = CLAY_CORNER_RADIUS(16),
+                                   .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        Clay_ElementId subtitleHeader = CLAY_ID("SubtitleHeader");
+        if (EffectsSectionHeader(subtitleHeader, "Subtitles", I_NOTE,
+                                 gSubtitleCardOpen, false, true))
+            gSubtitleCardOpen = !gSubtitleCardOpen;
+        if (gSubtitleCardOpen) {
+            CLAY(CLAY_ID("SubtitleEmptyState"), {.layout = {ROW, .sizing = {GROW, FIX(78)},
+                                                         .padding = {12, 12, 12, 12}, .childAlignment = AL_Y, .childGap = 9},
+                                                  .backgroundColor = C_RCARD,
+                                                  .cornerRadius = {0.f, 0.f, 16.f, 16.f}}) {
+                CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 4}}) {
+                    Tx(subtitleCount ? Fmt("%d subtitle cues", subtitleCount) : "No subtitles yet", 13.5f, C_TEXT, 0);
+                    Tx(gSubtitleGenerating ? "Transcribing audio…" :
+                       (subtitleCount ? "Regenerate from selected video" : "Generate from video audio"), 11.5f, C_MUTED, 0);
+                }
+                HSPACE
+                Clay_ElementId addSubtitle = CLAY_ID("SubtitleGenerateButton");
+                Bs addHover = Interact(addSubtitle);
+                if (addHover.clicked && !gSubtitleGenerating) {
+                    if (subtitleSource >= 0) PlutoRequestSubtitleGeneration(subtitleSource);
+                    else strcpy(gBackendMessage, "Import or select a video clip with audio first");
+                }
+                CLAY(addSubtitle, {.layout = {.sizing = {FIX(42), FIX(42)}, .childAlignment = AL_C},
+                                   .backgroundColor = BtnBg(C_RCARDB, RGB(54, 56, 63), addHover),
+                                   .cornerRadius = CLAY_CORNER_RADIUS(13),
+                                   .border = {.color = Mix(C_RCARDB, C_TEXT, addHover.hover * .22f),
+                                              .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    Icon(I_PLUS, 19, C_TEXT);
+                }
+            }
+            if (subtitleCount > 0) {
+                CLAY(CLAY_ID("SubtitleCueList"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {8, 8, 8, 8}, .childGap = 4},
+                                                  .backgroundColor = C_RCARD,
+                                                  .cornerRadius = {0.f, 0.f, 16.f, 16.f}}) {
+                    for (int i = 0; i < gTimelineClipCount; i++) {
+                        TimelineClipUi *cue = &gTimelineClips[i];
+                        if (!cue->isSubtitle) continue;
+                        Clay_ElementId cueId = CLAY_IDI("SubtitleCueRow", i);
+                        Bs cueHover = Interact(cueId);
+                        if (cueHover.clicked) {
+                            float cueStart = cue->start;
+                            PlutoTimelineSelect(i);
+                            gPlayhead = cueStart;
+                            gTimelinePlaying = false;
+                            gPreviewDirty = true;
+                        }
+                        CLAY(cueId, {.layout = {ROW, .sizing = {GROW, FIX(34)}, .padding = {9, 7, 7, 7}, .childAlignment = AL_Y, .childGap = 8},
+                                      .backgroundColor = BtnBg(RGB(31, 32, 37), RGB(43, 45, 52), cueHover),
+                                      .cornerRadius = CLAY_CORNER_RADIUS(8),
+                                      .border = {.color = Mix(C_RCARDB, RGB(74, 77, 85), cueHover.hover * .4f),
+                                                 .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                            CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}}}) {
+                                Tx(Fmt("%.31s", cue->subtitleText[0] ? cue->subtitleText : "(empty subtitle)"), 12.5f, C_TEXT, 0);
+                            }
+                            Tx(Fmt("%s–%s", Timecode(cue->start), Timecode(cue->start + cue->duration)), 10.5f, C_MUTED, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    GAPY(7)
     /* Content: keep only the actual editable field surfaced, not another card. */
     CLAY(CLAY_ID("TextContentCard"), {.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 8}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(24)}, .childAlignment = AL_Y}}) {
@@ -2805,7 +3196,6 @@ static void TextView(void) {
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(34)}, .childAlignment = AL_Y}}) {
             Tx("Font", 15, C_DIM, 0);
             HSPACE
-            static const char *fontNames[4] = {"System", "Arial", "Georgia", "Monospace"};
             Clay_ElementId fontButton = CLAY_ID("TextFontPicker");
             Bs fontHover = Interact(fontButton);
             if (fontHover.clicked) gTextFontMenuOpen = !gTextFontMenuOpen;
@@ -2814,23 +3204,36 @@ static void TextView(void) {
                               .cornerRadius = CLAY_CORNER_RADIUS(9),
                               .border = {.color = Mix(C_RCARDB, RGB(91, 95, 105), fontHover.hover * .55f),
                                          .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                Tx(fontNames[gTextFontFamily], 13, C_TEXT, 0);
+                Tx(Fmt("%.18s", gTextFontName[0] ? gTextFontName : "System"), 13, C_TEXT, 0);
                 HSPACE
                 Icon(I_CHEV_DN, 11, C_MUTED);
             }
+            Clay_BoundingBox picker = Clay_GetElementData(fontButton).boundingBox;
+            gTextFontPickerRect = (Rectangle){picker.x, picker.y, picker.width, picker.height};
+            const float menuW = 224.f, menuH = fminf(246.f, 8.f * 29.f + 8.f), edge = 8.f;
+            float menuX = picker.x;
+            float menuY = picker.y + picker.height + 5.f;
+            if (menuX + menuW > GetScreenWidth() - edge) menuX = GetScreenWidth() - menuW - edge;
+            if (menuX < edge) menuX = edge;
+            if (menuY + menuH > GetScreenHeight() - edge) menuY = picker.y - menuH - 5.f;
+            if (menuY < edge) menuY = edge;
+            gTextFontMenuRect = (Rectangle){menuX, menuY, menuW, menuH};
         }
-        if (gTextFontMenuOpen) {
-            static const char *fontNames[4] = {"System", "Arial", "Georgia", "Monospace"};
-            CLAY(CLAY_ID("TextFontMenu"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = CLAY_PADDING_ALL(4), .childGap = 2},
-                                          .backgroundColor = C_RCARD, .cornerRadius = CLAY_CORNER_RADIUS(10),
-                                          .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
-                for (int i = 0; i < 4; i++) {
-                    if (TextChoiceButton(CLAY_IDI("TextFontOption", i), fontNames[i], gTextFontFamily == i, false)) {
-                        gTextFontFamily = i;
-                        gTextFontMenuOpen = false;
-                    }
+        if (gTextFontMenuOpen && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 menuMouse = GetMousePosition();
+            if (CheckCollisionPointRec(menuMouse, gTextFontMenuRect)) {
+                int option = (int)floorf((menuMouse.y - gTextFontMenuRect.y - 4.f + gTextFontMenuScroll) / 29.f);
+                if (option == 0) {
+                    gTextFontFamily = 0; gTextFontPath[0] = 0;
+                    snprintf(gTextFontName, sizeof(gTextFontName), "System");
+                } else if (option > 0 && option <= gSystemFontCount) {
+                    gTextFontFamily = 0;
+                    snprintf(gTextFontPath, sizeof(gTextFontPath), "%s", gSystemFonts[option - 1].path);
+                    snprintf(gTextFontName, sizeof(gTextFontName), "%s", gSystemFonts[option - 1].name);
                 }
-            }
+                gTextFontMenuScroll = 0.f;
+                gTextFontMenuOpen = false;
+            } else if (!CheckCollisionPointRec(menuMouse, gTextFontPickerRect)) gTextFontMenuOpen = false;
         }
         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIT}, .childGap = 6}}) {
             if (IconBtn(CLAY_ID("TextBold"), I_BOLD, 31, 18, C_DIM, gTextBold, 7)) gTextBold = !gTextBold;
@@ -2892,6 +3295,12 @@ static void UpdateInspScroll(void) {
     float maxS = fmaxf(0.f, cb.height - bb.height);
     float wh = gWheelDelta;
     Vector2 m = GetMousePosition();
+    if (gTextFontMenuOpen && CheckCollisionPointRec(m, gTextFontMenuRect) && fabsf(wh) > .001f) {
+        float rows = (float)(gSystemFontCount + 1) * 29.f;
+        gTextFontMenuScroll = Clampf(gTextFontMenuScroll - wh * 34.f, 0.f,
+                                     fmaxf(0.f, rows - (gTextFontMenuRect.height - 8.f)));
+        wh = 0.f;
+    }
     if (wh != 0.f && m.x >= bb.x && m.x <= bb.x + bb.width && m.y >= bb.y && m.y <= bb.y + bb.height) {
         gScrollT -= wh * 60.f;
         gFollow = false;

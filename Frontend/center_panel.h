@@ -84,7 +84,12 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             Rectangle selection = gTextBoxDragRect;
             gTextBoxDragging = false;
-            if (selection.width >= 12.f && selection.height >= 12.f && frameValid) {
+            if (frameValid) {
+                /* A click is also a valid text-box gesture: create a compact
+                   default frame instead of silently doing nothing when the
+                   drag was shorter than the old 12px threshold. */
+                if (selection.width < 12.f) { selection.width = fminf(220.f, frame.width * .38f); selection.x = PreviewClamp(gTextBoxDragStart.x - selection.width * .5f, frame.x, frame.x + frame.width - selection.width); }
+                if (selection.height < 12.f) { selection.height = fminf(100.f, frame.height * .24f); selection.y = PreviewClamp(gTextBoxDragStart.y - selection.height * .5f, frame.y, frame.y + frame.height - selection.height); }
                 float x = (selection.x + selection.width * .5f - frame.x) / frame.width;
                 float y = (selection.y + selection.height * .5f - frame.y) / frame.height;
                 PlutoTextCreateBox(x, y, selection.width / frame.width, selection.height / frame.height);
@@ -147,7 +152,7 @@ static void CenterPanel(void) {
                 if (IconBtn(CLAY_ID("PrevF"), I_CHEV_L, 28, 14, C_DIM, false, 14)) { gPlayhead = fmaxf(0.f, gPlayhead - 1.f / (float)fmaxf(1, gPreviewFps)); gPreviewDirty = true; }
                 Clay_ElementId pid = CLAY_ID("Play");
                 Bs b = Interact(pid);
-                if (b.clicked) gTimelinePlaying = !gTimelinePlaying;
+                if (b.clicked) PlutoTogglePlayback();
                 float sz = 44.f + 3.f * b.hover - 3.f * b.press;
                 CLAY(pid, {.layout = {.sizing = {FIX(50), FIX(50)}, .childAlignment = AL_C}}) {
                     CLAY_AUTO_ID({.layout = {.sizing = {FIX(sz), FIX(sz)}, .childAlignment = AL_C},

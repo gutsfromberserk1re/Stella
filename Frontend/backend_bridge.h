@@ -8,6 +8,9 @@
 #include <string.h>
 
 static bool gTimelinePropertyEditOpen;
+#ifdef _WIN32
+static char gPendingRelinkClipId[64];
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -766,6 +769,10 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonBoolPath(begin, end, "props.audio.fadeIn", &clip->audioFadeIn);
             PlutoJsonBoolPath(begin, end, "props.audio.fadeOut", &clip->audioFadeOut);
             clip->track = PlutoTrackIndex(track);
+            PlutoJsonBoolPath(begin, end, "props.text.isSubtitle", &clip->isSubtitle);
+            PlutoJsonStringPath(begin, end, "props.text.sourceClipId", clip->subtitleSourceId, sizeof(clip->subtitleSourceId));
+            if (clip->isSubtitle)
+                PlutoJsonStringPath(begin, end, "props.text.content", clip->subtitleText, sizeof(clip->subtitleText));
             const char *hasAudio = strstr(begin, "\"hasAudio\":true");
             clip->hasAudio = hasAudio && hasAudio < end;
             for (int media = 0; media < gImportedCount; media++)
@@ -899,17 +906,18 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
     if (!path || !*path || !textJson || gTimelineClipCount >= MAX_TIMELINE_CLIPS) return false;
     char escapedPath[2048], id[64], request[8192];
     PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
+    bool isSubtitle = strstr(textJson, "\"isSubtitle\":true") != NULL;
     bool idInUse;
     do {
-        snprintf(id, sizeof(id), "title-%llu", (unsigned long long)gClipSerial++);
+        snprintf(id, sizeof(id), isSubtitle ? "subtitle-%llu" : "title-%llu", (unsigned long long)gClipSerial++);
         idInUse = false;
         for (int i = 0; i < gTimelineClipCount; i++) {
             if (strcmp(gTimelineClips[i].id, id) == 0) { idInUse = true; break; }
         }
     } while (idInUse);
     int n = snprintf(request, sizeof(request),
-        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Title\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
-        id, fmaxf(0.f, start), fmaxf(.05f, duration), escapedPath, fmaxf(.05f, duration), textJson);
+        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
+        id, fmaxf(0.f, start), fmaxf(.05f, duration), isSubtitle ? "Subtitle" : "Title", escapedPath, fmaxf(.05f, duration), textJson);
     if (n <= 0 || (size_t)n >= sizeof(request) || !PlutoTimelineCall(request)) return false;
     for (int i = 0; i < gTimelineClipCount; i++) {
         if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
@@ -947,6 +955,7 @@ static bool PlutoTimelineMove(int index, float start, int track) {
     if (index < 0 || index >= gTimelineClipCount) return false;
     char id[128], request[512]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
     float snapThreshold = fmaxf(.18f, fminf(.75f, 13.f / fmaxf(1.f, 21.5f * gTimelineZoom)));
+    if (gTimelineClips[index].isSubtitle) track = gTimelineClips[index].track;
     snprintf(request, sizeof(request), "{\"command\":\"timeline_move_clip\",\"id\":\"%s\",\"start\":%.4f,\"track\":\"%s\",\"playhead\":%.4f,\"snapThreshold\":%.4f}",
              id, fmaxf(0.f, start), PlutoTrackName(track), gPlayhead, snapThreshold);
     bool okay = PlutoTimelineCall(request);
@@ -1010,6 +1019,32 @@ static bool PlutoTimelineSeparateAudio(int index) {
     snprintf(request, sizeof(request), "{\"command\":\"timeline_separate_audio\",\"id\":\"%s\",\"audioId\":\"%s\"}", id, audioId);
     bool okay = PlutoTimelineCall(request);
     if (okay) gPreviewDirty = true;
+    return okay;
+}
+
+static bool PlutoTimelineLinkAudio(int videoIndex, int audioIndex) {
+    if (videoIndex < 0 || videoIndex >= gTimelineClipCount || audioIndex < 0 || audioIndex >= gTimelineClipCount) return false;
+    char videoId[160], audioId[160], request[512];
+    PlutoJsonEscape(gTimelineClips[videoIndex].id, videoId, sizeof(videoId));
+    PlutoJsonEscape(gTimelineClips[audioIndex].id, audioId, sizeof(audioId));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_link_clips\",\"videoId\":\"%s\",\"audioId\":\"%s\"}", videoId, audioId);
+    bool okay = PlutoTimelineCall(request);
+    if (okay) gPreviewDirty = true;
+    return okay;
+}
+
+static bool PlutoTimelineRelinkClip(int clipIndex, int mediaIndex) {
+    if (clipIndex < 0 || clipIndex >= gTimelineClipCount || mediaIndex < 0 || mediaIndex >= gImportedCount) return false;
+    ImportedMedia *media = &gImported[mediaIndex];
+    char id[160], path[6144], label[160], request[7000];
+    PlutoJsonEscape(gTimelineClips[clipIndex].id, id, sizeof(id));
+    PlutoJsonEscape(media->path, path, sizeof(path));
+    PlutoJsonEscape(media->name, label, sizeof(label));
+    char kind[64]; PlutoJsonEscape(media->kind, kind, sizeof(kind));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_relink_clip\",\"id\":\"%s\",\"path\":\"%s\",\"label\":\"%s\",\"kind\":\"%s\",\"hasAudio\":%s,\"sourceDuration\":%.6f}",
+             id, path, label, kind, media->hasAudio ? "true" : "false", fmaxf(.05f, media->duration));
+    bool okay = PlutoTimelineCall(request);
+    if (okay) { gPreviewDirty = true; gPreviewDebounce = 0.f; }
     return okay;
 }
 
@@ -1101,8 +1136,11 @@ static void PlutoPollBackend(void) {
                     (forward ? requestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
                              : requestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
                 bool movingFrameFresh = fabsf(requestAt - gPlayhead) <= previewLag && newerInDirection;
+                /* Playback previews must be close to the current transport time;
+                   direction-only filtering let a frame several seconds behind
+                   the playhead replace the visible frame. */
                 bool currentRequest = requestRes == gPreviewRes && requestFps == gPreviewFps &&
-                    (gTimelinePlaying ? newerInDirection : previewMoving ? movingFrameFresh : (!gPreviewDirty &&
+                    (previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(requestAt - gPlayhead) <= (0.5f / (float)fmaxf(1, requestFps))));
                 if (strstr(event, "\"ok\":true")) {
                     double renderedAt = -1.0, renderedHeight = 0.0, frameIdNumber = 0.0;
@@ -1210,6 +1248,13 @@ static void PlutoPollBackend(void) {
                     }
                 }
             }
+        } else if (strstr(event, "\"command\":\"generate_subtitles\"")) {
+            gSubtitleGenerating = false;
+            if (strstr(event, "\"ok\":true")) PlutoSubtitleHandleResult(event);
+            else {
+                PlutoJsonString(event, "error", gBackendMessage, sizeof(gBackendMessage));
+                gSubtitleSourceClipId[0] = 0;
+            }
         } else if (strstr(event, "\"command\":\"export_project\"")) {
             if (strstr(event, "\"ok\":true")) {
                 char path[1024] = {0};
@@ -1236,10 +1281,35 @@ static void PlutoPollBackend(void) {
                     asset->thumbnail = LoadTexture(asset->thumbnailPath);
                     if (asset->thumbnail.id) SetTextureFilter(asset->thumbnail, TEXTURE_FILTER_BILINEAR);
                 }
+#ifdef _WIN32
+                bool relinkAttempted = gPendingRelinkClipId[0] != 0;
+                if (relinkAttempted) {
+                    int clipIndex = -1;
+                    for (int c = 0; c < gTimelineClipCount; c++)
+                        if (strcmp(gTimelineClips[c].id, gPendingRelinkClipId) == 0) { clipIndex = c; break; }
+                    bool audioCompatible = clipIndex >= 0 && gTimelineClips[clipIndex].track >= TIMELINE_MAX_VIDEO_TRACKS
+                        ? strcmp(asset->kind, "audio") == 0
+                        : clipIndex >= 0 && strcmp(asset->kind, "audio") != 0;
+                    if (!audioCompatible) {
+                        strcpy(gBackendMessage, clipIndex < 0 ? "The timeline clip no longer exists" :
+                               "Selected file type does not match this timeline clip");
+                    } else if (PlutoTimelineRelinkClip(clipIndex, gImportedCount - 1)) {
+                        snprintf(gBackendMessage, sizeof(gBackendMessage), "Relinked media: %.180s", asset->name);
+                    } else if (!gBackendMessage[0]) {
+                        strcpy(gBackendMessage, "Could not relink the selected media");
+                    }
+                    gPendingRelinkClipId[0] = 0;
+                }
+                if (!relinkAttempted) gBackendMessage[0] = 0;
+#else
                 gBackendMessage[0] = 0;
+#endif
             }
         } else {
             PlutoJsonString(event, "error", gBackendMessage, sizeof(gBackendMessage));
+#ifdef _WIN32
+            if (strstr(event, "\"command\":\"inspect_media\"")) gPendingRelinkClipId[0] = 0;
+#endif
         }
         gBackend.release(event);
     }
@@ -1464,6 +1534,111 @@ static void PlutoRequestMediaImport(void) {
     }
     free(utf8);
 }
+
+static bool PlutoWidePathToUtf8(const wchar_t *widePath, char *out, size_t capacity) {
+    if (!widePath || !*widePath || !out || capacity == 0) return false;
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, widePath, -1, NULL, 0, NULL, NULL);
+    if (bytes <= 1 || (size_t)bytes > capacity) return false;
+    return WideCharToMultiByte(CP_UTF8, 0, widePath, -1, out, bytes, NULL, NULL) > 0;
+}
+
+static bool PlutoPickPath(const wchar_t *filter, wchar_t *path, DWORD pathChars, const wchar_t *title) {
+    OPENFILENAMEW dialog = {0};
+    path[0] = 0;
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = GetWindowHandle();
+    dialog.lpstrTitle = title;
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = pathChars;
+    dialog.lpstrFilter = filter;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    return GetOpenFileNameW(&dialog) != 0;
+}
+
+static void PlutoLoadWhisperConfig(void) {
+    if (gWhisperConfigLoaded) return;
+    gWhisperConfigLoaded = true;
+    char iniPath[2048];
+    snprintf(iniPath, sizeof(iniPath), "%sstella-subtitles.ini", GetApplicationDirectory());
+    GetPrivateProfileStringA("Subtitles", "WhisperCli", "", gWhisperCliPath, sizeof(gWhisperCliPath), iniPath);
+    GetPrivateProfileStringA("Subtitles", "Model", "", gWhisperModelPath, sizeof(gWhisperModelPath), iniPath);
+}
+
+static void PlutoSaveWhisperConfig(void) {
+    char iniPath[2048];
+    snprintf(iniPath, sizeof(iniPath), "%sstella-subtitles.ini", GetApplicationDirectory());
+    WritePrivateProfileStringA("Subtitles", "WhisperCli", gWhisperCliPath, iniPath);
+    WritePrivateProfileStringA("Subtitles", "Model", gWhisperModelPath, iniPath);
+}
+
+static bool PlutoChooseWhisperAssets(void) {
+    PlutoLoadWhisperConfig();
+    wchar_t selected[32768] = {0};
+    char utf8[1024];
+    if (!gWhisperCliPath[0] || !FileExists(gWhisperCliPath)) {
+        if (!PlutoPickPath(L"Whisper CLI executable\0whisper-cli.exe;*.exe\0Executables\0*.exe\0All files\0*.*\0\0",
+                           selected, (DWORD)(sizeof(selected) / sizeof(selected[0])), L"Choose whisper-cli.exe")) return false;
+        if (!PlutoWidePathToUtf8(selected, utf8, sizeof(utf8))) return false;
+        snprintf(gWhisperCliPath, sizeof(gWhisperCliPath), "%s", utf8);
+    }
+    if (!gWhisperModelPath[0] || !FileExists(gWhisperModelPath)) {
+        selected[0] = 0;
+        if (!PlutoPickPath(L"Whisper model\0*.bin\0All files\0*.*\0\0",
+                           selected, (DWORD)(sizeof(selected) / sizeof(selected[0])), L"Choose a Whisper model (.bin)")) return false;
+        if (!PlutoWidePathToUtf8(selected, utf8, sizeof(utf8))) return false;
+        snprintf(gWhisperModelPath, sizeof(gWhisperModelPath), "%s", utf8);
+    }
+    PlutoSaveWhisperConfig();
+    return FileExists(gWhisperCliPath) && FileExists(gWhisperModelPath);
+}
+
+static bool PlutoRequestRelinkClipFile(int clipIndex) {
+    if (!gBackend.submit || clipIndex < 0 || clipIndex >= gTimelineClipCount || gTimelineClips[clipIndex].isSubtitle) return false;
+    wchar_t selected[32768] = {0};
+    if (!PlutoPickPath(L"Media files\0*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.mp3;*.wav;*.m4a;*.aac;*.flac;*.ogg;*.png;*.jpg;*.jpeg;*.webp;*.gif\0All files\0*.*\0\0",
+                       selected, (DWORD)(sizeof(selected) / sizeof(selected[0])), L"Relink timeline media")) return false;
+    char path[1024], escaped[6144];
+    if (!PlutoWidePathToUtf8(selected, path, sizeof(path))) return false;
+    PlutoJsonEscape(path, escaped, sizeof(escaped));
+    char request[8192];
+    snprintf(request, sizeof(request), "{\"command\":\"inspect_media\",\"path\":\"%s\"}", escaped);
+    snprintf(gPendingRelinkClipId, sizeof(gPendingRelinkClipId), "%s", gTimelineClips[clipIndex].id);
+    if (!gBackend.submit(request)) {
+        gPendingRelinkClipId[0] = 0;
+        strcpy(gBackendMessage, "Could not queue media inspection");
+        return false;
+    }
+    strcpy(gBackendMessage, "Checking replacement media…");
+    return true;
+}
+
+static bool PlutoRequestSubtitleGeneration(int sourceClipIndex) {
+    if (!gBackend.submit || sourceClipIndex < 0 || sourceClipIndex >= gTimelineClipCount) return false;
+    TimelineClipUi *clip = &gTimelineClips[sourceClipIndex];
+    if (strcmp(clip->kind, "video") != 0 || !clip->hasAudio) {
+        strcpy(gBackendMessage, "Select a video clip that contains audio");
+        return false;
+    }
+    if (!PlutoChooseWhisperAssets()) {
+        strcpy(gBackendMessage, "Subtitle generation cancelled; choose whisper-cli and a model to continue");
+        return false;
+    }
+    char path[6144], whisper[6144], model[6144], request[20000];
+    PlutoJsonEscape(clip->path, path, sizeof(path));
+    PlutoJsonEscape(gWhisperCliPath, whisper, sizeof(whisper));
+    PlutoJsonEscape(gWhisperModelPath, model, sizeof(model));
+    int n = snprintf(request, sizeof(request),
+        "{\"command\":\"generate_subtitles\",\"path\":\"%s\",\"whisperPath\":\"%s\",\"modelPath\":\"%s\",\"sourceOffset\":%.6f,\"duration\":%.6f,\"clipStart\":%.6f}",
+        path, whisper, model, clip->sourceOffset, clip->duration, clip->start);
+    if (n <= 0 || (size_t)n >= sizeof(request) || !gBackend.submit(request)) {
+        strcpy(gBackendMessage, "Could not queue subtitle generation");
+        return false;
+    }
+    gSubtitleGenerating = true;
+    snprintf(gSubtitleSourceClipId, sizeof(gSubtitleSourceClipId), "%s", clip->id);
+    strcpy(gBackendMessage, "Generating subtitles…");
+    return true;
+}
 #else
 typedef struct { int unavailable; } PlutoBackend;
 static PlutoBackend gBackend;
@@ -1493,6 +1668,8 @@ static void PlutoRequestExport(void) {}
 static void PlutoPollBackend(void) {}
 static void PlutoUnloadMedia(void) {}
 static void PlutoRequestMediaImport(void) {}
+static bool PlutoRequestRelinkClipFile(int clipIndex) { (void)clipIndex; return false; }
+static bool PlutoRequestSubtitleGeneration(int sourceClipIndex) { (void)sourceClipIndex; return false; }
 #endif
 
 #endif

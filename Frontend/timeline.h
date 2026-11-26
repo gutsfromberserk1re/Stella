@@ -5,6 +5,11 @@
 static float TimelinePps(void) { return 21.5f * gTimelineZoom; }
 #define TIMELINE_LANE_MIN 56.f
 #define TIMELINE_LANE_MAX 80.f
+#define TIMELINE_SUBTITLE_TRACK (TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS)
+static bool TimelineHasSubtitles(void) {
+    for (int i = 0; i < gTimelineClipCount; i++) if (gTimelineClips[i].isSubtitle) return true;
+    return false;
+}
 static float gTimelineLaneHeight = TIMELINE_LANE_MIN;
 
 /* Track rows animate independently. A row remains in the Clay layout while it
@@ -54,6 +59,9 @@ static float gTimelineLastRevealY = -1.f;
 static bool gTimelineWasDraggingVideo;
 static float gTimelineLastAudioRevealY = -1.f;
 static bool gTimelineWasDraggingAudio;
+static double gLastPointerCutAt;
+static float gLastPointerCutTime;
+static int gLastPointerCutTrack = -1;
 
 static bool TimelineVideoTrackIsVisible(int track) {
     for (int i = 0; i < gTimelineVideoTracks; i++)
@@ -82,7 +90,7 @@ static void TimelineRebuildVisibleVideoTracks(void) {
     bool wanted[TIMELINE_MAX_VIDEO_TRACKS] = {true};
     for (int i = 0; i < gTimelineClipCount; i++) {
         int track = gTimelineClips[i].track;
-        if (TimelineTrackIsVideo(track)) wanted[track] = true;
+        if (!gTimelineClips[i].isSubtitle && TimelineTrackIsVideo(track)) wanted[track] = true;
     }
     if (gTimelinePendingVideoTrack >= 1) {
         int last = gTimelinePendingVideoTrack < TIMELINE_MAX_VIDEO_TRACKS - 1 ? gTimelinePendingVideoTrack : TIMELINE_MAX_VIDEO_TRACKS - 1;
@@ -301,6 +309,17 @@ static int TimelineTrackUnderPointer(void) {
         (Rectangle){viewport.x, viewport.y, viewport.width, viewport.height})) return -1;
     float best = INFINITY;
     int bestTrack = -1;
+    if (TimelineHasSubtitles()) {
+        Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", TIMELINE_SUBTITLE_TRACK)).boundingBox;
+        if (lane.width > 0.f && lane.height >= 10.f) {
+            float center = lane.y + lane.height * .5f;
+            float distance = fabsf(mouse.y - center);
+            if (mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
+                distance <= lane.height * .5f + fmaxf(6.f, lane.height * .18f)) {
+                best = distance; bestTrack = TIMELINE_SUBTITLE_TRACK;
+            }
+        }
+    }
     for (int i = 0; i < gTimelineVideoTracks; i++) {
         int track = gTimelineVideoTrackIds[i];
         Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", track)).boundingBox;
@@ -336,18 +355,22 @@ static int TimelineTrackUnderPointerForDrag(void) {
     Clay_BoundingBox viewport = Clay_GetElementData(CLAY_ID("TrackViewport")).boundingBox;
     if (viewport.width > 0.f && !CheckCollisionPointRec(mouse,
         (Rectangle){viewport.x, viewport.y, viewport.width, viewport.height})) return -1;
+    bool draggingSubtitle = gClipDragIndex >= 0 && gClipDragIndex < gTimelineClipCount &&
+                            gTimelineClips[gClipDragIndex].isSubtitle;
     bool draggingAudio = (gClipDragIndex >= 0 && gClipDragIndex < gTimelineClipCount &&
                           TimelineTrackIsAudio(gClipDragTrack)) ||
                          (gMediaDragIndex >= 0 && gMediaDragIndex < gImportedCount &&
                           strcmp(gImported[gMediaDragIndex].kind, "audio") == 0);
     bool draggingVideo = (gClipDragIndex >= 0 && gClipDragIndex < gTimelineClipCount &&
-                          TimelineTrackIsVideo(gClipDragTrack)) ||
+                          !gTimelineClips[gClipDragIndex].isSubtitle && TimelineTrackIsVideo(gClipDragTrack)) ||
                          (gMediaDragIndex >= 0 && gMediaDragIndex < gImportedCount &&
                           strcmp(gImported[gMediaDragIndex].kind, "audio") != 0);
     int preferred = gTimelineDragTargetTrack;
-    if (preferred >= 0 && preferred < TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS &&
-        ((!draggingAudio || TimelineTrackIsAudio(preferred)) &&
-         (!draggingVideo || TimelineTrackIsVideo(preferred)))) {
+    if (preferred >= 0 && preferred <= TIMELINE_SUBTITLE_TRACK &&
+        ((draggingSubtitle && preferred == TIMELINE_SUBTITLE_TRACK) ||
+         (!draggingSubtitle && preferred < TIMELINE_SUBTITLE_TRACK &&
+          (!draggingAudio || TimelineTrackIsAudio(preferred)) &&
+          (!draggingVideo || TimelineTrackIsVideo(preferred))))) {
         Clay_BoundingBox lane = Clay_GetElementData(CLAY_IDI("TrackLane", preferred)).boundingBox;
         if (lane.width > 0.f && lane.height >= 10.f &&
             mouse.x >= lane.x - 4.f && mouse.x <= lane.x + lane.width + 4.f &&
@@ -355,6 +378,7 @@ static int TimelineTrackUnderPointerForDrag(void) {
             return preferred;
     }
     int next = TimelineTrackUnderPointer();
+    if (draggingSubtitle) return TimelineHasSubtitles() ? TIMELINE_SUBTITLE_TRACK : -1;
     /* Keep the media kind on its own family of lanes. In particular, an audio
        asset dropped over V1 should reveal and target A1 instead of being
        silently rejected because the audio row was hidden at drag start. */
@@ -378,7 +402,7 @@ static int TimelineTrackUnderPointerForDrag(void) {
 static void TimelineBuildSnapCache(void) {
     gTimelineSnapPointCount = 0;
     for (int i = 0; i < gTimelineClipCount && gTimelineSnapPointCount + 1 < MAX_TIMELINE_CLIPS * 2; i++) {
-        if (!TimelineTrackIsVideo(gTimelineClips[i].track)) continue;
+        if (!TimelineTrackIsVideo(gTimelineClips[i].track) || gTimelineClips[i].isSubtitle) continue;
         gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start, i};
         gTimelineSnapPoints[gTimelineSnapPointCount++] = (TimelineSnapPoint){gTimelineClips[i].start + gTimelineClips[i].duration, i};
     }
@@ -428,7 +452,7 @@ static float TimelineSnapStart(float start, float duration, bool video, int movi
     /* Non-drag edits keep the uncached path so it always reflects the latest
        project state. */
     for (int n = -1; n < gTimelineClipCount; n++) {
-        if (n == movingIndex || (n >= 0 && (!TimelineTrackIsVideo(gTimelineClips[n].track) ||
+        if (n == movingIndex || (n >= 0 && (!TimelineTrackIsVideo(gTimelineClips[n].track) || gTimelineClips[n].isSubtitle ||
             (excludeGroup && *excludeGroup && strcmp(gTimelineClips[n].groupId, excludeGroup) == 0)))) continue;
         float candidates[2]; int count = 0;
         if (n < 0) { if (snapPlayhead) candidates[count++] = playhead; }
@@ -444,7 +468,8 @@ static float TimelineSnapStart(float start, float duration, bool video, int movi
 
 static bool TimelineTrackOverlaps(int track, float start, float duration, int excluded, const char *excludeGroup) {
     for (int i = 0; i < gTimelineClipCount; i++) {
-        if (i == excluded || (excludeGroup && *excludeGroup && strcmp(gTimelineClips[i].groupId, excludeGroup) == 0) ||
+        if (i == excluded || gTimelineClips[i].isSubtitle ||
+            (excludeGroup && *excludeGroup && strcmp(gTimelineClips[i].groupId, excludeGroup) == 0) ||
             gTimelineClips[i].track != track) continue;
         if (start < gTimelineClips[i].start + gTimelineClips[i].duration - .0001f &&
             start + duration > gTimelineClips[i].start + .0001f) return true;
@@ -469,6 +494,7 @@ static int TimelineClosestFreeTrack(int requested, float start, float duration, 
 
 static const char *TimelineTrackLabel(int track) {
     static const char *labels[] = {"V1", "V2", "V3", "V4", "V5", "V6", "A1", "A2", "A3", "A4", "A5", "A6"};
+    if (track == TIMELINE_SUBTITLE_TRACK) return "S";
     int last = TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
     return labels[track < 0 ? 0 : track > last ? last : track];
 }
@@ -479,14 +505,16 @@ static void TimelineTrackRow(int track, float height) {
     Clay_ElementId row = CLAY_IDI("TrackRow", track);
     static const Color videoBands[3] = {{26, 27, 30, 255}, {25, 26, 29, 255}, {30, 30, 32, 255}};
     static const Color audioBands[2] = {{23, 24, 27, 255}, {26, 27, 30, 255}};
-    Color bgRaylib = track < TIMELINE_MAX_VIDEO_TRACKS ? videoBands[track % 3] : audioBands[(track - TIMELINE_MAX_VIDEO_TRACKS) % 2];
+    Color bgRaylib = track == TIMELINE_SUBTITLE_TRACK ? (Color){32, 30, 35, 255} :
+        track < TIMELINE_MAX_VIDEO_TRACKS ? videoBands[track % 3] : audioBands[(track - TIMELINE_MAX_VIDEO_TRACKS) % 2];
     /* FIX: Clay's backgroundColor is a Clay_Color (floats), not a raylib Color (unsigned char). */
     Clay_Color bg = (Clay_Color){(float)bgRaylib.r, (float)bgRaylib.g, (float)bgRaylib.b, (float)bgRaylib.a};
     CLAY(row, {.layout = {.sizing = {GROW, FIX(height)}, .childAlignment = AL_Y}, .backgroundColor = bg,
                .clip = {.horizontal = true, .vertical = true},
                .border = {.color = RGB(41, 42, 46), .width = {.bottom = 1}}}) {
         CLAY_AUTO_ID({.layout = {.sizing = {FIX(60), FIT}, .padding = {16, 0, 0, 0}, .childGap = 5, .childAlignment = AL_Y}}) {
-            Icon(TimelineTrackIsVideo(track) ? I_FILM : I_NOTE, 14, C_MUTED);
+            Icon(track == TIMELINE_SUBTITLE_TRACK ? I_TEXT :
+                 TimelineTrackIsVideo(track) ? I_FILM : I_NOTE, 14, C_MUTED);
             TxMedium(TimelineTrackLabel(track), 13, C_MUTED);
         }
         TimelineClipLane(track, height);
@@ -526,7 +554,8 @@ static void TimelineUpdateTrimDrag(void) {
         /* Expanding the left edge restores source frames, but never overlaps
            the previous clip on this lane. */
         for (int j = 0; j < gTimelineClipCount; j++) {
-            if (j == index || gTimelineClips[j].track != clip->track) continue;
+            if (clip->isSubtitle || j == index || gTimelineClips[j].isSubtitle ||
+                gTimelineClips[j].track != clip->track) continue;
             if (clip->groupId[0] && strcmp(gTimelineClips[j].groupId, clip->groupId) == 0) continue;
             float otherEnd = gTimelineClips[j].start + gTimelineClips[j].duration;
             if (otherEnd <= gClipTrimOrigStart + 0.001f && otherEnd > minimumStart)
@@ -541,7 +570,8 @@ static void TimelineUpdateTrimDrag(void) {
         /* Expanding the right edge restores source frames, but never overlaps
            the next clip on this lane. */
         for (int j = 0; j < gTimelineClipCount; j++) {
-            if (j == index || gTimelineClips[j].track != clip->track) continue;
+            if (clip->isSubtitle || j == index || gTimelineClips[j].isSubtitle ||
+                gTimelineClips[j].track != clip->track) continue;
             if (clip->groupId[0] && strcmp(gTimelineClips[j].groupId, clip->groupId) == 0) continue;
             if (gTimelineClips[j].start >= gClipTrimOrigEnd - 0.001f &&
                 gTimelineClips[j].start < maximumEnd)
@@ -662,11 +692,13 @@ static void TimelineClipLane(int track, float height) {
         return;
     }
     float pps = TimelinePps();
-    if (gTimelineTool == 2 && Clay_PointerOver(laneId)) gCross = true;
+    if ((gTimelineTool == 2 || gTimelineTool == 4) && Clay_PointerOver(laneId)) gCross = true;
     bool transitionPressed = false;
     int order[MAX_TIMELINE_CLIPS], count = 0;
     for (int i = 0; i < gTimelineClipCount; i++) {
-        if (gTimelineClips[i].track == track) order[count++] = i;
+        bool belongs = track == TIMELINE_SUBTITLE_TRACK ? gTimelineClips[i].isSubtitle :
+            (!gTimelineClips[i].isSubtitle && gTimelineClips[i].track == track);
+        if (belongs) order[count++] = i;
     }
     /* qsort avoids the old insertion-sort O(n^2) cost when large timelines
        are edited or redrawn. The index tie-break keeps ordering deterministic. */
@@ -733,7 +765,7 @@ static void TimelineClipLane(int track, float height) {
                   .clip = {.horizontal = true, .vertical = true}}) {
         int mediaTarget = TimelineTrackUnderPointerForDrag();
         if (gMediaDragIndex >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && mediaTarget >= 0 &&
-            mediaTarget == track && gMediaDragIndex < gImportedCount) {
+            mediaTarget == track && track != TIMELINE_SUBTITLE_TRACK && gMediaDragIndex < gImportedCount) {
             ImportedMedia *media = &gImported[gMediaDragIndex];
             bool mediaIsAudio = strcmp(media->kind, "audio") == 0;
             if (mediaIsAudio == !TimelineTrackIsVideo(track)) {
@@ -862,7 +894,7 @@ static void TimelineClipLane(int track, float height) {
                 PlutoTimelineSelect(i);
                 if (gTimelineTool == 0 || gTimelineTool == 1) {
                     gClipDragIndex = i;
-                    gClipDragTrack = track;
+                    gClipDragTrack = gTimelineClips[i].isSubtitle ? TIMELINE_SUBTITLE_TRACK : track;
                     gTimelineDragTargetTrack = track;
                     gClipDragOrigStart = gTimelineClips[i].start;
                     gClipDragOffset = GetMousePosition().x - bb.x;
@@ -887,16 +919,19 @@ static void TimelineClipLane(int track, float height) {
             if (gClipTrimIndex < 0 && gKeyframeDragClip < 0 && gClipDragIndex == i && (gTimelineTool == 0 || gTimelineTool == 1)) {
                 if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && lane.width > 0.f) {
                     int hoveredTrack = TimelineTrackUnderPointerForDrag();
-                    int requestedTrack = hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
-                        ? hoveredTrack : gClipDragTrack;
+                    bool subtitleClip = gTimelineClips[i].isSubtitle;
+                    int requestedTrack = subtitleClip ? TIMELINE_SUBTITLE_TRACK :
+                        (hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
+                            ? hoveredTrack : gClipDragTrack);
                     Clay_BoundingBox targetLane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
                     float start = fmaxf(0.f, (GetMousePosition().x - targetLane.x - gTimelinePan - gClipDragOffset) / pps);
-                    start = TimelineSnapStart(start, gTimelineClips[i].duration, TimelineTrackIsVideo(gClipDragTrack), i, gPlayhead, true,
+                    start = TimelineSnapStart(start, gTimelineClips[i].duration, true, i, gPlayhead, true,
                                               gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
-                    int targetTrack = TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
+                    int targetTrack = subtitleClip ? gTimelineClips[i].track : TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
                                                                gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
                     if (TimelineTrackIsAudio(targetTrack) && targetTrack > gTimelinePendingAudioTrack) gTimelinePendingAudioTrack = targetTrack;
-                    Clay_BoundingBox targetBox = Clay_GetElementData(CLAY_IDI("TrackLane", targetTrack)).boundingBox;
+                    int displayTrack = subtitleClip ? TIMELINE_SUBTITLE_TRACK : targetTrack;
+                    Clay_BoundingBox targetBox = Clay_GetElementData(CLAY_IDI("TrackLane", displayTrack)).boundingBox;
                     float x = targetBox.x + gTimelinePan + start * pps;
                     float w = fmaxf(46.f, gTimelineClips[i].duration * pps);
                     float left = fmaxf(targetBox.x, x), right = fminf(targetBox.x + targetBox.width, x + w);
@@ -910,15 +945,17 @@ static void TimelineClipLane(int track, float height) {
                     }
                 } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                     int hoveredTrack = TimelineTrackUnderPointerForDrag();
-                    int requestedTrack = hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
-                        ? hoveredTrack : gClipDragTrack;
+                    bool subtitleClip = gTimelineClips[i].isSubtitle;
+                    int requestedTrack = subtitleClip ? TIMELINE_SUBTITLE_TRACK :
+                        (hoveredTrack >= 0 && TimelineTrackIsVideo(hoveredTrack) == TimelineTrackIsVideo(gClipDragTrack)
+                            ? hoveredTrack : gClipDragTrack);
                     Clay_BoundingBox targetLane = Clay_GetElementData(CLAY_IDI("TrackLane", requestedTrack)).boundingBox;
                     float start = targetLane.width > 0.f
                         ? fmaxf(0.f, (GetMousePosition().x - targetLane.x - gTimelinePan - gClipDragOffset) / pps)
                         : gTimelineClips[i].start;
-                    start = TimelineSnapStart(start, gTimelineClips[i].duration, TimelineTrackIsVideo(gClipDragTrack), i, gPlayhead, true,
+                    start = TimelineSnapStart(start, gTimelineClips[i].duration, true, i, gPlayhead, true,
                                               gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
-                    int targetTrack = TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
+                    int targetTrack = subtitleClip ? gTimelineClips[i].track : TimelineClosestFreeTrack(requestedTrack, start, gTimelineClips[i].duration, i,
                                                                gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
                     if (!PlutoTimelineMove(i, start, targetTrack)) {
                         gTimelineClips[i].start = gClipDragOrigStart;
@@ -934,11 +971,28 @@ static void TimelineClipLane(int track, float height) {
                     gMediaDropPreviewMedia = -1;
                 }
             }
-            if (b.clicked && gTimelineTool == 2) {
-                float cutAt = (GetMousePosition().x - lane.x - gTimelinePan) / pps;
-                cutAt = fmaxf(gTimelineClips[i].start + .001f,
-                              fminf(gTimelineClips[i].start + gTimelineClips[i].duration - .001f, cutAt));
-                PlutoTimelineSplit(i, cutAt);
+            if (b.clicked && (gTimelineTool == 2 || gTimelineTool == 4)) {
+                float cutAt = gTimelineTool == 4 ? gPlayhead :
+                    (GetMousePosition().x - lane.x - gTimelinePan) / pps;
+                bool insideClip = cutAt > gTimelineClips[i].start + .001f &&
+                    cutAt < gTimelineClips[i].start + gTimelineClips[i].duration - .001f;
+                double now = GetTime();
+                /* A split changes the clip geometry underneath the pointer. On a
+                   double-click the second press can therefore resolve to a nearby
+                   timestamp even when the user clicked the exact same screen spot.
+                   Compare a wider screen-space radius and the platform double-click
+                   interval so one gesture can never create two adjacent cuts. */
+                bool doubleClickRepeat = gTimelineTool == 2 && gLastPointerCutTrack == track &&
+                    fabsf(cutAt - gLastPointerCutTime) < fmaxf(.06f, 8.f / fmaxf(1.f, pps)) &&
+                    gLastPointerCutAt > 0.0 && now - gLastPointerCutAt < .52;
+                if (insideClip && !doubleClickRepeat) {
+                    PlutoTimelineSplit(i, cutAt);
+                    if (gTimelineTool == 2) {
+                        gLastPointerCutAt = now;
+                        gLastPointerCutTime = cutAt;
+                        gLastPointerCutTrack = track;
+                    }
+                }
             }
             float cardWidth = fmaxf(1.f, width);
             bool clipSelected = gTimelineSelected == i || gTimelineMultiSelect[i];
@@ -952,7 +1006,10 @@ static void TimelineClipLane(int track, float height) {
                           .clip = {.horizontal = true, .vertical = true},
                           .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, b.hover,
                                                      (i << 1) | (clipSelected ? 1 : 0))}}) {
-                if (TimelineTrackIsVideo(gTimelineClips[i].track)) {
+                if (gTimelineClips[i].isSubtitle) {
+                    Icon(I_NOTE, 13, C_TEXT);
+                    if (cardWidth >= 72.f) Tx(gTimelineClips[i].label, 12, C_TEXT, 1);
+                } else if (TimelineTrackIsVideo(gTimelineClips[i].track)) {
                     Icon(I_FILM, 13, C_TEXT);
                     if (cardWidth >= 92.f) Tx(gTimelineClips[i].label, 13, C_TEXT, 1);
                 }
@@ -963,14 +1020,39 @@ static void TimelineClipLane(int track, float height) {
     }
 }
 
-static int TimelineContextActions(int actions[4]) {
+static bool TimelineSelectedVideoAudioPair(int *videoIndex, int *audioIndex) {
+    int selected[2] = {-1, -1}, count = 0;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        if (gTimelineMultiSelect[i]) {
+            if (count >= 2) return false;
+            selected[count++] = i;
+        }
+    }
+    if (count != 2) return false;
+    int a = selected[0], b = selected[1];
+    if (TimelineTrackIsVideo(gTimelineClips[a].track) && TimelineTrackIsAudio(gTimelineClips[b].track)) {
+        *videoIndex = a; *audioIndex = b; return true;
+    }
+    if (TimelineTrackIsVideo(gTimelineClips[b].track) && TimelineTrackIsAudio(gTimelineClips[a].track)) {
+        *videoIndex = b; *audioIndex = a; return true;
+    }
+    return false;
+}
+
+static int TimelineContextActions(int actions[6]) {
     if (gTimelineContextClip < 0 || gTimelineContextClip >= gTimelineClipCount) return 0;
     TimelineClipUi *clip = &gTimelineClips[gTimelineContextClip];
     int count = 0;
-    actions[count++] = clip->groupId[0] ? 1 : 0; /* 0 group, 1 ungroup */
-    if (TimelineTrackIsVideo(clip->track) && clip->hasAudio) actions[count++] = 2;
-    if (clip->linkedId[0]) actions[count++] = 3;
-    actions[count++] = 4; /* delete */
+    actions[count++] = clip->groupId[0] ? 1 : 0;
+    if (!clip->isSubtitle && TimelineTrackIsVideo(clip->track) && clip->hasAudio) actions[count++] = 2;
+    if (!clip->isSubtitle && clip->linkedId[0]) actions[count++] = 3;
+    int videoIndex = -1, audioIndex = -1;
+    if (!clip->isSubtitle && TimelineSelectedVideoAudioPair(&videoIndex, &audioIndex) &&
+        !gTimelineClips[videoIndex].isSubtitle && !gTimelineClips[audioIndex].isSubtitle &&
+        !gTimelineClips[videoIndex].linkedId[0] && !gTimelineClips[audioIndex].linkedId[0])
+        actions[count++] = 5;
+    if (!clip->isSubtitle) actions[count++] = 6;
+    actions[count++] = 4;
     return count;
 }
 
@@ -980,13 +1062,15 @@ static const char *TimelineContextLabel(int action, int selectedCount) {
     case 1: return "Ungroup clips";
     case 2: return "Separate audio";
     case 3: return "Unlink audio";
+    case 5: return "Link selected audio + video";
+    case 6: return "Relink media…";
     default: return "Delete clip";
     }
 }
 
 static Rectangle TimelineContextBounds(void) {
-    int actions[4], count = TimelineContextActions(actions);
-    float width = 188.f, height = count * 30.f + 8.f;
+    int actions[6], count = TimelineContextActions(actions);
+    float width = 208.f, height = count * 30.f + 8.f;
     float x = gTimelineContextPos.x, y = gTimelineContextPos.y;
     if (x + width > GetScreenWidth() - 8.f) x = GetScreenWidth() - width - 8.f;
     if (y + height > GetScreenHeight() - 8.f) y = GetScreenHeight() - height - 8.f;
@@ -1003,7 +1087,7 @@ static void TimelineContextLogic(void) {
     Vector2 mouse = GetMousePosition();
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (CheckCollisionPointRec(mouse, menu)) {
-            int actions[4], count = TimelineContextActions(actions);
+            int actions[6], count = TimelineContextActions(actions);
             int row = (int)((mouse.y - menu.y - 4.f) / 30.f);
             if (row >= 0 && row < count) {
                 int action = actions[row];
@@ -1013,6 +1097,11 @@ static void TimelineContextLogic(void) {
                 } else if (action == 1) PlutoTimelineUngroup(gTimelineContextClip);
                 else if (action == 2) PlutoTimelineSeparateAudio(gTimelineContextClip);
                 else if (action == 3) PlutoTimelineUnlink(gTimelineContextClip);
+                else if (action == 5) {
+                    int videoIndex = -1, audioIndex = -1;
+                    if (TimelineSelectedVideoAudioPair(&videoIndex, &audioIndex)) PlutoTimelineLinkAudio(videoIndex, audioIndex);
+                }
+                else if (action == 6) PlutoRequestRelinkClipFile(gTimelineContextClip);
                 else if (action == 4) {
                     PlutoTimelineDelete(gTimelineContextClip);
                     memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
@@ -1031,7 +1120,7 @@ static void TimelineContextLogic(void) {
 
 static void DrawTimelineContextMenu(void) {
     if (!gTimelineContextOpen) return;
-    int actions[4], count = TimelineContextActions(actions);
+    int actions[6], count = TimelineContextActions(actions);
     Rectangle menu = TimelineContextBounds();
     Vector2 mouse = GetMousePosition();
     gTimelineContextRect = menu;
@@ -1183,6 +1272,7 @@ static void Timeline(void) {
     gTimelineLaneHeight = fmaxf(TIMELINE_LANE_MIN, fminf(TIMELINE_LANE_MAX, gTimelineLaneHeight));
     float trackViewportHeight = fmaxf(1.f, gTimeH - 90.5f);
     float laneContentHeight = 0.f;
+    if (TimelineHasSubtitles()) laneContentHeight += gTimelineLaneHeight + 2.25f;
     for (int i = 0; i < gTimelineVideoTracks; i++) {
         int track = gTimelineVideoTrackIds[i];
         float vis = gTimelineTrackVis[track];
@@ -1204,6 +1294,7 @@ static void Timeline(void) {
             if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) { gTimelineTool = 0; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+            if (IconBtn(CLAY_ID("ToolPlayheadCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 4, 9)) { gTimelineTool = 4; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             if (IconBtn(CLAY_ID("ToolText"), I_TEXT, 36, 18, C_DIM, gTimelineTool == 3, 9)) {
                 gTimelineTool = 3;
                 gRightTab = 3;
@@ -1300,6 +1391,7 @@ static void Timeline(void) {
                 }
                 CLAY(CLAY_ID("TrackViewport"), {.layout = {COLM, .sizing = {GROW, GROW}},
                     .clip = {.horizontal = true, .vertical = true, .childOffset = {0, -gTimelineVerticalScroll}}}) {
+                    if (TimelineHasSubtitles()) TimelineTrackRow(TIMELINE_SUBTITLE_TRACK, gTimelineLaneHeight);
                     for (int i = 0; i < gTimelineVideoTracks; i++) {
                         int track = gTimelineVideoTrackIds[i];
                         TimelineTrackRow(track, fmaxf(0.1f, gTimelineLaneHeight * gTimelineTrackVis[track]));

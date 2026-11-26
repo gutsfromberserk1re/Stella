@@ -200,7 +200,7 @@ jobs:
 
           if(MINGW)
               target_link_options(Stella PRIVATE -static -static-libgcc -mwindows)
-              target_link_libraries(Stella PRIVATE opengl32 gdi32 winmm comdlg32)
+              target_link_libraries(Stella PRIVATE opengl32 gdi32 winmm comdlg32 advapi32)
           endif()
 
           set_target_properties(Stella PROPERTIES

@@ -97,7 +97,7 @@ static uint64_t gPreviewTaskId;
 /* Small preview request window: finished frames are matched to the exact
    playhead/resolution snapshot that produced them, even when requests finish
    out of order on the preview workers. */
-#define STELLA_PREVIEW_REQUESTS 3
+#define STELLA_PREVIEW_REQUESTS 1
 typedef struct {
     uint64_t id;
     float at;
@@ -217,7 +217,21 @@ static bool gTextBold = true;
 static bool gTextItalic;
 static bool gTextUnderline;
 static int gTextFontFamily; /* 0 System, 1 Arial, 2 Georgia, 3 Monospace */
+static char gTextFontName[96] = "System";
+static char gTextFontPath[1024];
 static bool gTextFontMenuOpen;
+static Rectangle gTextFontPickerRect, gTextFontMenuRect;
+static float gTextFontMenuScroll;
+static bool gTextIsSubtitle;
+static bool gSubtitleCardOpen;
+static bool gSubtitleGenerating;
+static int gSubtitleCueCount;
+static char gWhisperCliPath[1024];
+static char gWhisperModelPath[1024];
+static char gSubtitleSourceClipId[64];
+static char gTextSubtitleSourceId[64];
+static bool gWhisperConfigLoaded;
+static void PlutoSubtitleHandleResult(const char *event);
 static double gTextCaretT;
 static double gTextFocusStartedAt;
 static bool gTextOutline;
@@ -336,12 +350,12 @@ enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
        KF_SCALE_H = 1u << 3, KF_ROTATION = 1u << 4, KF_OPACITY = 1u << 5 };
 
 typedef struct {
-    char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16];
+    char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16], subtitleSourceId[64], subtitleText[STELLA_TEXT_MAX];
     char transitionType[16];
     int track, mediaIndex; /* 0..5 = video V1..V6, 6..11 = audio A1..A6 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
     float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
-    bool hasAudio, audioFadeIn, audioFadeOut;
+    bool hasAudio, audioFadeIn, audioFadeOut, isSubtitle;
     TimelineKeyframeUi keyframes[32];
     int keyframeCount;
 } TimelineClipUi;
@@ -373,6 +387,20 @@ static int gTimelinePendingAudioTrack = -1;
 static float TimelinePps(void);
 static float TimelineDuration(void);
 
+/* A single transport transition resets stale preview direction state. Starting
+   from the exact end wraps to zero; starting anywhere else preserves the user's
+   chosen playhead position. */
+static void PlutoTogglePlayback(void) {
+    if (!gTimelinePlaying) {
+        const float frame = 1.f / (float)fmaxf(1, gPreviewFps);
+        if (gPlayhead >= TimelineDuration() - frame * 0.5f) gPlayhead = 0.f;
+        gPreviewDisplayedAt = -1.f;
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    }
+    gTimelinePlaying = !gTimelinePlaying;
+}
+
 /* rotation ruler geometry (inside the 322px wide ruler box) */
 #define RULER_L 22.f
 #define RULER_R 22.5f
@@ -394,9 +422,13 @@ static const char *Fmt(const char *f, ...) {
 static char gFontPath[11][260];
 static bool gFontOK[11];
 static int  gFcps[100], gFcpN;
-typedef struct { int slot, px; Font f; } FontEnt;
-static FontEnt gFC[256];
+typedef struct { int slot, px; bool custom; char path[1024]; Font f; } FontEnt;
+static FontEnt gFC[512];
 static int gFCN;
+#define STELLA_MAX_SYSTEM_FONTS 384
+typedef struct { char name[96]; char path[1024]; } StellaSystemFont;
+static StellaSystemFont gSystemFonts[STELLA_MAX_SYSTEM_FONTS];
+static int gSystemFontCount;
 
 static int PxOf(int slot, float size) {
     int p = (int)roundf(size * gFK[slot] * gDpiScale);
@@ -407,11 +439,27 @@ static Font FontPx(int slot, int px) {
     if (!gFontOK[slot]) return GetFontDefault();
     for (int i = 0; i < gFCN; i++)
         if (gFC[i].slot == slot && gFC[i].px == px) return gFC[i].f;
-    if (gFCN >= 256) return GetFontDefault();
+    if (gFCN >= (int)(sizeof(gFC) / sizeof(gFC[0]))) return GetFontDefault();
     Font f = LoadFontEx(gFontPath[slot], px, gFcps, gFcpN);
     if (f.texture.id == 0) { gFontOK[slot] = false; return GetFontDefault(); }
     SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
-    gFC[gFCN].slot = slot; gFC[gFCN].px = px; gFC[gFCN].f = f;
+    gFC[gFCN].slot = slot; gFC[gFCN].px = px; gFC[gFCN].custom = false;
+    gFC[gFCN].path[0] = 0; gFC[gFCN].f = f;
+    return gFC[gFCN++].f;
+}
+
+static Font FontPxFromPath(const char *path, int px) {
+    if (!path || !*path || !FileExists(path)) return GetFontDefault();
+    for (int i = 0; i < gFCN; i++)
+        if (gFC[i].custom && gFC[i].px == px && strcmp(gFC[i].path, path) == 0) return gFC[i].f;
+    if (gFCN >= (int)(sizeof(gFC) / sizeof(gFC[0]))) return GetFontDefault();
+    Font f = LoadFontEx(path, px, gFcps, gFcpN);
+    if (f.texture.id == 0) return GetFontDefault();
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    gFC[gFCN].slot = -1; gFC[gFCN].px = px; gFC[gFCN].custom = true;
+    strncpy(gFC[gFCN].path, path, sizeof(gFC[gFCN].path) - 1);
+    gFC[gFCN].path[sizeof(gFC[gFCN].path) - 1] = 0;
+    gFC[gFCN].f = f;
     return gFC[gFCN++].f;
 }
 
