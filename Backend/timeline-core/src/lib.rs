@@ -247,7 +247,7 @@ impl Timeline {
             shift_clip_keyframes(&mut moved, moved.start - original.start);
             self.replace(moved);
             self.refresh_duration();
-            return self.find(id).cloned().ok_or_else(|| TimelineError::ClipNotFound(id.into()));
+            return Ok(self.find(id)?.clone());
         }
         let group_id = original.extra.get("groupId").and_then(serde_json::Value::as_str).map(str::to_owned);
         let mut members: Vec<_> = self.clips.iter().filter(|clip| {
@@ -416,7 +416,7 @@ impl Timeline {
             }
             Some(linked)
         } else { None };
-        let linked_right_id = linked_original.as_ref().map(|linked| format!("{}-linked", right_id));
+        let linked_right_id = linked_original.as_ref().map(|_| format!("{}-linked", right_id));
         if linked_right_id.as_ref().map_or(false, |new_id| self.clips.iter().any(|clip| clip.id == *new_id)) {
             return Err(TimelineError::InvalidRange);
         }
@@ -992,7 +992,7 @@ mod tests {
     fn separately_placed_audio_can_be_linked_to_its_matching_video_clip() {
         let mut video = video_clip("video", 1.0, 4.0);
         video.extra.insert("sourceOffset".into(), serde_json::json!(1.5));
-        let mut audio = Clip {
+        let audio = Clip {
             id: "audio".into(), track: TrackId::A1, start: 1.0, duration: 4.0,
             label: "audio".into(), linked_clip_id: None,
             extra: HashMap::from([
