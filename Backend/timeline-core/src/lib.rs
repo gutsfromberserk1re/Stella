@@ -606,17 +606,11 @@ impl Timeline {
         }
         let deleted_ids: HashSet<String> = deleted.iter().map(|c| c.id.clone()).collect();
         if self.magnetic && deleted.iter().any(|item| !clip_is_subtitle(item)) {
+            /* Ripple-delete exactly the removed time on each affected row.
+               Do not compact the whole row again here: that would also erase
+               pre-existing gaps unrelated to this deletion, pulling followers
+               too far left (and making A/V rows appear to jump unpredictably). */
             self.close_lane_gaps(&deleted, &deleted_ids);
-            let mut affected_tracks: Vec<TrackId> = deleted.iter()
-                .filter(|item| !clip_is_subtitle(item))
-                .map(|item| item.track)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            affected_tracks.sort_by_key(|track| track.sort_index());
-            for track in affected_tracks {
-                self.compact_lane(track, &deleted_ids);
-            }
         }
         self.clips.retain(|c| !deleted_ids.contains(&c.id));
         self.refresh_duration();
