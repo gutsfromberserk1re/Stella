@@ -496,86 +496,57 @@ static float TimelineSnapStart(float start, float duration, int targetTrack, int
    separate proximity snap; a remote V1 cut cannot pull a V2 clip across time. */
 static float TimelineMagneticStart(float start, float duration, int targetTrack, int movingIndex,
                                    const char *excludeGroup) {
+    (void)duration;
     if (targetTrack < 0 || targetTrack >= TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS)
         return fmaxf(0.f, start);
 
-    float removedStarts[MAX_TIMELINE_CLIPS], removedEnds[MAX_TIMELINE_CLIPS];
-    int removedCount = 0;
-    for (int i = 0; i < gTimelineClipCount; i++) {
-        const TimelineClipUi *clip = &gTimelineClips[i];
-        bool moving = i == movingIndex || (excludeGroup && *excludeGroup &&
-            clip->groupId[0] && strcmp(clip->groupId, excludeGroup) == 0);
-        if (!moving || clip->track != targetTrack || clip->isSubtitle) continue;
-        removedStarts[removedCount] = clip->start;
-        removedEnds[removedCount] = clip->start + clip->duration;
-        removedCount++;
-    }
-    for (int i = 1; i < removedCount; i++) {
-        float begin = removedStarts[i], end = removedEnds[i];
-        int j = i - 1;
-        while (j >= 0 && removedStarts[j] > begin) {
-            removedStarts[j + 1] = removedStarts[j];
-            removedEnds[j + 1] = removedEnds[j];
-            j--;
-        }
-        removedStarts[j + 1] = begin;
-        removedEnds[j + 1] = end;
-    }
-    float mergedStarts[MAX_TIMELINE_CLIPS], mergedEnds[MAX_TIMELINE_CLIPS];
-    int mergedCount = 0;
-    for (int i = 0; i < removedCount; i++) {
-        if (mergedCount && removedStarts[i] <= mergedEnds[mergedCount - 1] + .0001f) {
-            mergedEnds[mergedCount - 1] = fmaxf(mergedEnds[mergedCount - 1], removedEnds[i]);
-        } else {
-            mergedStarts[mergedCount] = removedStarts[i];
-            mergedEnds[mergedCount] = removedEnds[i];
-            mergedCount++;
-        }
-    }
-
-    float bestStart = fmaxf(0.f, start), bestDistance = 1e30f;
-    for (int i = 0; i < gTimelineClipCount; i++) {
+    int order[MAX_TIMELINE_CLIPS];
+    int count = 0;
+    for (int i = 0; i < gTimelineClipCount && count < MAX_TIMELINE_CLIPS; i++) {
         const TimelineClipUi *clip = &gTimelineClips[i];
         bool moving = i == movingIndex || (excludeGroup && *excludeGroup &&
             clip->groupId[0] && strcmp(clip->groupId, excludeGroup) == 0);
         if (moving || clip->track != targetTrack || clip->isSubtitle) continue;
-        float shift = 0.f;
-        for (int r = 0; r < mergedCount; r++)
-            if (mergedEnds[r] <= clip->start + .0001f) shift += mergedEnds[r] - mergedStarts[r];
-        float projectedStart = fmaxf(0.f, clip->start - shift);
-        float projectedEnd = projectedStart + clip->duration;
-        float candidates[2] = {projectedEnd, projectedStart - duration};
-        for (int c = 0; c < 2; c++) {
-            float candidate = candidates[c];
-            if (!isfinite(candidate) || candidate < 0.f) continue;
-            bool startsInsideExisting = false;
-            for (int j = 0; j < gTimelineClipCount; j++) {
-                const TimelineClipUi *other = &gTimelineClips[j];
-                bool otherMoving = j == movingIndex || (excludeGroup && *excludeGroup &&
-                    other->groupId[0] && strcmp(other->groupId, excludeGroup) == 0);
-                if (otherMoving || other->track != targetTrack || other->isSubtitle) continue;
-                float otherShift = 0.f;
-                for (int r = 0; r < mergedCount; r++)
-                    if (mergedEnds[r] <= other->start + .0001f) otherShift += mergedEnds[r] - mergedStarts[r];
-                float otherStart = fmaxf(0.f, other->start - otherShift);
-                float otherEnd = otherStart + other->duration;
-                if (candidate > otherStart + .0001f && candidate < otherEnd - .0001f) {
-                    startsInsideExisting = true;
-                    break;
-                }
-            }
-            if (startsInsideExisting) continue;
-            float distance = fabsf(candidate - start);
-            if (distance < bestDistance - .00001f ||
-                (fabsf(distance - bestDistance) <= .00001f && candidate < bestStart)) {
-                bestDistance = distance;
-                bestStart = candidate;
-            }
+        int insert = count;
+        while (insert > 0) {
+            const TimelineClipUi *previous = &gTimelineClips[order[insert - 1]];
+            if (previous->start < clip->start - .0001f ||
+                (fabsf(previous->start - clip->start) <= .0001f &&
+                 strcmp(previous->id, clip->id) <= 0)) break;
+            order[insert] = order[insert - 1];
+            insert--;
         }
+        order[insert] = i;
+        count++;
+    }
+    if (count == 0) return fmaxf(0.f, start);
+    if (start <= gTimelineClips[order[0]].start + .0001f) return fmaxf(0.f, start);
+
+    /* The Rust backend compacts the destination row before insertion. Mirror
+       that projection here so the drag ghost and committed clip land together. */
+    float cursor = gTimelineClips[order[0]].start;
+    float bestStart = fmaxf(0.f, start);
+    float bestDistance = fabsf(bestStart - cursor);
+    for (int n = 0; n < count; n++) {
+        const TimelineClipUi *clip = &gTimelineClips[order[n]];
+        float cutBefore = cursor;
+        float cutAfter = cursor + clip->duration;
+        float beforeDistance = fabsf(cutBefore - start);
+        float afterDistance = fabsf(cutAfter - start);
+        if (beforeDistance < bestDistance - .00001f ||
+            (fabsf(beforeDistance - bestDistance) <= .00001f && cutBefore < bestStart)) {
+            bestDistance = beforeDistance;
+            bestStart = cutBefore;
+        }
+        if (afterDistance < bestDistance - .00001f ||
+            (fabsf(afterDistance - bestDistance) <= .00001f && cutAfter < bestStart)) {
+            bestDistance = afterDistance;
+            bestStart = cutAfter;
+        }
+        cursor = cutAfter;
     }
     return fmaxf(0.f, bestStart);
 }
-
 
 static const char *TimelineTrackLabel(int track) {
     static const char *labels[] = {"V1", "V2", "V3", "V4", "V5", "V6", "A1", "A2", "A3", "A4", "A5", "A6"};
@@ -1019,9 +990,13 @@ static void TimelineClipLane(int track, float height) {
                     bool snapEngaged = false;
                     float start = TimelineSnapStart(rawStart, gTimelineClips[i].duration, requestedTrack, i, gPlayhead, true,
                                                     gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL, &snapEngaged);
-                    if (!subtitleClip && !snapEngaged)
-                        start = TimelineMagneticStart(start, gTimelineClips[i].duration, requestedTrack, i,
-                                                      gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
+                    if (!subtitleClip) {
+                        float laneCut = TimelineMagneticStart(start, gTimelineClips[i].duration, requestedTrack, i,
+                                                             gTimelineClips[i].groupId[0] ? gTimelineClips[i].groupId : NULL);
+                        /* Match Rust: keep a proximity snap only when it is also
+                           a cut in the destination lane, preserving gapless rows. */
+                        if (!snapEngaged || fabsf(laneCut - start) > .001f) start = laneCut;
+                    }
                     int targetTrack = subtitleClip ? gTimelineClips[i].track : requestedTrack;
                     if (TimelineTrackIsAudio(targetTrack) && targetTrack > gTimelinePendingAudioTrack) gTimelinePendingAudioTrack = targetTrack;
                     int displayTrack = subtitleClip ? TIMELINE_SUBTITLE_TRACK : targetTrack;

@@ -921,9 +921,24 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
         "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
         id, fmaxf(0.f, start), fmaxf(.05f, duration), isSubtitle ? "Subtitle" : "Title", escapedPath, fmaxf(.05f, duration), textJson);
     if (n <= 0 || (size_t)n >= sizeof(request) || !PlutoTimelineCall(request)) return false;
+    int createdIndex = -1;
     for (int i = 0; i < gTimelineClipCount; i++) {
-        if (strcmp(gTimelineClips[i].id, id) == 0) { PlutoTimelineSelect(i); break; }
+        if (strcmp(gTimelineClips[i].id, id) == 0) { createdIndex = i; break; }
     }
+    /* A successful backend response should include the new V6 title. Refresh
+       once if the frontend snapshot lagged, rather than silently leaving the
+       user with a title that exists in Rust but is not visible/selectable. */
+    if (createdIndex < 0 && PlutoTimelineCall("{\"command\":\"timeline_get\"}")) {
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            if (strcmp(gTimelineClips[i].id, id) == 0) { createdIndex = i; break; }
+        }
+    }
+    if (createdIndex < 0) {
+        if (!gBackendMessage[0]) strcpy(gBackendMessage, "The title was not returned by the timeline backend");
+        return false;
+    }
+    PlutoTimelineSelect(createdIndex);
+    gTimelinePendingVideoTrack = 5;
     gRightTab = 3;
     gTextTitleSelected = true;
     gPreviewDirty = true;

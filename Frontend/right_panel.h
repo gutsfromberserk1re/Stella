@@ -2424,7 +2424,8 @@ static void PlutoTextCreateBox(float x, float y, float width, float height) {
     if (!gTextContent[0]) strcpy(gTextContent, "Text");
     gTextInputFocused = false;
     gTextFocusStartedAt = 0.0;
-    PlutoTextApply(true, false);
+    if (!PlutoTextApply(true, false) && !gBackendMessage[0])
+        strcpy(gBackendMessage, "Could not place the text clip on V6");
 }
 
 static uint64_t PlutoTextRasterSignature(void) {
