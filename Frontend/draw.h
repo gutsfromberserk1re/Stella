@@ -1123,20 +1123,15 @@ static void RenderUI(Clay_RenderCommandArray cmds) {
         bool hover = CheckCollisionPointRec(GetMousePosition(), r);
         if (button->applied) {
             Rectangle span = button->durationRect;
-            if (span.width > 2.f && span.height > 2.f) {
-                float mid = span.x + span.width * .5f;
-                float cy = span.y + span.height * .5f;
-                Color cone = hover ? (Color){100, 174, 235, 78} : (Color){94, 160, 220, 54};
-                /* Two translucent cones widen across both clips and meet at
-                   their join: the visible width is the actual transition duration. */
-                DrawTriangle((Vector2){span.x, span.y}, (Vector2){span.x, span.y + span.height},
-                             (Vector2){mid, cy}, cone);
-                DrawTriangle((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y},
-                             (Vector2){span.x + span.width, span.y + span.height}, cone);
-                DrawLineEx((Vector2){span.x, span.y}, (Vector2){mid, cy}, 1.f, (Color){146, 196, 242, 92});
-                DrawLineEx((Vector2){span.x, span.y + span.height}, (Vector2){mid, cy}, 1.f, (Color){146, 196, 242, 92});
-                DrawLineEx((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y}, 1.f, (Color){146, 196, 242, 92});
-                DrawLineEx((Vector2){mid, cy}, (Vector2){span.x + span.width, span.y + span.height}, 1.f, (Color){146, 196, 242, 92});
+            if (span.width > 1.f && span.height > 2.f) {
+                /* A solid range bar is easier to read than the old hourglass
+                   cones: its left edge is transition-in and its right edge is
+                   the edit point. Its width is the effective duration. */
+                FillRR(span, 3.f, hover ? (Color){100, 174, 235, 104} : (Color){94, 160, 220, 76});
+                StrokeRR(span, 3.f, 1.f, hover ? (Color){166, 207, 246, 190} : (Color){146, 196, 242, 132});
+                float cutX = span.x + span.width - 1.f;
+                DrawLineEx((Vector2){cutX, span.y + 1.f}, (Vector2){cutX, span.y + span.height - 1.f},
+                           1.4f, (Color){205, 225, 247, 210});
             }
         } else if (hover) {
             DrawCircleV((Vector2){r.x + r.width * .5f, r.y + r.height * .5f}, r.width * .5f,

@@ -465,7 +465,8 @@ static void AudioPlaybackTick(bool playing) {
         return;
     }
     bool active[STELLA_AUDIO_VOICES] = {false};
-    float mixGainTotal = 0.f;
+    float mixTotalGain = 0.f;
+    int mixActiveCount = 0;
     for (int i = 0; i < gTimelineClipCount; i++) {
         TimelineClipUi *clip = &gTimelineClips[i];
         if (!(clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio) || clip->duration <= 0.f ||
@@ -485,9 +486,10 @@ static void AudioPlaybackTick(bool playing) {
         float remaining = clip->start + clip->duration - gPlayhead;
         if (clip->audioFadeOut && clip->audioFadeOutDuration > .001f)
             fade = fminf(fade, fmaxf(0.f, remaining / clip->audioFadeOutDuration));
-        float volume = fmaxf(0.f, fminf(2.f, clip->audioVolume / 100.f)) * fade;
+        float volume = fmaxf(0.f, fminf(STELLA_AUDIO_VOLUME_MAX / 100.f, clip->audioVolume / 100.f)) * fade;
         float pan = fmaxf(-1.f, fminf(1.f, clip->audioPan / 100.f));
-        mixGainTotal += volume;
+        mixTotalGain += volume;
+        mixActiveCount++;
         SetMusicVolume(voice->music, volume);
         SetMusicPan(voice->music, pan);
 
@@ -525,10 +527,11 @@ static void AudioPlaybackTick(bool playing) {
             }
         }
     }
-    /* A simple master-bus gain stage keeps overlapping full-level clips from
-       summing into hard digital clipping. Smooth the gain so track entrances
-       do not cause an audible volume jump. */
-    float targetHeadroom = 1.f / fmaxf(1.f, mixGainTotal);
+    /* Preserve the full requested gain for a single clip (including 10x).
+       When multiple clips overlap, reduce the master bus according to their
+       summed gains to avoid digital clipping. Smooth the change to prevent
+       audible level jumps at track entrances and exits. */
+    float targetHeadroom = mixActiveCount > 1 ? 1.f / fmaxf(1.f, mixTotalGain) : 1.f;
     float mixFollow = 1.f - expf(-8.f * fmaxf(0.f, gDt));
     gAudioMixHeadroom += (targetHeadroom - gAudioMixHeadroom) * mixFollow;
     SetMasterVolume(.92f * gAudioMixHeadroom);
@@ -873,6 +876,8 @@ int main(void) {
         }
         if (gPreviewFps != observedPreviewFps) {
             observedPreviewFps = gPreviewFps;
+            gPreviewLastSubmittedFrame = -1;
+            gPreviewDisplayedAt = -1.f;
             gPreviewDirty = true;
         }
         if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
@@ -990,14 +995,21 @@ int main(void) {
 
         if (gTimelinePlaying) {
             float end = TimelineDuration();
-            const float frameDuration = 1.f / (float)fmaxf(1, gPreviewFps);
-            float previousPlayhead = gPlayhead;
+            const int previewFps = (int)fmaxf(1.f, (float)gPreviewFps);
             gPlayhead += (float)transportElapsed;
             if (gPlayhead >= end) {
                 gPlayhead = end;
                 gTimelinePlaying = false;
+                /* Finish with an exact still frame at the project endpoint; the
+                   last cadence request may have been snapped to the prior frame. */
+                gPreviewDirty = true;
             }
-            if (fabsf(gPlayhead - previousPlayhead) >= frameDuration * .5f) gPreviewDirty = true;
+            /* Do not schedule from a per-UI-tick half-frame threshold. At 24 fps
+               half a frame is longer than one 60 Hz UI tick, so most ticks never
+               request a refresh; at 30 fps it sits exactly on the tick and is
+               sensitive to tiny timing jitter. Schedule on output-frame changes. */
+            const int64_t wantedFrame = (int64_t)floor((double)gPlayhead * previewFps + 1e-4);
+            if (wantedFrame != gPreviewLastSubmittedFrame) gPreviewDirty = true;
         }
         AudioPlaybackTick(gTimelinePlaying);
         gWheelDelta = GetMouseWheelMove();

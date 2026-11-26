@@ -79,7 +79,6 @@ static void MediaView(void) {
 /* value text for knob idx */
 /* draggable knob: drag up/down to change, snaps to the centre detent */
 static void KnobGroup(int idx, const char *label) {
-    static float sent[4] = {.5f, .5f, .5f, .5f};
     static double lastClickTime[4];
     static bool clickMoved[4];
     static const char *paths[4] = {"props.audio.volume", "props.audio.pan", "props.audio.bass", "props.audio.treble"};
@@ -111,10 +110,11 @@ static void KnobGroup(int idx, const char *label) {
                 gKnob[idx] = v; drag = true;
             } else gDragId = 0;
         }
-        if (!drag && fabsf(gKnob[idx] - sent[idx]) > .002f) {
-            double value = idx == 0 ? gKnob[idx] * 200.0 : idx == 1 ? (gKnob[idx] - .5) * 200.0 : (gKnob[idx] - .5) * 24.0;
+        if (!drag && fabsf(gKnob[idx] - gKnobSent[idx]) > .002f) {
+            double value = idx == 0 ? StellaAudioVolumeFromKnob(gKnob[idx]) :
+                           idx == 1 ? (gKnob[idx] - .5) * 200.0 : (gKnob[idx] - .5) * 24.0;
             PlutoTimelineSetProperty(paths[idx], value);
-            sent[idx] = gKnob[idx];
+            gKnobSent[idx] = gKnob[idx];
         }
         float act = Anim(kid.id + 9u, drag ? 1.f : b.hover * .6f, 20.f);
         float shown = Anim(kid.id + 13u, gKnob[idx], 30.f);      /* smooth pointer motion */
@@ -129,17 +129,17 @@ static void KnobGroup(int idx, const char *label) {
         CLAY(kid, {.layout = {.sizing = {FIX(72), FIX(72)}},
                    .custom = {.customData = NC(K_KNOB, C_CARD, ((Clay_Color){sPos[idx], 0, 0, 255}), C_CARD, shown, act, 0)}}) {}
         Tx(label, 14, C_MUTED, 0);
-        float shownValue = idx == 0 ? roundf(gKnob[idx] * 200.f) :
+        float shownValue = idx == 0 ? roundf(StellaAudioVolumeFromKnob(gKnob[idx])) :
                            idx == 1 ? roundf((gKnob[idx] - .5f) * 200.f) : roundf((gKnob[idx] - .5f) * 24.f);
         const char *unit = idx == 0 ? "%" : idx >= 2 ? "dB" : NULL;
         float minimum = idx == 0 ? 0.f : idx == 1 ? -100.f : -12.f;
-        float maximum = idx == 0 ? 200.f : idx == 1 ? 100.f : 12.f;
+        float maximum = idx == 0 ? STELLA_AUDIO_VOLUME_MAX : idx == 1 ? 100.f : 12.f;
         if (ValBoxTyped(CLAY_IDI("KnobValue", idx), &shownValue, unit, 74, 28, 15.5f, 12.5f, 9,
                         minimum, maximum, 0)) {
-            gKnob[idx] = idx == 0 ? shownValue / 200.f : idx == 1 ? shownValue / 200.f + .5f : shownValue / 24.f + .5f;
-            double value = shownValue;
-            PlutoTimelineSetProperty(paths[idx], value);
-            sent[idx] = gKnob[idx];
+            gKnob[idx] = idx == 0 ? StellaAudioKnobFromVolume(shownValue) :
+                         idx == 1 ? shownValue / 200.f + .5f : shownValue / 24.f + .5f;
+            PlutoTimelineSetProperty(paths[idx], (double)shownValue);
+            gKnobSent[idx] = gKnob[idx];
         }
     }
 }

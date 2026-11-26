@@ -709,11 +709,13 @@ static void TimelineClipLane(int track, float height) {
        timeline time positions, so they stay centered at low zoom. */
     float visualLeft[MAX_TIMELINE_CLIPS] = {0};
     float visualWidth[MAX_TIMELINE_CLIPS] = {0};
+    float visualPixelsPerSecond[MAX_TIMELINE_CLIPS] = {0};
     float visualCursor = 0.f;
     for (int n = 0; n < count; n++) {
         int i = order[n];
         float x = gTimelinePan + TimelineDisplayStart(i) * pps;
         float width = fmaxf(46.f, gTimelineClips[i].duration * pps);
+        visualPixelsPerSecond[i] = width / fmaxf(.001f, gTimelineClips[i].duration);
         if (lane.width > 0.f && x >= lane.width) break; /* sorted: every later clip is also off-screen */
         if (x + width <= 0.f) continue;
         float left = fmaxf(0.f, x);
@@ -731,17 +733,23 @@ static void TimelineClipLane(int track, float height) {
             if (fabsf(end - gTimelineClips[right].start) > .04f) continue;
             if (visualWidth[left] <= 0.f || visualWidth[right] <= 0.f) continue;
             float leftEdge = visualLeft[left];
-            float leftVisibleEnd = leftEdge + visualWidth[left];
             float rightEdge = visualLeft[right];
-            float rightVisibleEnd = rightEdge + visualWidth[right];
-            float joinX = (leftVisibleEnd + rightEdge) * .5f;
-            float spanSeconds = fminf(gTimelineClips[left].transitionDuration,
-                                      fminf(gTimelineClips[left].duration, gTimelineClips[right].duration));
-            float spanPixels = fmaxf(2.f, spanSeconds * pps);
+            /* The backend's transition interval ends at the incoming clip's
+               start, so the marker must use that same edit edge (not the
+               midpoint of a small visible gap/overlap). */
+            float joinX = rightEdge;
+            float spanSeconds = StellaTransitionEffectiveDuration(
+                gTimelineClips[left].transitionDuration,
+                gTimelineClips[left].duration,
+                gTimelineClips[right].duration);
+            float spanPixels = fmaxf(2.f, spanSeconds * visualPixelsPerSecond[left]);
             bool applied = gTimelineClips[left].transitionType[0] &&
-                           strcmp(gTimelineClips[left].transitionType, "none") != 0;
-            float spanStart = fmaxf(lane.x, fmaxf(leftEdge, joinX - spanPixels * .5f));
-            float spanEnd = fminf(lane.x + lane.width, fminf(rightVisibleEnd, joinX + spanPixels * .5f));
+                           strcmp(gTimelineClips[left].transitionType, "none") != 0 && spanSeconds > .001f;
+            /* The renderer reveals the incoming clip over [cut-duration, cut].
+               Draw that exact one-sided interval instead of centering a badge
+               over the edit point, which falsely suggested a longer duration. */
+            float spanStart = fmaxf(lane.x, fmaxf(leftEdge, joinX - spanPixels));
+            float spanEnd = fminf(lane.x + lane.width, joinX);
             Rectangle durationRect = {spanStart,
                                       lane.y + 3.f,
                                       fmaxf(0.f, spanEnd - spanStart),
@@ -754,7 +762,6 @@ static void TimelineClipLane(int track, float height) {
             gTransitionButtons[gTransitionButtonCount++] = (TransitionButton){rect, durationRect, left, applied};
             if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 transitionPressed = true;
-                gTransitionFocusClip = left;
                 gRightTab = 2;
                 PlutoTimelineSelect(left);
             }
@@ -813,7 +820,6 @@ static void TimelineClipLane(int track, float height) {
                 int hitKeyframe = TimelineKeyframeHit(i, bb, pointer);
                 if (hitKeyframe >= 0) {
                     keyframePressed = true;
-                    gTransitionFocusClip = -1;
                     PlutoTimelineSelect(i);
                     gKeyframeDragClip = i;
                     gKeyframeDragIndex = hitKeyframe;
@@ -839,7 +845,6 @@ static void TimelineClipLane(int track, float height) {
                 bool rightHit = rightVisible && rightDistance >= -1.f && rightDistance <= 9.f;
                 if (leftHit || rightHit) {
                     trimPressed = true;
-                    gTransitionFocusClip = -1;
                     memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
                     gTimelineMultiSelect[i] = true;
                     gTimelineSelectionAnchor = i;
@@ -882,7 +887,6 @@ static void TimelineClipLane(int track, float height) {
                 Clay_PointerOver(clipId) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 gSelectedKeyframeClip = -1;
                 gSelectedKeyframeTime = -1.f;
-                gTransitionFocusClip = -1;
                 if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
                     gTimelineMultiSelect[i] = true;
                     gTimelineSelectionAnchor = i;
@@ -1039,18 +1043,115 @@ static bool TimelineSelectedVideoAudioPair(int *videoIndex, int *audioIndex) {
     return false;
 }
 
-static int TimelineContextActions(int actions[6]) {
+static bool TimelineUnlinkedAudioPairForClip(int clipIndex, int *videoIndex, int *audioIndex) {
+    if (clipIndex < 0 || clipIndex >= gTimelineClipCount) return false;
+    TimelineClipUi *selected = &gTimelineClips[clipIndex];
+    int video = -1, audio = -1;
+    if (TimelineTrackIsVideo(selected->track) && !selected->isSubtitle && selected->unlinkedFromClipId[0]) {
+        video = clipIndex;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            TimelineClipUi *candidate = &gTimelineClips[i];
+            if (!TimelineTrackIsAudio(candidate->track) || strcmp(candidate->kind, "audio") != 0) continue;
+            if (strcmp(candidate->id, selected->unlinkedFromClipId) != 0 ||
+                strcmp(candidate->unlinkedFromClipId, selected->id) != 0) continue;
+            if (candidate->linkedId[0] || selected->linkedId[0]) continue;
+            if (fabsf(candidate->start - selected->start) > .001f ||
+                fabsf(candidate->duration - selected->duration) > .001f) continue;
+            audio = i; break;
+        }
+    } else if (TimelineTrackIsAudio(selected->track) && strcmp(selected->kind, "audio") == 0 &&
+               selected->unlinkedFromClipId[0]) {
+        audio = clipIndex;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            TimelineClipUi *candidate = &gTimelineClips[i];
+            if (!TimelineTrackIsVideo(candidate->track) || candidate->isSubtitle) continue;
+            if (strcmp(candidate->id, selected->unlinkedFromClipId) != 0 ||
+                strcmp(candidate->unlinkedFromClipId, selected->id) != 0) continue;
+            if (candidate->linkedId[0] || selected->linkedId[0]) continue;
+            if (fabsf(candidate->start - selected->start) > .001f ||
+                fabsf(candidate->duration - selected->duration) > .001f) continue;
+            video = i; break;
+        }
+    }
+    if (video < 0 || audio < 0) return false;
+    if (videoIndex) *videoIndex = video;
+    if (audioIndex) *audioIndex = audio;
+    return true;
+}
+
+static bool TimelineDetachedAudioPairForClip(int clipIndex, int *videoIndex, int *audioIndex) {
+    if (clipIndex < 0 || clipIndex >= gTimelineClipCount) return false;
+    TimelineClipUi *selected = &gTimelineClips[clipIndex];
+    int video = -1, audio = -1;
+    if (TimelineTrackIsVideo(selected->track)) {
+        if (selected->hasAudio) return false;
+        video = clipIndex;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            TimelineClipUi *candidate = &gTimelineClips[i];
+            if (!TimelineTrackIsAudio(candidate->track) || strcmp(candidate->kind, "audio") != 0) continue;
+            if (candidate->detachedFromVideoId[0] && strcmp(candidate->detachedFromVideoId, selected->id) != 0) continue;
+            if (strcmp(candidate->path, selected->path) != 0 || !selected->path[0]) continue;
+            if (fabsf(candidate->start - selected->start) > .001f ||
+                fabsf(candidate->duration - selected->duration) > .001f ||
+                fabsf(candidate->sourceOffset - selected->sourceOffset) > .001f) continue;
+            if (candidate->linkedId[0] && strcmp(candidate->linkedId, selected->id) != 0) continue;
+            if (selected->linkedId[0] && strcmp(selected->linkedId, candidate->id) != 0) continue;
+            /* Older projects predate detachedFromVideoId. Their generated
+               '<video label> Audio' name is a safe fallback for discovery. */
+            if (!candidate->detachedFromVideoId[0]) {
+                char expected[300]; snprintf(expected, sizeof(expected), "%.255s Audio", selected->label);
+                if (strcmp(candidate->label, expected) != 0) continue;
+            }
+            audio = i; break;
+        }
+    } else if (TimelineTrackIsAudio(selected->track) && strcmp(selected->kind, "audio") == 0) {
+        audio = clipIndex;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            TimelineClipUi *candidate = &gTimelineClips[i];
+            if (!TimelineTrackIsVideo(candidate->track) || candidate->hasAudio) continue;
+            if (selected->detachedFromVideoId[0] && strcmp(selected->detachedFromVideoId, candidate->id) != 0) continue;
+            if (strcmp(candidate->path, selected->path) != 0 || !selected->path[0]) continue;
+            if (fabsf(candidate->start - selected->start) > .001f ||
+                fabsf(candidate->duration - selected->duration) > .001f ||
+                fabsf(candidate->sourceOffset - selected->sourceOffset) > .001f) continue;
+            if (selected->linkedId[0] && strcmp(selected->linkedId, candidate->id) != 0) continue;
+            if (candidate->linkedId[0] && strcmp(candidate->linkedId, selected->id) != 0) continue;
+            if (!selected->detachedFromVideoId[0]) {
+                char expected[300]; snprintf(expected, sizeof(expected), "%.255s Audio", candidate->label);
+                if (strcmp(selected->label, expected) != 0) continue;
+            }
+            video = i; break;
+        }
+    }
+    if (video < 0 || audio < 0) return false;
+    if (videoIndex) *videoIndex = video;
+    if (audioIndex) *audioIndex = audio;
+    return true;
+}
+
+static int TimelineContextActions(int actions[10]) {
     if (gTimelineContextClip < 0 || gTimelineContextClip >= gTimelineClipCount) return 0;
     TimelineClipUi *clip = &gTimelineClips[gTimelineContextClip];
     int count = 0;
     actions[count++] = clip->groupId[0] ? 1 : 0;
     if (!clip->isSubtitle && TimelineTrackIsVideo(clip->track) && clip->hasAudio) actions[count++] = 2;
     if (!clip->isSubtitle && clip->linkedId[0]) actions[count++] = 3;
-    int videoIndex = -1, audioIndex = -1;
-    if (!clip->isSubtitle && TimelineSelectedVideoAudioPair(&videoIndex, &audioIndex) &&
-        !gTimelineClips[videoIndex].isSubtitle && !gTimelineClips[audioIndex].isSubtitle &&
-        !gTimelineClips[videoIndex].linkedId[0] && !gTimelineClips[audioIndex].linkedId[0])
-        actions[count++] = 5;
+
+    int detachedVideo = -1, detachedAudio = -1;
+    int unlinkedVideo = -1, unlinkedAudio = -1;
+    bool detachedPair = !clip->isSubtitle &&
+        TimelineDetachedAudioPairForClip(gTimelineContextClip, &detachedVideo, &detachedAudio);
+    bool rememberedUnlinkedPair = !clip->isSubtitle &&
+        TimelineUnlinkedAudioPairForClip(gTimelineContextClip, &unlinkedVideo, &unlinkedAudio);
+    if (rememberedUnlinkedPair) actions[count++] = 7;
+    if (detachedPair) actions[count++] = 8;
+    if (!rememberedUnlinkedPair && !detachedPair) {
+        int videoIndex = -1, audioIndex = -1;
+        if (!clip->isSubtitle && TimelineSelectedVideoAudioPair(&videoIndex, &audioIndex) &&
+            !gTimelineClips[videoIndex].isSubtitle && !gTimelineClips[audioIndex].isSubtitle &&
+            !gTimelineClips[videoIndex].linkedId[0] && !gTimelineClips[audioIndex].linkedId[0])
+            actions[count++] = 5;
+    }
     if (!clip->isSubtitle) actions[count++] = 6;
     actions[count++] = 4;
     return count;
@@ -1064,13 +1165,15 @@ static const char *TimelineContextLabel(int action, int selectedCount) {
     case 3: return "Unlink audio";
     case 5: return "Link selected audio + video";
     case 6: return "Relink media…";
+    case 7: return "Relink audio + video";
+    case 8: return "Reattach original audio";
     default: return "Delete clip";
     }
 }
 
 static Rectangle TimelineContextBounds(void) {
-    int actions[6], count = TimelineContextActions(actions);
-    float width = 208.f, height = count * 30.f + 8.f;
+    int actions[10], count = TimelineContextActions(actions);
+    float width = 224.f, height = count * 30.f + 8.f;
     float x = gTimelineContextPos.x, y = gTimelineContextPos.y;
     if (x + width > GetScreenWidth() - 8.f) x = GetScreenWidth() - width - 8.f;
     if (y + height > GetScreenHeight() - 8.f) y = GetScreenHeight() - height - 8.f;
@@ -1087,7 +1190,7 @@ static void TimelineContextLogic(void) {
     Vector2 mouse = GetMousePosition();
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (CheckCollisionPointRec(mouse, menu)) {
-            int actions[6], count = TimelineContextActions(actions);
+            int actions[10], count = TimelineContextActions(actions);
             int row = (int)((mouse.y - menu.y - 4.f) / 30.f);
             if (row >= 0 && row < count) {
                 int action = actions[row];
@@ -1100,9 +1203,16 @@ static void TimelineContextLogic(void) {
                 else if (action == 5) {
                     int videoIndex = -1, audioIndex = -1;
                     if (TimelineSelectedVideoAudioPair(&videoIndex, &audioIndex)) PlutoTimelineLinkAudio(videoIndex, audioIndex);
-                }
-                else if (action == 6) PlutoRequestRelinkClipFile(gTimelineContextClip);
-                else if (action == 4) {
+                } else if (action == 6) PlutoRequestRelinkClipFile(gTimelineContextClip);
+                else if (action == 7) {
+                    int videoIndex = -1, audioIndex = -1;
+                    if (TimelineUnlinkedAudioPairForClip(gTimelineContextClip, &videoIndex, &audioIndex))
+                        PlutoTimelineLinkAudio(videoIndex, audioIndex);
+                } else if (action == 8) {
+                    int videoIndex = -1, audioIndex = -1;
+                    if (TimelineDetachedAudioPairForClip(gTimelineContextClip, &videoIndex, &audioIndex))
+                        PlutoTimelineReattachAudio(videoIndex, audioIndex);
+                } else if (action == 4) {
                     PlutoTimelineDelete(gTimelineContextClip);
                     memset(gTimelineMultiSelect, 0, sizeof(gTimelineMultiSelect));
                     gTimelineSelected = -1;
@@ -1120,7 +1230,7 @@ static void TimelineContextLogic(void) {
 
 static void DrawTimelineContextMenu(void) {
     if (!gTimelineContextOpen) return;
-    int actions[6], count = TimelineContextActions(actions);
+    int actions[10], count = TimelineContextActions(actions);
     Rectangle menu = TimelineContextBounds();
     Vector2 mouse = GetMousePosition();
     gTimelineContextRect = menu;

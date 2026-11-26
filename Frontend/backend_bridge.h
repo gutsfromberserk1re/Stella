@@ -755,6 +755,8 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonStringRange(begin, end, "track", track, sizeof(track));
             PlutoJsonStringRange(begin, end, "groupId", clip->groupId, sizeof(clip->groupId));
             PlutoJsonStringRange(begin, end, "linkedAudioId", clip->linkedId, sizeof(clip->linkedId));
+            PlutoJsonStringRange(begin, end, "detachedFromVideoId", clip->detachedFromVideoId, sizeof(clip->detachedFromVideoId));
+            PlutoJsonStringRange(begin, end, "unlinkedFromClipId", clip->unlinkedFromClipId, sizeof(clip->unlinkedFromClipId));
             PlutoJsonStringRange(begin, end, "kind", clip->kind, sizeof(clip->kind));
             PlutoJsonStringPath(begin, end, "props.transitionOut.type", clip->transitionType, sizeof(clip->transitionType));
             PlutoJsonNumberRange(begin, end, "start", &start);
@@ -1048,6 +1050,17 @@ static bool PlutoTimelineRelinkClip(int clipIndex, int mediaIndex) {
     return okay;
 }
 
+static bool PlutoTimelineReattachAudio(int videoIndex, int audioIndex) {
+    if (videoIndex < 0 || videoIndex >= gTimelineClipCount || audioIndex < 0 || audioIndex >= gTimelineClipCount) return false;
+    char videoId[160], audioId[160], request[512];
+    PlutoJsonEscape(gTimelineClips[videoIndex].id, videoId, sizeof(videoId));
+    PlutoJsonEscape(gTimelineClips[audioIndex].id, audioId, sizeof(audioId));
+    snprintf(request, sizeof(request), "{\"command\":\"timeline_reattach_audio\",\"videoId\":\"%s\",\"audioId\":\"%s\"}", videoId, audioId);
+    bool okay = PlutoTimelineCall(request);
+    if (okay) { gPreviewDirty = true; gPreviewDebounce = 0.f; }
+    return okay;
+}
+
 static bool PlutoTimelineUnlink(int index) {
     if (index < 0 || index >= gTimelineClipCount) return false;
     char id[160], request[256]; PlutoJsonEscape(gTimelineClips[index].id, id, sizeof(id));
@@ -1130,15 +1143,26 @@ static void PlutoPollBackend(void) {
                 const int requestFps = completedRequest.fps > 0 ? completedRequest.fps : gPreviewFps;
                 const double requestStartedAt = completedRequest.startedAt;
                 bool previewMoving = gTimelinePlaying || gTimelineScrubbing || gPreviewNavigating;
-                float previewLag = fmaxf(.2f, 6.f / (float)fmaxf(1, gPreviewFps));
+                const int freshnessFps = (int)fmaxf(1.f, (float)requestFps);
                 bool forward = gPreviewDisplayedAt < 0.f || gPlayhead >= gPreviewDisplayedAt;
                 bool newerInDirection = gPreviewDisplayedAt < 0.f ||
-                    (forward ? requestAt >= gPreviewDisplayedAt - .5f / gPreviewFps
-                             : requestAt <= gPreviewDisplayedAt + .5f / gPreviewFps);
-                bool movingFrameFresh = fabsf(requestAt - gPlayhead) <= previewLag && newerInDirection;
-                /* Playback previews must be close to the current transport time;
-                   direction-only filtering let a frame several seconds behind
-                   the playhead replace the visible frame. */
+                    (forward ? requestAt >= gPreviewDisplayedAt - .5f / freshnessFps
+                             : requestAt <= gPreviewDisplayedAt + .5f / freshnessFps);
+                bool movingFrameFresh = false;
+                if (gTimelinePlaying) {
+                    const int64_t wantedFrame = (int64_t)floor((double)gPlayhead * freshnessFps + 1e-4);
+                    const int64_t completedFrame = (int64_t)llround((double)requestAt * freshnessFps);
+                    const int64_t frameLag = wantedFrame - completedFrame;
+                    /* Permit at most one frame of decode latency. The old 200ms
+                       minimum let 5-6 stale frames replace the live preview at
+                       24/30 fps, which looked like uneven frame holds. */
+                    movingFrameFresh = frameLag >= 0 && frameLag <= 1 && newerInDirection;
+                } else {
+                    const float previewLag = 2.f / (float)freshnessFps;
+                    movingFrameFresh = fabsf(requestAt - gPlayhead) <= previewLag && newerInDirection;
+                }
+                /* A completed frame must still belong to the current playback
+                   cadence and direction before it is allowed onto the screen. */
                 bool currentRequest = requestRes == gPreviewRes && requestFps == gPreviewFps &&
                     (previewMoving ? movingFrameFresh : (!gPreviewDirty &&
                      fabsf(requestAt - gPlayhead) <= (0.5f / (float)fmaxf(1, requestFps))));
@@ -1339,24 +1363,34 @@ static uint64_t PlutoRequestPreview(void) {
         if (!gPreviewRequests[i].id) { requestSlot = i; break; }
     if (requestSlot < 0) return 0;
     char request[192];
+    const int requestFps = (int)fmaxf(1.f, (float)gPreviewFps);
+    float requestAt = gPlayhead;
+    int64_t requestFrame = -1;
+    if (gTimelinePlaying) {
+        /* The backend quantizes by the selected preview rate too. Send the
+           exact frame boundary so 24/30 fps cadence cannot wobble with UI dt. */
+        requestFrame = (int64_t)floor((double)gPlayhead * requestFps + 1e-4);
+        requestAt = (float)((double)requestFrame / (double)requestFps);
+    }
     /* "playing" enables decode-ahead; "stepping" (arrow keys) makes the backend cache the
        frames before a seek target so repeated reverse steps do not each re-seek (Yoru). */
     snprintf(request, sizeof(request),
              "{\"command\":\"preview_frame\",\"at\":%.6f,\"height\":%d,\"fps\":%d,\"playing\":%s,\"stepping\":%s}",
-             gPlayhead, gPreviewRes, gPreviewFps,
+             requestAt, gPreviewRes, requestFps,
              gTimelinePlaying ? "true" : "false", gPreviewNavigating ? "true" : "false");
     uint64_t taskId = gBackend.submit(request);
     if (taskId) {
         StellaPreviewRequest *slot = &gPreviewRequests[requestSlot];
         memset(slot, 0, sizeof(*slot));
         slot->id = taskId;
-        slot->at = gPlayhead;
+        slot->at = requestAt;
         slot->resolution = gPreviewRes;
-        slot->fps = gPreviewFps;
+        slot->fps = requestFps;
         slot->startedAt = GetTime();
         snprintf(slot->textPath, sizeof(slot->textPath), "%s", gTextOutputPath);
         gPreviewInFlightCount++;
-        gPreviewRequestAt = gPlayhead;
+        if (requestFrame >= 0) gPreviewLastSubmittedFrame = requestFrame;
+        gPreviewRequestAt = requestAt;
         gPreviewRequestRes = gPreviewRes;
         gPreviewRequestStartedAt = slot->startedAt;
         PlutoRefreshPreviewRequestMirrors();
@@ -1597,6 +1631,7 @@ static void PlutoRequestExport(void) {}
 static void PlutoPollBackend(void) {}
 static void PlutoUnloadMedia(void) {}
 static void PlutoRequestMediaImport(void) {}
+static bool PlutoTimelineReattachAudio(int videoIndex, int audioIndex) { (void)videoIndex; (void)audioIndex; return false; }
 static bool PlutoRequestRelinkClipFile(int clipIndex) { (void)clipIndex; return false; }
 #endif
 

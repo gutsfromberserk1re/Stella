@@ -44,6 +44,9 @@ static bool gFxOn[VIDEO_FX_COUNT];
 static bool gFxSlDrag[VIDEO_FX_COUNT][3];
 static int gFxOpen = -1;
 static bool gVfxOpen = false, gFiltOpen = false;
+/* Accordion expansion is view state, not clip-property state. Remember the
+   selected clip so a property refresh does not close its currently open card. */
+static char gEffectAccordionClipId[64] = {0};
 static const char *gExtraFxNames[] = {"Gaussian Blur", "Grain", "Sharpen", "Scanlines", "Camera Shake", "Film Burn", "Halftone", "Posterize", "Light Leak", "Mirror", "Sine Waves"};
 static const char *gExtraFxKeys[] = {"blur", "grain", "sharpen", "scanlines", "shake", "filmBurn", "halftone", "posterize", "lightLeak", "mirror", "sineWaves"};
 #define EXTRA_FX_COUNT 11
@@ -157,6 +160,16 @@ static void PlutoApplyKeyframeValues(void) {
 }
 
 static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
+    char selectedEffectClipId[64] = {0};
+    if (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount)
+        snprintf(selectedEffectClipId, sizeof(selectedEffectClipId), "%s", gTimelineClips[gTimelineSelected].id);
+    if (strcmp(gEffectAccordionClipId, selectedEffectClipId) != 0) {
+        /* A genuinely different clip gets a fresh inspector accordion state;
+           same-clip refreshes after toggles/slider commits keep it expanded. */
+        gExtraFxOpen = -1;
+        gFxOpen = -1;
+        snprintf(gEffectAccordionClipId, sizeof(gEffectAccordionClipId), "%s", selectedEffectClipId);
+    }
     gTextInputFocused = false;
     gTextFocusStartedAt = 0.0;
     gTextOutputPath[0] = 0;
@@ -248,7 +261,6 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
             gFxV[i][2] = gFxSent[i][2] = fmaxf(0.f, fminf(1.f, .5f + offset / 60.f));
         }
     }
-    gExtraFxOpen = -1;
     char blurMode[24] = {0};
     gBlurMode = 0;
     if (PlutoJsonStringPath(clipBegin, clipEnd, "props.effects.blur.mode", blurMode, sizeof(blurMode))) {
@@ -345,8 +357,8 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
 
     for (int i = 0; i < 4; i++) {
         float value = PlutoReadNumber(clipBegin, clipEnd, audioPaths[i], i == 0 ? 100.f : 0.f);
-        float normalized = i == 0 ? value / 200.f : value / (i == 1 ? 200.f : 24.f) + .5f;
-        gKnob[i] = fmaxf(0.f, fminf(1.f, normalized));
+        float normalized = i == 0 ? StellaAudioKnobFromVolume(value) : value / (i == 1 ? 200.f : 24.f) + .5f;
+        gKnob[i] = gKnobSent[i] = fmaxf(0.f, fminf(1.f, normalized));
     }
     gSwOn[0] = gSwOn[1] = false;
     PlutoJsonBoolPath(clipBegin, clipEnd, "props.audio.fadeIn", &gSwOn[0]);
@@ -1558,17 +1570,33 @@ static bool EffectsSectionHeader(Clay_ElementId id, const char *title, int icon,
 }
 
 static int TransitionNextClip(int from) {
-    if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track >= TIMELINE_MAX_VIDEO_TRACKS) return -1;
+    if (from < 0 || from >= gTimelineClipCount || gTimelineClips[from].track >= TIMELINE_MAX_VIDEO_TRACKS ||
+        gTimelineClips[from].isSubtitle) return -1;
     float end = gTimelineClips[from].start + gTimelineClips[from].duration;
-    int best = -1;
+    int next = -1;
+    float nextStart = INFINITY;
+    /* Match the backend's same-track chronological neighbor pairing. Looking
+       for the smallest absolute distance can accidentally pick an overlapping
+       previous clip and write a transition to the wrong side of the edit. */
     for (int i = 0; i < gTimelineClipCount; i++) {
-        if (i == from || gTimelineClips[i].track != gTimelineClips[from].track) continue;
-        if (fabsf(gTimelineClips[i].start - end) <= .04f) { best = i; break; }
+        if (i == from || gTimelineClips[i].isSubtitle ||
+            gTimelineClips[i].track != gTimelineClips[from].track) continue;
+        float candidateStart = gTimelineClips[i].start;
+        if (candidateStart <= gTimelineClips[from].start + .001f || candidateStart >= nextStart) continue;
+        next = i;
+        nextStart = candidateStart;
     }
-    return best;
+    return next >= 0 && fabsf(nextStart - end) <= .04f ? next : -1;
 }
 
 static void CommitTransition(void) {
+    /* The backend applies properties to gTimelineSelected. The transition badge
+       already selects its outgoing clip, so never write to a stale focus index. */
+    int from = gTimelineSelected;
+    int next = TransitionNextClip(from);
+    if (from < 0 || next < 0) return;
+    gTransitionDuration = StellaTransitionEffectiveDuration(
+        gTransitionDuration, gTimelineClips[from].duration, gTimelineClips[next].duration);
     char updates[256];
     snprintf(updates, sizeof(updates), "[{\"path\":\"props.transitionOut.type\",\"value\":\"%s\"},{\"path\":\"props.transitionOut.duration\",\"value\":%.3f}]",
              gTransitionType, (double)gTransitionDuration);
@@ -1614,7 +1642,7 @@ static void FilterIntensityControl(void) {
 }
 
 static void EffectsView(void) {
-    int from = gTransitionFocusClip >= 0 ? gTransitionFocusClip : gTimelineSelected;
+    int from = gTimelineSelected;
     int next = TransitionNextClip(from);
 
     /* Let the Effects page share the exact content width supplied by InspContent.
@@ -1691,11 +1719,15 @@ static void EffectsView(void) {
                                 }
                             }
                         }
+                        float transitionMax = StellaTransitionMaxDuration(
+                            gTimelineClips[from].duration, gTimelineClips[next].duration);
+                        float transitionMin = fminf(.05f, transitionMax);
+                        gTransitionDuration = Clampf(gTransitionDuration, transitionMin, transitionMax);
                         CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(22)}, .childAlignment = AL_Y}}) {
                             Tx("Duration", 13, C_MUTED, 0); HSPACE;
                             float durationValue = gTransitionDuration;
                             if (ValBoxEditable(CLAY_ID("TransitionDurationValue"), &durationValue,
-                                               "s", 72, 22, 13, 11, 10, .1f, 2.f, 1)) {
+                                               "s", 72, 22, 13, 11, 10, transitionMin, transitionMax, 2)) {
                                 gTransitionDuration = durationValue;
                                 CommitTransition();
                             }
@@ -1706,7 +1738,8 @@ static void EffectsView(void) {
                         if (durationDrag && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                             Clay_BoundingBox bb = Clay_GetElementData(did).boundingBox;
                             if (bb.width > 1.f)
-                                gTransitionDuration = .1f + 1.9f * Clampf((GetMousePosition().x - bb.x) / bb.width, 0.f, 1.f);
+                                gTransitionDuration = transitionMin + (transitionMax - transitionMin) *
+                                    Clampf((GetMousePosition().x - bb.x) / bb.width, 0.f, 1.f);
                         }
                         if (durationDrag && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                             durationDrag = false;
@@ -1714,7 +1747,8 @@ static void EffectsView(void) {
                         }
                         CLAY(did, {.layout = {.sizing = {GROW, FIX(16)}},
                                    .custom = {.customData = NC(K_SLIDER, RGB(40, 42, 48), RGB(150, 152, 160),
-                                                               C_CARD, (gTransitionDuration - .1f) / 1.9f,
+                                                               C_CARD, (gTransitionDuration - transitionMin) /
+                                                               fmaxf(.0001f, transitionMax - transitionMin),
                                                                durationDrag ? 1.f : Clay_PointerOver(did), 0)}}) {}
                     }
                 }

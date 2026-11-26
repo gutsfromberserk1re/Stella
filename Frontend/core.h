@@ -90,6 +90,9 @@ static int gPreviewFps = 30;
 static bool gPreviewFpsMenuOpen;
 static float gPreviewFpsMenuT;
 static bool gPreviewNavigating;
+/* Playback submits exactly one preview request per selected-FPS frame index.
+   This avoids half-frame threshold jitter (especially 24/30 fps on a 60 Hz UI). */
+static int64_t gPreviewLastSubmittedFrame = -1;
 static float gPreviewDisplayedAt = -1.f;
 static bool  gTimelineScrubbing;
 static float gPreviewDebounce;
@@ -170,7 +173,6 @@ static int gMediaDropPreviewMedia = -1;
 static int   gTimelineTool;
 static float gTimelineZoom = 1.f, gTimelinePan, gPlayhead;
 static bool  gTimelineSnap = true, gTimelinePlaying, gTimelineGrid;
-static int gTransitionFocusClip = -1;
 static char gTransitionType[16] = "none";
 static float gTransitionDuration = 1.f;
 typedef struct {
@@ -279,6 +281,33 @@ static bool  gSB; static Rectangle gSBR;              /* inspector scrollbar thu
 static float gAudS, gAudT;                            /* audio panel scroll */
 static bool  gSwOn[2];                                /* fade in / fade out */
 static float gKnob[4] = {.5f, .5f, .5f, .5f};        /* volume, pan, bass, treble (0..1, .5 = default) */
+static float gKnobSent[4] = {.5f, .5f, .5f, .5f};
+#define STELLA_AUDIO_VOLUME_MAX 1000.f
+
+/* The volume knob has a useful unity detent at its midpoint while still
+   exposing the full 0-1000% range. A squared curve gives fine control below
+   unity and usable resolution for boosted gain above it. */
+static float StellaAudioVolumeFromKnob(float normalized) {
+    float n = normalized < 0.f ? 0.f : normalized > 1.f ? 1.f : normalized;
+    if (n <= .5f) {
+        float t = n * 2.f;
+        return 100.f * t * t;
+    }
+    float t = (n - .5f) * 2.f;
+    return 100.f + 900.f * t * t;
+}
+static float StellaAudioKnobFromVolume(float volume) {
+    float v = volume < 0.f ? 0.f : volume > STELLA_AUDIO_VOLUME_MAX ? STELLA_AUDIO_VOLUME_MAX : volume;
+    if (v <= 100.f) return .5f * sqrtf(v / 100.f);
+    return .5f + .5f * sqrtf((v - 100.f) / 900.f);
+}
+static float StellaTransitionMaxDuration(float leftDuration, float rightDuration) {
+    float maximum = fminf(2.f, fminf(leftDuration * .5f, rightDuration * .5f));
+    return fmaxf(0.f, maximum);
+}
+static float StellaTransitionEffectiveDuration(float requested, float leftDuration, float rightDuration) {
+    return fminf(fmaxf(0.f, requested), StellaTransitionMaxDuration(leftDuration, rightDuration));
+}
 static float gKnobStartV, gKnobStartY;
 static float gLTabT = 1.f, gLTabE = 1.f;             /* left tab-switch transition */
 static Rectangle gLFadeR; static float gLFadeA;      /* fade overlay while switching Media/Audio */
@@ -343,7 +372,7 @@ enum { KF_X = 1u << 0, KF_Y = 1u << 1, KF_SCALE_W = 1u << 2,
        KF_SCALE_H = 1u << 3, KF_ROTATION = 1u << 4, KF_OPACITY = 1u << 5 };
 
 typedef struct {
-    char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], kind[16], subtitleSourceId[64], subtitleText[STELLA_TEXT_MAX];
+    char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], detachedFromVideoId[64], unlinkedFromClipId[64], kind[16], subtitleSourceId[64], subtitleText[STELLA_TEXT_MAX];
     char transitionType[16];
     int track, mediaIndex; /* 0..5 = video V1..V6, 6..11 = audio A1..A6 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
@@ -388,6 +417,12 @@ static void PlutoTogglePlayback(void) {
         const float frame = 1.f / (float)fmaxf(1, gPreviewFps);
         if (gPlayhead >= TimelineDuration() - frame * 0.5f) gPlayhead = 0.f;
         gPreviewDisplayedAt = -1.f;
+        gPreviewDirty = true;
+        gPreviewDebounce = 0.f;
+    } else {
+        /* A frame request may have been submitted at the previous output-frame
+           boundary. Force one exact still preview at the pause position after
+           that in-flight request retires. */
         gPreviewDirty = true;
         gPreviewDebounce = 0.f;
     }

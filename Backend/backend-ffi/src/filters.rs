@@ -346,7 +346,7 @@ pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     let audio = &props["audio"];
     let effects = &props["effects"];
     let mut filters = vec![format!("atrim=start={:.5}:duration={length:.5}", n(clip, "sourceOffset", 0.0).max(0.0)), "asetpts=PTS-STARTPTS".into()];
-    let volume = (n(audio, "volume", 100.0) / 100.0).clamp(0.0, 2.0);
+    let volume = (n(audio, "volume", 100.0) / 100.0).clamp(0.0, 10.0);
     if (volume - 1.0).abs() > 0.0001 { filters.push(format!("volume={volume:.4}")); }
     let pan = (n(audio, "pan", 0.0) / 100.0).clamp(-1.0, 1.0);
     if pan.abs() > 0.001 { filters.push(format!("stereotools=balance_out={pan:.4}")); }
@@ -392,6 +392,27 @@ pub(crate) fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn audio_export_preserves_boosts_above_six_hundred_percent() {
+        let clip = json!({
+            "start": 0.0,
+            "sourceOffset": 0.0,
+            "props": { "audio": { "volume": 800.0 } }
+        });
+        let graph = audio_filters(&clip, 4.0, 4.0);
+        assert!(graph.contains("volume=8.0000"), "unexpected audio filter chain: {graph}");
+    }
+
+    #[test]
+    fn audio_export_caps_gain_at_ten_times_without_reducing_valid_boosts() {
+        let clip = json!({
+            "start": 0.0,
+            "props": { "audio": { "volume": 1500.0 } }
+        });
+        let graph = audio_filters(&clip, 4.0, 4.0);
+        assert!(graph.contains("volume=10.0000"), "unexpected audio filter chain: {graph}");
+    }
 
     #[test]
     fn crop_keeps_the_original_canvas_without_rescaling_the_remainder() {

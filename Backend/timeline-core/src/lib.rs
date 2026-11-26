@@ -340,19 +340,44 @@ impl Timeline {
             .and_then(serde_json::Value::as_f64).unwrap_or(0.0).max(0.0);
         let source_duration = clip.extra.get("sourceDuration")
             .and_then(serde_json::Value::as_f64).filter(|duration| duration.is_finite() && *duration > 0.0);
-        /* A left trim changes source offset. The source start and end stay
-           bounded so dragging a handle back restores already-trimmed media. */
-        let next_start = start.max((clip.start - source_offset).max(0.0));
+        let linked_id = clip.linked_clip_id.clone();
+        let linked_original = linked_id.as_deref()
+            .map(|linked| self.find(linked).cloned())
+            .transpose()?;
+        let linked_track = linked_original.as_ref().map(|linked| linked.track);
+        let linked_source_offset = linked_original.as_ref().map(|linked| {
+            linked.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0).max(0.0)
+        });
+        let linked_source_duration = linked_original.as_ref().and_then(|linked| {
+            linked.extra.get("sourceDuration").and_then(serde_json::Value::as_f64)
+                .filter(|duration| duration.is_finite() && *duration > 0.0)
+        });
+
+        /* Trim the pair on one shared timeline range, but keep each source's
+           independent in-point. An audio file linked to video can start at a
+           different source timestamp; changing one clip must not overwrite the
+           other's sourceOffset or sourceDuration. */
+        let mut minimum_start = (clip.start - source_offset).max(0.0);
+        if let (Some(linked), Some(linked_offset)) = (linked_original.as_ref(), linked_source_offset) {
+            minimum_start = minimum_start.max((linked.start - linked_offset).max(0.0));
+        }
+        let next_start = start.max(minimum_start);
         let next_offset = (source_offset + next_start - clip.start).max(0.0);
-        let next_end = source_duration
+        let mut next_end = source_duration
             .map(|duration| end.min(next_start + (duration - next_offset).max(0.0)))
             .unwrap_or_else(|| end.min(clip.end()));
+        let linked_next_offset = linked_original.as_ref().zip(linked_source_offset).map(|(linked, offset)| {
+            (offset + next_start - linked.start).max(0.0)
+        });
+        if let (Some(linked), Some(linked_offset)) = (linked_original.as_ref(), linked_next_offset) {
+            if let Some(duration) = linked_source_duration {
+                next_end = next_end.min(next_start + (duration - linked_offset).max(0.0));
+            } else if linked_source_duration.is_none() && source_duration.is_none() {
+                next_end = next_end.min(linked.end() + (next_start - linked.start));
+            }
+        }
         if next_end - next_start <= EPSILON { return Err(TimelineError::InvalidRange); }
 
-        let linked_id = clip.linked_clip_id.clone();
-        let linked_track = linked_id.as_deref()
-            .and_then(|linked| self.clips.iter().find(|candidate| candidate.id == linked))
-            .map(|linked| linked.track);
         let mut changing_ids = vec![id];
         if let Some(linked) = linked_id.as_deref() { changing_ids.push(linked); }
         if !clip_is_subtitle(&clip) && self.clips.iter().any(|other| {
@@ -371,17 +396,16 @@ impl Timeline {
         clip.duration = next_end - next_start;
         clip.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
         self.replace(clip.clone());
-        if let Some(linked_id) = linked_id {
-            if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
-                let previous_linked_start = linked.start;
-                linked.start = next_start;
-                let linked_delta = linked.start - previous_linked_start;
-                shift_clip_keyframes(&mut linked, linked_delta);
-                linked.duration = next_end - next_start;
-                linked.extra.insert("sourceOffset".into(), serde_json::json!(next_offset));
-                if let Some(duration) = source_duration { linked.extra.insert("sourceDuration".into(), serde_json::json!(duration)); }
-                self.replace(linked);
-            }
+        if let (Some(mut linked), Some(linked_offset)) = (linked_original, linked_next_offset) {
+            let previous_linked_start = linked.start;
+            linked.start = next_start;
+            let linked_delta = linked.start - previous_linked_start;
+            shift_clip_keyframes(&mut linked, linked_delta);
+            linked.duration = next_end - next_start;
+            linked.extra.insert("sourceOffset".into(), serde_json::json!(linked_offset));
+            /* sourceDuration belongs to each source independently and is left
+               untouched on the linked clip. */
+            self.replace(linked);
         }
         self.refresh_duration();
         self.find(id).cloned()
@@ -427,6 +451,11 @@ impl Timeline {
             .and_then(serde_json::Value::as_f64).unwrap_or(0.0);
         let mut right_extra = left.extra.clone();
         right_extra.insert("sourceOffset".into(), serde_json::json!(original_source_offset + split_offset));
+        if !left.track.is_video() {
+            if let Some(linked_right_id) = linked_right_id.as_ref() {
+                right_extra.insert("detachedFromVideoId".into(), serde_json::json!(linked_right_id));
+            }
+        }
         let right = Clip {
             id: right_id,
             track: left.track,
@@ -460,6 +489,9 @@ impl Timeline {
             linked_right.duration = linked_original_end - at;
             linked_right.linked_clip_id = Some(right.id.clone());
             linked_right.extra.insert("sourceOffset".into(), serde_json::json!(linked_source_offset + linked_offset));
+            if linked_right.track.is_video() == false {
+                linked_right.extra.insert("detachedFromVideoId".into(), serde_json::json!(right.id.clone()));
+            }
             linked_left.linked_clip_id = Some(left.id.clone());
             self.replace(linked_left);
             self.clips.push(linked_right);
@@ -524,6 +556,7 @@ impl Timeline {
         audio.linked_clip_id = Some(video.id.clone());
         audio.extra.insert("kind".into(), serde_json::json!("audio"));
         audio.extra.insert("hasAudio".into(), serde_json::json!(true));
+        audio.extra.insert("detachedFromVideoId".into(), serde_json::json!(video.id.clone()));
         video.linked_clip_id = Some(audio_id.clone());
         video.extra.insert("hasAudio".into(), serde_json::json!(false));
         self.replace(video);
@@ -540,11 +573,10 @@ impl Timeline {
             || (video.start - audio.start).abs() > 0.001
             || (video.duration - audio.duration).abs() > 0.001
         { return Err(TimelineError::InvalidRange); }
-        let video_offset = video.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-        let audio_offset = audio.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-        if (video_offset - audio_offset).abs() > 0.001 { return Err(TimelineError::InvalidRange); }
         video.linked_clip_id = Some(audio.id.clone());
         audio.linked_clip_id = Some(video.id.clone());
+        video.extra.remove("unlinkedFromClipId");
+        audio.extra.remove("unlinkedFromClipId");
         self.replace(video);
         self.replace(audio);
         Ok(())
@@ -564,9 +596,11 @@ impl Timeline {
             return Err(TimelineError::InvalidRange);
         }
         if let Some(linked_id) = clip.linked_clip_id.take() {
+            clip.extra.insert("unlinkedFromClipId".into(), serde_json::json!(linked_id.clone()));
             self.replace(clip.clone());
             if let Some(mut linked) = self.clips.iter().find(|candidate| candidate.id == linked_id).cloned() {
                 linked.linked_clip_id = None;
+                linked.extra.insert("unlinkedFromClipId".into(), serde_json::json!(clip.id.clone()));
                 self.replace(linked);
             }
         }
@@ -584,12 +618,52 @@ impl Timeline {
         Ok(clip)
     }
 
+    /// Restores the embedded audio stream on its original video clip and
+    /// removes the detached timeline audio. This is intentionally limited to
+    /// the exact untouched source/range created by separate_audio; an edited
+    /// or replaced audio clip must not be silently discarded.
+    pub fn reattach_audio(&mut self, video_id: &str, audio_id: &str) -> Result<(), TimelineError> {
+        let mut video = self.find(video_id)?.clone();
+        let audio = self.find(audio_id)?.clone();
+        let detached_from = audio.extra.get("detachedFromVideoId").and_then(serde_json::Value::as_str);
+        let expected_label = format!("{} Audio", video.label);
+        let video_path = video.extra.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+        let audio_path = audio.extra.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+        let video_offset = video.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let audio_offset = audio.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let identity_matches = detached_from.map_or(audio.label == expected_label, |source_id| source_id == video_id);
+        if !video.track.is_video()
+            || audio.track.is_video()
+            || audio.extra.get("kind").and_then(serde_json::Value::as_str) != Some("audio")
+            || video.extra.get("hasAudio").and_then(serde_json::Value::as_bool) != Some(false)
+            || !identity_matches
+            || video_path.is_empty()
+            || video_path != audio_path
+            || (video.start - audio.start).abs() > 0.001
+            || (video.duration - audio.duration).abs() > 0.001
+            || (video_offset - audio_offset).abs() > 0.001
+            || video.linked_clip_id.as_deref().map_or(false, |linked| linked != audio_id)
+            || audio.linked_clip_id.as_deref().map_or(false, |linked| linked != video_id)
+        {
+            return Err(TimelineError::InvalidRange);
+        }
+        video.linked_clip_id = None;
+        video.extra.remove("unlinkedFromClipId");
+        video.extra.insert("hasAudio".into(), serde_json::json!(true));
+        self.replace(video);
+        self.clips.retain(|clip| clip.id != audio_id);
+        self.refresh_duration();
+        Ok(())
+    }
+
     pub fn unlink_clip(&mut self, id: &str) -> Result<(), TimelineError> {
         let mut clip = self.find(id)?.clone();
         let linked_id = clip.linked_clip_id.take().ok_or(TimelineError::InvalidRange)?;
-        self.replace(clip);
+        clip.extra.insert("unlinkedFromClipId".into(), serde_json::json!(linked_id.clone()));
+        self.replace(clip.clone());
         if let Some(mut linked) = self.clips.iter().find(|current| current.id == linked_id).cloned() {
             linked.linked_clip_id = None;
+            linked.extra.insert("unlinkedFromClipId".into(), serde_json::json!(clip.id.clone()));
             self.replace(linked);
         }
         Ok(())
@@ -998,7 +1072,7 @@ mod tests {
             label: "audio".into(), linked_clip_id: None,
             extra: HashMap::from([
                 ("kind".into(), serde_json::json!("audio")),
-                ("sourceOffset".into(), serde_json::json!(1.5)),
+                ("sourceOffset".into(), serde_json::json!(0.5)),
             ]),
         };
         let mut timeline = Timeline::default();
@@ -1006,6 +1080,69 @@ mod tests {
         timeline.link_clips("video", "audio").unwrap();
         assert_eq!(timeline.clips.iter().find(|clip| clip.id == "video").unwrap().linked_clip_id.as_deref(), Some("audio"));
         assert_eq!(timeline.clips.iter().find(|clip| clip.id == "audio").unwrap().linked_clip_id.as_deref(), Some("video"));
+        timeline.unlink_clip("audio").unwrap();
+        assert_eq!(timeline.find("video").unwrap().extra.get("unlinkedFromClipId").and_then(serde_json::Value::as_str), Some("audio"));
+        assert_eq!(timeline.find("audio").unwrap().extra.get("unlinkedFromClipId").and_then(serde_json::Value::as_str), Some("video"));
+        timeline.link_clips("video", "audio").unwrap();
+        assert_eq!(timeline.find("video").unwrap().extra.get("unlinkedFromClipId"), None);
+        assert_eq!(timeline.clips.iter().find(|clip| clip.id == "video").unwrap().linked_clip_id.as_deref(), Some("audio"));
+    }
+
+    #[test]
+    fn linked_external_audio_keeps_its_own_source_offset_when_video_is_trimmed() {
+        let mut video = video_clip("video", 1.0, 4.0);
+        video.extra.insert("sourceOffset".into(), serde_json::json!(2.0));
+        video.extra.insert("sourceDuration".into(), serde_json::json!(12.0));
+        let audio = Clip {
+            id: "music-audio".into(), track: TrackId::A1, start: 1.0, duration: 4.0,
+            label: "Music".into(), linked_clip_id: None,
+            extra: HashMap::from([
+                ("kind".into(), serde_json::json!("audio")),
+                ("sourceOffset".into(), serde_json::json!(0.5)),
+                ("sourceDuration".into(), serde_json::json!(8.0)),
+            ]),
+        };
+        let mut timeline = Timeline::default();
+        timeline.clips.extend([video, audio]);
+        timeline.link_clips("video", "music-audio").unwrap();
+        timeline.trim_clip("video", 2.0, 4.5, None).unwrap();
+        let video_after = timeline.find("video").unwrap();
+        let audio_after = timeline.find("music-audio").unwrap();
+        assert_eq!(video_after.extra.get("sourceOffset").and_then(serde_json::Value::as_f64), Some(3.0));
+        assert_eq!(audio_after.extra.get("sourceOffset").and_then(serde_json::Value::as_f64), Some(1.5));
+        assert_eq!(audio_after.extra.get("sourceDuration").and_then(serde_json::Value::as_f64), Some(8.0));
+        assert_eq!(video_after.duration, audio_after.duration);
+    }
+
+    #[test]
+    fn detached_audio_can_be_reattached_after_unlinking() {
+        let mut video = video_clip("video", 1.0, 4.0);
+        video.extra.insert("hasAudio".into(), serde_json::json!(true));
+        video.extra.insert("path".into(), serde_json::json!("same.mp4"));
+        video.extra.insert("sourceOffset".into(), serde_json::json!(0.5));
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video);
+        timeline.separate_audio("video", "video-audio".into()).unwrap();
+        timeline.unlink_clip("video-audio").unwrap();
+        timeline.reattach_audio("video", "video-audio").unwrap();
+        assert_eq!(timeline.clips.len(), 1);
+        let restored = timeline.find("video").unwrap();
+        assert_eq!(restored.extra.get("hasAudio").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(restored.linked_clip_id, None);
+    }
+
+    #[test]
+    fn split_detached_audio_keeps_the_matching_video_origin_for_reattach() {
+        let mut video = video_clip("video", 1.0, 4.0);
+        video.extra.insert("hasAudio".into(), serde_json::json!(true));
+        video.extra.insert("path".into(), serde_json::json!("same.mp4"));
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video);
+        timeline.separate_audio("video", "video-audio".into()).unwrap();
+        timeline.split_clip("video", 3.0, "video-right".into()).unwrap();
+        timeline.reattach_audio("video-right", "video-right-linked").unwrap();
+        assert!(timeline.find("video-right-linked").is_err());
+        assert_eq!(timeline.find("video-right").unwrap().extra.get("hasAudio").and_then(serde_json::Value::as_bool), Some(true));
     }
 
     #[test]

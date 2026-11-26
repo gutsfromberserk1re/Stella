@@ -1186,15 +1186,17 @@ fn transition_out(clip: &Clip) -> Option<(String, f64)> {
         "zoom" | "zoomin" | "spin" | "blur" | "checker" |
         "squeezeh" | "squeezev")
     { return None; }
-    let duration = transition["duration"].as_f64().filter(|v| v.is_finite()).unwrap_or(1.0).max(0.05).min(clip.duration.min(3.0).max(0.05));
+    let duration = transition["duration"].as_f64().filter(|v| v.is_finite()).unwrap_or(1.0).clamp(0.0, 2.0);
     Some((kind.to_owned(), duration))
 }
 
 fn transition_between(left: &Clip, right: &Clip) -> Option<(String, f64)> {
     if left.track != right.track || (left.end() - right.start).abs() > 0.04 { return None; }
-    let (kind, duration) = transition_out(left)?;
-    let preserve_preview_duration = left.extra.get("previewSeekAdjusted").and_then(Value::as_bool) == Some(true);
-    let duration = if preserve_preview_duration { duration } else { duration.min(left.duration * 0.5).min(right.duration * 0.5) };
+    let (kind, requested_duration) = transition_out(left)?;
+    /* One canonical effective duration is shared by the preview compositor,
+       export renderer and frontend duration indicator. A stale seek flag must
+       never bypass the source-handle limits for either side of an edit. */
+    let duration = requested_duration.min(left.duration * 0.5).min(right.duration * 0.5);
     (duration > 0.0).then_some((kind, duration))
 }
 
@@ -1228,12 +1230,14 @@ fn composite_clip_order(a: &&Clip, b: &&Clip) -> std::cmp::Ordering {
 }
 
 fn transition_preroll_source_time(source_offset: f64, duration: f64, elapsed: f64) -> f64 {
-    let duration = duration.max(0.0);
-    let source_offset = source_offset.max(0.0);
-    let available_preroll = source_offset.min(duration);
-    let missing_preroll = duration - available_preroll;
-    let source_start = source_offset - available_preroll;
-    source_start + (elapsed.max(0.0) - missing_preroll).max(0.0)
+    // The incoming shot must keep moving while it is revealed. When trimmed
+    // source handles exist, use them before the edit; otherwise consume the
+    // first `duration` seconds of source in the transition itself.
+    (source_offset.max(0.0) - duration.max(0.0)).max(0.0) + elapsed.max(0.0)
+}
+
+fn transition_postroll_source_offset(source_offset: f64, duration: f64) -> f64 {
+    source_offset.max(duration.max(0.0))
 }
 
 #[allow(dead_code)] // Legacy FFmpeg visual graph helper; WGPU is the active visual renderer.
@@ -1495,12 +1499,16 @@ fn render_wgpu_export_frame(
     ordered_video.sort_by(composite_clip_order);
 
     let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
+    let mut transition_source_context: HashMap<String, f64> = HashMap::new();
     let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
     for (left_index, right_index) in same_track_neighbor_indices(&ordered_video) {
         let left = ordered_video[left_index];
         let right = ordered_video[right_index];
         let Some((kind, duration)) = transition_between(left, right) else { continue; };
         let transition_start = right.start - duration;
+        if frame_at + 1e-7 >= transition_start && frame_at < right.end() - 1e-7 {
+            transition_source_context.insert(right.id.clone(), duration);
+        }
         if frame_at + 1e-7 >= transition_start && frame_at < right.start - 1e-7 {
             incoming_transitions.insert(right.id.clone(), (kind.clone(), duration));
             if kind == "dip" {
@@ -1532,8 +1540,12 @@ fn render_wgpu_export_frame(
             .filter(|path| !path.is_empty())
             .ok_or_else(|| format!("Video clip '{}' has no source path", clip.id))?;
         let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-        let source_time = if let Some((_, duration)) = incoming_transitions.get(&clip.id) {
-            transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+        let source_time = if let Some(duration) = transition_source_context.get(&clip.id) {
+            if frame_at < clip.start {
+                transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+            } else {
+                transition_postroll_source_offset(source_offset, *duration) + (frame_at - clip.start).max(0.0)
+            }
         } else {
             (source_offset + (frame_at - clip.start)).max(0.0)
         };
@@ -2003,6 +2015,7 @@ impl PreviewEngine {
         }).collect();
         ordered_video.sort_by(composite_clip_order);
         let mut incoming_transitions: HashMap<String, (String, f64)> = HashMap::new();
+        let mut transition_source_context: HashMap<String, f64> = HashMap::new();
         let mut outgoing_transitions: HashMap<String, (String, f64)> = HashMap::new();
         for (left_index, right_index) in same_track_neighbor_indices(&ordered_video) {
             let left = ordered_video[left_index];
@@ -2012,6 +2025,9 @@ impl PreviewEngine {
                 None => continue,
             };
             let transition_start = right.start - duration;
+            if frame_at + 1e-7 >= transition_start && frame_at < right.end() - 1e-7 {
+                transition_source_context.insert(right.id.clone(), duration);
+            }
             if frame_at + 1e-7 >= transition_start && frame_at < right.start - 1e-7 {
                 incoming_transitions.insert(right.id.clone(), (kind.clone(), duration));
                 if kind == "dip" {
@@ -2083,8 +2099,12 @@ impl PreviewEngine {
                 return note_wgpu_preview_failure(4, format!("source media is missing: {source}"));
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
-            let source_time = if let Some((_, duration)) = incoming_transitions.get(&clip.id) {
-                transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+            let source_time = if let Some(duration) = transition_source_context.get(&clip.id) {
+                if frame_at < clip.start {
+                    transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+                } else {
+                    transition_postroll_source_offset(source_offset, *duration) + (frame_at - clip.start).max(0.0)
+                }
             } else {
                 (source_offset + (frame_at - clip.start)).max(0.0)
             };
@@ -2427,6 +2447,14 @@ fn dispatch(request: Value) -> Result<Value, String> {
             let kind = request["kind"].as_str().unwrap_or_default();
             let has_audio = request["hasAudio"].as_bool().unwrap_or(false);
             timeline.relink_clip(id, path, label, duration, kind, has_audio).map_err(|e| format!("{e:?}"))?;
+            save_history(backend, before)?;
+            serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
+        }
+        "timeline_reattach_audio" => {
+            let before = timeline.clone();
+            let video_id = request["videoId"].as_str().ok_or("Video clip id is required")?;
+            let audio_id = request["audioId"].as_str().ok_or("Audio clip id is required")?;
+            timeline.reattach_audio(video_id, audio_id).map_err(|e| format!("{e:?}"))?;
             save_history(backend, before)?;
             serde_json::to_value(timeline.clone()).map_err(|e| e.to_string())
         }
@@ -3269,6 +3297,20 @@ mod tests {
     }
 
     #[test]
+    fn transition_duration_is_capped_by_both_adjacent_clip_handles() {
+        let mut left = test_clip("transition-left");
+        left.start = 0.0;
+        left.duration = 1.0;
+        left.extra.insert("props".into(), json!({"transitionOut":{"type":"crossfade","duration":1.8}}));
+        /* Legacy seek bookkeeping must not bypass the effective-duration cap. */
+        left.extra.insert("previewSeekAdjusted".into(), json!(true));
+        let mut right = test_clip("transition-right");
+        right.start = 1.0;
+        right.duration = 0.6;
+        assert_eq!(transition_between(&left, &right), Some(("crossfade".to_owned(), 0.3)));
+    }
+
+    #[test]
     fn new_transition_types_are_preserved_from_clip_properties() {
         for kind in ["zoom", "spin", "blur", "checker", "dip", "crossfade"] {
             let mut clip = test_clip(kind);
@@ -3322,17 +3364,19 @@ mod tests {
     }
 
     #[test]
-    fn transition_preroll_holds_first_frame_when_source_has_no_handle() {
+    fn transition_preroll_advances_source_without_a_frozen_incoming_frame() {
         assert!((transition_preroll_source_time(0.0, 0.8, 0.0) - 0.0).abs() < 1e-9);
-        assert!((transition_preroll_source_time(0.0, 0.8, 0.4) - 0.0).abs() < 1e-9);
-        assert!((transition_preroll_source_time(0.0, 0.8, 0.8) - 0.0).abs() < 1e-9);
-        assert!((transition_preroll_source_time(0.0, 0.8, 1.2) - 0.4).abs() < 1e-9);
+        assert!((transition_preroll_source_time(0.0, 0.8, 0.4) - 0.4).abs() < 1e-9);
+        assert!((transition_preroll_source_time(0.0, 0.8, 0.8) - 0.8).abs() < 1e-9);
+        assert!((transition_postroll_source_offset(0.0, 0.8) - 0.8).abs() < 1e-9);
+        assert!((transition_postroll_source_offset(0.0, 0.8) + 0.4 - 1.2).abs() < 1e-9);
     }
 
     #[test]
     fn transition_preroll_consumes_available_source_handle_without_cut_jump() {
         assert!((transition_preroll_source_time(1.5, 0.8, 0.0) - 0.7).abs() < 1e-9);
         assert!((transition_preroll_source_time(1.5, 0.8, 0.8) - 1.5).abs() < 1e-9);
+        assert!((transition_postroll_source_offset(1.5, 0.8) - 1.5).abs() < 1e-9);
     }
 
     #[test]
