@@ -6,6 +6,7 @@ description = "C ABI bridge to Pluto's Rust timeline and media engine"
 
 [lib]
 name = "pluto_backend"
+path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
