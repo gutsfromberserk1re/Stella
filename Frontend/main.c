@@ -149,9 +149,10 @@ static void TimelineHistoryAction(bool redo) {
     }
 }
 
-/* Native multi-clip audio clock. Media inspection creates one cached OGG
+/* Native multi-clip audio playback. Media inspection creates one cached OGG
    playback proxy per source, so MP4/MOV and detached audio clips all use the
-   same Raylib streaming path. Streams are reused across play/pause/scrub. */
+   same Raylib streaming path. Streams follow the single timeline clock and
+   are reused across play/pause/scrub. */
 #define STELLA_AUDIO_VOICES 32
 #if defined(_WIN32)
 #define STELLA_AUDIO_PATH_COPY(dst, src) strncpy((dst), (src), sizeof(dst) - 1)
@@ -168,15 +169,14 @@ typedef struct {
     bool loading;
     bool failed;
     bool wasActive;
+    float lastRequestedSourceTime;
+    bool hasRequestedSourceTime;
 } StellaAudioVoice;
 static StellaAudioVoice gAudioVoices[STELLA_AUDIO_VOICES];
 static bool gAudioReady;
 static float gAudioMixHeadroom = 1.f;
-/* The first active audio stream acts as the transport master. Video-only
-   timelines continue to use the monotonic wall clock as their fallback. */
-static bool gAudioClockValid;
-static float gAudioClockPlayhead;
-static double gAudioClockUpdatedAt;
+/* Audio follows the single monotonic timeline transport clock. It never
+   writes time back into gPlayhead, avoiding competing audio/video playheads. */
 
 static uint64_t StellaAudioHash(const char *text) {
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -293,7 +293,8 @@ static DWORD WINAPI AudioPumpThreadProc(LPVOID unused) {
             }
             LeaveCriticalSection(&gAudioStateLock);
         }
-        Sleep(5);
+        /* Keep raylib's stream buffers topped up without polling at 200 Hz. */
+        Sleep(10);
     }
     return 0;
 }
@@ -446,12 +447,12 @@ static StellaAudioVoice *AudioVoiceForClip(const TimelineClipUi *clip) {
 }
 
 static void AudioPlaybackTick(bool playing) {
-    gAudioClockValid = false;
 #if defined(_WIN32)
     bool audioLockHeld = false;
     if (gAudioWorkersReady) {
-        /* Never let the UI wait for a stream refill. If the 5ms pump owns the
-           audio state lock, this tick simply falls back to the wall-clock. */
+        /* Never let the UI wait for a stream refill. If the audio pump owns
+           this lock, skip this audio-management tick; transport timing is
+           independent and continues from the monotonic main-loop clock. */
         if (!TryEnterCriticalSection(&gAudioStateLock)) return;
         audioLockHeld = true;
         AudioCollectLoadResultsLocked();
@@ -493,26 +494,35 @@ static void AudioPlaybackTick(bool playing) {
         bool streamPlaying = IsMusicStreamPlaying(voice->music);
         if (playing) {
             if (!streamPlaying) {
+                /* Entering a clip (or resuming after it left the active range)
+                   is the normal seek point. The device stream then advances
+                   alongside the monotonic transport clock. */
                 SeekMusicStream(voice->music, sourceTime);
                 PlayMusicStream(voice->music);
+            } else {
+                /* A deliberate scrub/jump while playing may move the timeline
+                   far from this stream. Small differences are normal output
+                   buffer latency and must not trigger a seek every frame. */
+                float requestedDelta = fabsf(sourceTime - voice->lastRequestedSourceTime);
+                if (voice->hasRequestedSourceTime &&
+                    ((gTimelineScrubbing && requestedDelta > .025f) || requestedDelta > .50f))
+                    SeekMusicStream(voice->music, sourceTime);
             }
+            voice->lastRequestedSourceTime = sourceTime;
+            voice->hasRequestedSourceTime = true;
 #if !defined(_WIN32)
             UpdateMusicStream(voice->music);
 #endif
-            float actual = GetMusicTimePlayed(voice->music);
-            if (!gAudioClockValid && isfinite(actual)) {
-                float masterAt = clip->start + actual - clip->sourceOffset;
-                if (masterAt >= clip->start - .1f && masterAt <= clip->start + clip->duration + .1f) {
-                    gAudioClockPlayhead = masterAt;
-                    gAudioClockUpdatedAt = GetTime();
-                    gAudioClockValid = true;
-                }
-            }
-            if (fabsf(actual - sourceTime) > .10f) SeekMusicStream(voice->music, sourceTime);
         } else {
             if (streamPlaying) PauseMusicStream(voice->music);
-            float actual = GetMusicTimePlayed(voice->music);
-            if (fabsf(actual - sourceTime) > .04f) SeekMusicStream(voice->music, sourceTime);
+            /* While paused, seek only when the user actually moved the
+               playhead instead of reopening decoder state on every UI tick. */
+            if (!voice->hasRequestedSourceTime ||
+                fabsf(sourceTime - voice->lastRequestedSourceTime) > .025f) {
+                SeekMusicStream(voice->music, sourceTime);
+                voice->lastRequestedSourceTime = sourceTime;
+                voice->hasRequestedSourceTime = true;
+            }
         }
     }
     /* A simple master-bus gain stage keeps overlapping full-level clips from
@@ -851,8 +861,9 @@ int main(void) {
     int observedPreviewRes = gPreviewRes;
     int observedPreviewFps = gPreviewFps;
     float observedPlayhead = gPlayhead;
-    float playbackRemainder = 0.f;
     float navigationRepeat = 0.f;
+    bool transportWasPlaying = gTimelinePlaying;
+    double transportLastTickAt = GetTime();
     while (!WindowShouldClose() && !gWantQuit) {
         gDt = GetFrameTime(); if (gDt > 0.05f) gDt = 0.05f;
         if (gPreviewRes != observedPreviewRes) {
@@ -862,7 +873,7 @@ int main(void) {
         }
         if (gPreviewFps != observedPreviewFps) {
             observedPreviewFps = gPreviewFps;
-            playbackRemainder = 0.f;
+            gPreviewDirty = true;
         }
         if (fabsf(gPlayhead - observedPlayhead) > 0.0001f) {
             observedPlayhead = gPlayhead;
@@ -964,28 +975,30 @@ int main(void) {
             gPreviewDirty = true;
             gPreviewDebounce = 1.f;
         }
+        /* There is exactly one transport clock, independent of audio presence.
+           gDt is intentionally capped for UI animations; using it here slows
+           playback whenever a preview frame stalls. GetTime() is monotonic and
+           advances the playhead by real elapsed time even during dropped frames. */
+        double transportNow = GetTime();
+        if (gTimelinePlaying != transportWasPlaying) {
+            transportWasPlaying = gTimelinePlaying;
+            transportLastTickAt = transportNow;
+        }
+        double transportElapsed = transportNow - transportLastTickAt;
+        transportLastTickAt = transportNow;
+        if (!isfinite(transportElapsed) || transportElapsed < 0.0) transportElapsed = 0.0;
+
         if (gTimelinePlaying) {
             float end = TimelineDuration();
             const float frameDuration = 1.f / (float)fmaxf(1, gPreviewFps);
             float previousPlayhead = gPlayhead;
-            if (gAudioClockValid && GetTime() - gAudioClockUpdatedAt < .15) {
-                /* Audio owns the transport clock while a stream is active.
-                   This removes the old wall-clock/audio seek-chase feedback loop. */
-                gPlayhead = gAudioClockPlayhead;
-                playbackRemainder = 0.f;
-            } else {
-                playbackRemainder += gDt;
-                if (playbackRemainder >= frameDuration) {
-                    float advance = floorf(playbackRemainder / frameDuration) * frameDuration;
-                    playbackRemainder -= advance;
-                    gPlayhead += advance;
-                }
-            }
+            gPlayhead += (float)transportElapsed;
             if (gPlayhead >= end) {
-                gPlayhead = end; gTimelinePlaying = false; playbackRemainder = 0.f;
+                gPlayhead = end;
+                gTimelinePlaying = false;
             }
             if (fabsf(gPlayhead - previousPlayhead) >= frameDuration * .5f) gPreviewDirty = true;
-        } else playbackRemainder = 0.f;
+        }
         AudioPlaybackTick(gTimelinePlaying);
         gWheelDelta = GetMouseWheelMove();
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);

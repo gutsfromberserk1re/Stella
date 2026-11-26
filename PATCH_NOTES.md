@@ -23,3 +23,10 @@ The source files and ZIP archive were checked for consistency and archive integr
 ## CI compile fix — Clay horizontal layout
 - Replaced the undefined `ROW` layout shorthand in the Subtitles empty-state and cue rows with Clay's explicit `CLAY_LEFT_TO_RIGHT` layout direction.
 - Checked the frontend sources for any remaining `ROW` references; none remain.
+
+## Playback clock and embedded-audio fix
+
+- Removed the embedded-audio stream as a second transport clock. The timeline playhead now has one monotonic `GetTime()`-based clock whether the active video has audio, has been separated, or is silent.
+- Removed per-frame `GetMusicTimePlayed` feedback and 100 ms seek chasing. Audio streams seek on clip entry, on paused scrubs, or on deliberate timeline jumps; ordinary output-buffer latency no longer causes repeated decoder seeks.
+- Changed the Windows Raylib audio pump from a 5 ms (200 Hz) poll to 10 ms (100 Hz), reducing unnecessary stream updates and contention with the UI/audio-state lock.
+- Transport time now uses real monotonic elapsed time instead of the UI animation delta capped at 50 ms, so dropped preview frames do not slow down the playhead.
