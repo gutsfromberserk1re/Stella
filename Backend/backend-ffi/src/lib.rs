@@ -3253,6 +3253,34 @@ mod tests {
     }
 
     #[test]
+    fn hsl_hue_bands_keep_independent_values_when_selection_changes() {
+        let mut clip = test_clip("hsl-independent-bands");
+
+        // Yellow (band 3) and red (band 1) must remain independent. Changing
+        // the selected band is UI state and must not overwrite either grade.
+        set_clip_property(&mut clip, "props.colors.hsl.3.hue", json!(24.0)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.3.saturation", json!(62.0)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.3.lightness", json!(-18.0)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.1.hue", json!(-12.0)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.1.saturation", json!(35.0)).unwrap();
+        set_clip_property(&mut clip, "props.colors.hsl.selected", json!(1)).unwrap();
+
+        let props = &clip.extra["props"];
+        assert_eq!(props["colors"]["hsl"]["3"]["hue"].as_f64(), Some(24.0));
+        assert_eq!(props["colors"]["hsl"]["3"]["saturation"].as_f64(), Some(62.0));
+        assert_eq!(props["colors"]["hsl"]["3"]["lightness"].as_f64(), Some(-18.0));
+        assert_eq!(props["colors"]["hsl"]["1"]["hue"].as_f64(), Some(-12.0));
+        assert_eq!(props["colors"]["hsl"]["1"]["saturation"].as_f64(), Some(35.0));
+        assert_eq!(props["colors"]["hsl"]["selected"].as_i64(), Some(1));
+
+        set_clip_property(&mut clip, "props.colors.hsl.selected", json!(3)).unwrap();
+        let props = &clip.extra["props"];
+        assert_eq!(props["colors"]["hsl"]["selected"].as_i64(), Some(3));
+        assert_eq!(props["colors"]["hsl"]["3"]["saturation"].as_f64(), Some(62.0));
+        assert_eq!(props["colors"]["hsl"]["1"]["saturation"].as_f64(), Some(35.0));
+    }
+
+    #[test]
     fn inspector_edits_at_a_keyframe_update_only_that_keyframe_channel() {
         let mut clip = test_clip("keyframe-edit-test");
         clip.extra.insert("keyframes".into(), json!([

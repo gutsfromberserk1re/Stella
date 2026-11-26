@@ -1107,10 +1107,16 @@ static void SliderRow(int idx, int s) {
     static float sent[NSL];
     static bool sentInit;
     static int previousSelected = -2;
-    if (!sentInit || previousSelected != gTimelineSelected) {
+    static int previousHsl = -2;
+    /* HSL uses the same three UI slider slots for nine independent hue bands.
+       Re-seed the outbound cache whenever the active band changes, otherwise
+       the previous band's cached progress can be mistaken for an unsent edit
+       and written into the newly selected band. */
+    if (!sentInit || previousSelected != gTimelineSelected || (idx == 1 && previousHsl != gHsl)) {
         memcpy(sent, gSlT, sizeof(sent));
         sentInit = true;
         previousSelected = gTimelineSelected;
+        previousHsl = gHsl;
     }
     int gi = idx * 8 + s, mode; Clay_Color a, b, c;
     SliderSpec(idx, s, &mode, &a, &b, &c);
@@ -1154,7 +1160,15 @@ static void Chip(int i) {
     Clay_ElementId id = CLAY_IDI("Chip", i);
     Bs b = Interact(id);
     float sel = Anim(id.id + 3u, gHsl == i ? 1.f : 0.f, 30.f);
-    if (b.clicked) { gHsl = i; PlutoTimelineSetProperty("props.colors.hsl.selected", i); }
+    if (b.clicked && gHsl != i) {
+        /* A chip click may land on the same mouse-up frame as the previous
+           slider drag. Commit that edit first: SetProperty otherwise inherits
+           the live-edit flag and skips the full timeline sync/inspector hydrate,
+           leaving the prior hue's slider progress active for the new hue. */
+        PlutoTimelineEndPropertyEdit();
+        gHsl = i;
+        PlutoTimelineSetProperty("props.colors.hsl.selected", i);
+    }
     CLAY(id, {.layout = {.sizing = {FIX(30), FIX(30)}, .childAlignment = AL_C}, .cornerRadius = CLAY_CORNER_RADIUS(15),
               .border = {.color = RGBA(240, 242, 246, 255.f * sel + 70.f * b.hover * (1.f - sel)), .width = CLAY_BORDER_OUTSIDE(2)}}) {
         float sz = 22.f + 2.f * b.hover - 2.f * b.press;
