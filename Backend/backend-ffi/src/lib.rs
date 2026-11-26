@@ -571,7 +571,6 @@ fn media_worker(tasks: Receiver<(u64, Value)>, events: Sender<String>, proxy_tas
                 result
             }
             "export_project" => export_project(&request, id),
-            "generate_subtitles" => generate_subtitles(&request, id),
             "" => Err("Background command is required".into()),
             other => Err(format!("Unsupported background command: {other}")),
         };
@@ -1009,6 +1008,7 @@ fn inspect_media(path: &str) -> Result<Value, String> {
     }))
 }
 
+#[cfg(test)]
 fn parse_srt_timestamp(value: &str) -> Option<f64> {
     let value = value.trim().replace(',', ".");
     let mut parts = value.split(':');
@@ -1021,6 +1021,7 @@ fn parse_srt_timestamp(value: &str) -> Option<f64> {
     Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
+#[cfg(test)]
 fn parse_srt_cues(source: &str, clip_duration: f64, clip_start: f64) -> Vec<Value> {
     let normalized = source.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
     let mut cues = Vec::new();
@@ -1051,62 +1052,6 @@ fn parse_srt_cues(source: &str, clip_duration: f64, clip_start: f64) -> Vec<Valu
         }
     }
     cues
-}
-
-fn generate_subtitles(request: &Value, request_id: u64) -> Result<Value, String> {
-    use std::path::{Path, PathBuf};
-    let source = request["path"].as_str().filter(|value| !value.is_empty())
-        .ok_or("Subtitle source path is required")?;
-    let whisper_cli = request["whisperPath"].as_str().filter(|value| !value.is_empty())
-        .ok_or("Select the whisper-cli executable first")?;
-    let model = request["modelPath"].as_str().filter(|value| !value.is_empty())
-        .ok_or("Select a Whisper model first")?;
-    let source_offset = request["sourceOffset"].as_f64().unwrap_or(0.0).max(0.0);
-    let duration = request["duration"].as_f64().unwrap_or(0.0);
-    let clip_start = request["clipStart"].as_f64().unwrap_or(0.0).max(0.0);
-    if !Path::new(source).is_file() { return Err("The source video file could not be found".into()); }
-    if !Path::new(whisper_cli).is_file() { return Err("The selected whisper-cli executable could not be found".into()); }
-    if !Path::new(model).is_file() { return Err("The selected Whisper model could not be found".into()); }
-    if !duration.is_finite() || duration <= 0.02 { return Err("The selected video clip has no usable duration".into()); }
-
-    let cache_dir = std::env::temp_dir().join("stella-subtitles");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Could not create subtitle cache: {e}"))?;
-    let base: PathBuf = cache_dir.join(format!("subtitle-{request_id}"));
-    let wav = base.with_extension("wav");
-    let srt = base.with_extension("srt");
-    let ffmpeg = multimedia_binary("ffmpeg");
-    let extract = media_command(ffmpeg)
-        .arg("-hide_banner").arg("-loglevel").arg("error")
-        .arg("-i").arg(source)
-        .arg("-ss").arg(format!("{source_offset:.6}"))
-        .arg("-t").arg(format!("{duration:.6}"))
-        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y"])
-        .arg(&wav)
-        .output()
-        .map_err(|e| format!("Could not start FFmpeg for subtitle audio: {e}"))?;
-    if !extract.status.success() {
-        let _ = std::fs::remove_file(&wav);
-        let detail = String::from_utf8_lossy(&extract.stderr).trim().to_owned();
-        return Err(if detail.is_empty() { "Could not extract audio from this video".into() } else { detail });
-    }
-
-    let whisper = media_command(whisper_cli)
-        .arg("-m").arg(model)
-        .arg("-f").arg(&wav)
-        .arg("-osrt").arg("-of").arg(&base)
-        .arg("-np")
-        .output()
-        .map_err(|e| format!("Could not start Whisper: {e}"))?;
-    let _ = std::fs::remove_file(&wav);
-    if !whisper.status.success() {
-        let detail = String::from_utf8_lossy(&whisper.stderr).trim().to_owned();
-        return Err(if detail.is_empty() { "Whisper failed to transcribe this clip".into() } else { detail });
-    }
-    let srt_text = std::fs::read_to_string(&srt)
-        .map_err(|e| format!("Whisper completed but its subtitle file could not be read: {e}"))?;
-    let cues = parse_srt_cues(&srt_text, duration, clip_start);
-    if cues.is_empty() { return Err("Whisper did not detect any speech in the selected clip".into()); }
-    Ok(json!({"cues": cues, "cueCount": cues.len(), "clipStart": clip_start, "duration": duration}))
 }
 
 fn multimedia_binary(name: &str) -> std::path::PathBuf {

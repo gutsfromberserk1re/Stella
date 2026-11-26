@@ -1248,13 +1248,6 @@ static void PlutoPollBackend(void) {
                     }
                 }
             }
-        } else if (strstr(event, "\"command\":\"generate_subtitles\"")) {
-            gSubtitleGenerating = false;
-            if (strstr(event, "\"ok\":true")) PlutoSubtitleHandleResult(event);
-            else {
-                PlutoJsonString(event, "error", gBackendMessage, sizeof(gBackendMessage));
-                gSubtitleSourceClipId[0] = 0;
-            }
         } else if (strstr(event, "\"command\":\"export_project\"")) {
             if (strstr(event, "\"ok\":true")) {
                 char path[1024] = {0};
@@ -1555,43 +1548,6 @@ static bool PlutoPickPath(const wchar_t *filter, wchar_t *path, DWORD pathChars,
     return GetOpenFileNameW(&dialog) != 0;
 }
 
-static void PlutoLoadWhisperConfig(void) {
-    if (gWhisperConfigLoaded) return;
-    gWhisperConfigLoaded = true;
-    char iniPath[2048];
-    snprintf(iniPath, sizeof(iniPath), "%sstella-subtitles.ini", GetApplicationDirectory());
-    GetPrivateProfileStringA("Subtitles", "WhisperCli", "", gWhisperCliPath, sizeof(gWhisperCliPath), iniPath);
-    GetPrivateProfileStringA("Subtitles", "Model", "", gWhisperModelPath, sizeof(gWhisperModelPath), iniPath);
-}
-
-static void PlutoSaveWhisperConfig(void) {
-    char iniPath[2048];
-    snprintf(iniPath, sizeof(iniPath), "%sstella-subtitles.ini", GetApplicationDirectory());
-    WritePrivateProfileStringA("Subtitles", "WhisperCli", gWhisperCliPath, iniPath);
-    WritePrivateProfileStringA("Subtitles", "Model", gWhisperModelPath, iniPath);
-}
-
-static bool PlutoChooseWhisperAssets(void) {
-    PlutoLoadWhisperConfig();
-    wchar_t selected[32768] = {0};
-    char utf8[1024];
-    if (!gWhisperCliPath[0] || !FileExists(gWhisperCliPath)) {
-        if (!PlutoPickPath(L"Whisper CLI executable\0whisper-cli.exe;*.exe\0Executables\0*.exe\0All files\0*.*\0\0",
-                           selected, (DWORD)(sizeof(selected) / sizeof(selected[0])), L"Choose whisper-cli.exe")) return false;
-        if (!PlutoWidePathToUtf8(selected, utf8, sizeof(utf8))) return false;
-        snprintf(gWhisperCliPath, sizeof(gWhisperCliPath), "%s", utf8);
-    }
-    if (!gWhisperModelPath[0] || !FileExists(gWhisperModelPath)) {
-        selected[0] = 0;
-        if (!PlutoPickPath(L"Whisper model\0*.bin\0All files\0*.*\0\0",
-                           selected, (DWORD)(sizeof(selected) / sizeof(selected[0])), L"Choose a Whisper model (.bin)")) return false;
-        if (!PlutoWidePathToUtf8(selected, utf8, sizeof(utf8))) return false;
-        snprintf(gWhisperModelPath, sizeof(gWhisperModelPath), "%s", utf8);
-    }
-    PlutoSaveWhisperConfig();
-    return FileExists(gWhisperCliPath) && FileExists(gWhisperModelPath);
-}
-
 static bool PlutoRequestRelinkClipFile(int clipIndex) {
     if (!gBackend.submit || clipIndex < 0 || clipIndex >= gTimelineClipCount || gTimelineClips[clipIndex].isSubtitle) return false;
     wchar_t selected[32768] = {0};
@@ -1612,33 +1568,6 @@ static bool PlutoRequestRelinkClipFile(int clipIndex) {
     return true;
 }
 
-static bool PlutoRequestSubtitleGeneration(int sourceClipIndex) {
-    if (!gBackend.submit || sourceClipIndex < 0 || sourceClipIndex >= gTimelineClipCount) return false;
-    TimelineClipUi *clip = &gTimelineClips[sourceClipIndex];
-    if (strcmp(clip->kind, "video") != 0 || !clip->hasAudio) {
-        strcpy(gBackendMessage, "Select a video clip that contains audio");
-        return false;
-    }
-    if (!PlutoChooseWhisperAssets()) {
-        strcpy(gBackendMessage, "Subtitle generation cancelled; choose whisper-cli and a model to continue");
-        return false;
-    }
-    char path[6144], whisper[6144], model[6144], request[20000];
-    PlutoJsonEscape(clip->path, path, sizeof(path));
-    PlutoJsonEscape(gWhisperCliPath, whisper, sizeof(whisper));
-    PlutoJsonEscape(gWhisperModelPath, model, sizeof(model));
-    int n = snprintf(request, sizeof(request),
-        "{\"command\":\"generate_subtitles\",\"path\":\"%s\",\"whisperPath\":\"%s\",\"modelPath\":\"%s\",\"sourceOffset\":%.6f,\"duration\":%.6f,\"clipStart\":%.6f}",
-        path, whisper, model, clip->sourceOffset, clip->duration, clip->start);
-    if (n <= 0 || (size_t)n >= sizeof(request) || !gBackend.submit(request)) {
-        strcpy(gBackendMessage, "Could not queue subtitle generation");
-        return false;
-    }
-    gSubtitleGenerating = true;
-    snprintf(gSubtitleSourceClipId, sizeof(gSubtitleSourceClipId), "%s", clip->id);
-    strcpy(gBackendMessage, "Generating subtitles…");
-    return true;
-}
 #else
 typedef struct { int unavailable; } PlutoBackend;
 static PlutoBackend gBackend;
@@ -1669,7 +1598,6 @@ static void PlutoPollBackend(void) {}
 static void PlutoUnloadMedia(void) {}
 static void PlutoRequestMediaImport(void) {}
 static bool PlutoRequestRelinkClipFile(int clipIndex) { (void)clipIndex; return false; }
-static bool PlutoRequestSubtitleGeneration(int sourceClipIndex) { (void)sourceClipIndex; return false; }
 #endif
 
 #endif

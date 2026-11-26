@@ -2319,142 +2319,6 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     return n > 0 && (size_t)n < capacity;
 }
 
-static bool PlutoAppendSubtitleCue(char *request, size_t capacity, size_t *used,
-                                   const char *text, float start, float end, bool firstCue, char *lastId, size_t idCapacity) {
-    if (!text || !*text || !isfinite(start) || !isfinite(end) || end - start < .04f ||
-        !request || !used || *used >= capacity) return false;
-    snprintf(gTextContent, sizeof(gTextContent), "%s", text);
-    gTextIsSubtitle = true;
-    snprintf(gTextSubtitleSourceId, sizeof(gTextSubtitleSourceId), "%s", gSubtitleSourceClipId);
-    gTextFontFamily = 0; gTextFontPath[0] = 0;
-    snprintf(gTextFontName, sizeof(gTextFontName), "System");
-    gTextFontSize = 54; gTextAutoFit = true;
-    gTextBold = true; gTextItalic = false; gTextUnderline = false;
-    gTextOutline = true; gTextShadow = true; gTextBackground = true;
-    gTextAlign = 1; gTextPosX = .5f; gTextPosY = .865f;
-    gTextBoxW = .92f; gTextBoxH = .16f;
-    gTextAppearance[0] = (Color){250, 250, 252, 255};
-    gTextAppearance[1] = (Color){7, 8, 10, 245};
-    gTextAppearance[2] = (Color){0, 0, 0, 190};
-    gTextAppearance[3] = (Color){8, 9, 12, 148};
-    for (int i = 0; i < 4; i++)
-        gTextWheelPuck[i] = gTextWheelPuckT[i] = PlutoTextColorToWheel(gTextAppearance[i]);
-    char path[1024], props[8192], escapedPath[6144], id[64];
-    if (!PlutoTextWriteImage(path, sizeof(path), true) || !PlutoTextBuildPropsJson(props, sizeof(props))) return false;
-    PlutoJsonEscape(path, escapedPath, sizeof(escapedPath));
-    bool idTaken = false;
-    do {
-        snprintf(id, sizeof(id), "subtitle-%llu", (unsigned long long)gClipSerial++);
-        idTaken = false;
-        for (int i = 0; i < gTimelineClipCount; i++) {
-            if (strcmp(gTimelineClips[i].id, id) == 0) { idTaken = true; break; }
-        }
-    } while (idTaken);
-    int n = snprintf(request + *used, capacity - *used,
-        "%s{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"Subtitle\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}",
-        firstCue ? "" : ",", id, fmaxf(0.f, start), fmaxf(.05f, end - start), escapedPath,
-        fmaxf(.05f, end - start), props);
-    if (n <= 0 || (size_t)n >= capacity - *used) return false;
-    *used += (size_t)n;
-    if (lastId && idCapacity) snprintf(lastId, idCapacity, "%s", id);
-    return true;
-}
-
-static void PlutoSubtitleHandleResult(const char *event) {
-    if (!event) return;
-    const char *eventEnd = event + strlen(event), *arrayBegin = NULL, *arrayEnd = NULL;
-    if (!gSubtitleSourceClipId[0] ||
-        !PlutoJsonMemberRange(event, eventEnd, "cues", &arrayBegin, &arrayEnd) ||
-        arrayBegin >= arrayEnd || *arrayBegin != '[') {
-        strcpy(gBackendMessage, "Whisper returned no readable subtitle cues");
-        gSubtitleSourceClipId[0] = 0;
-        return;
-    }
-    size_t requestCapacity = 4u * 1024u * 1024u, requestUsed = 0;
-    char *request = (char *)malloc(requestCapacity);
-    if (!request) {
-        strcpy(gBackendMessage, "Not enough memory to build subtitle clips");
-        gSubtitleSourceClipId[0] = 0;
-        return;
-    }
-    char escapedSourceId[512];
-    PlutoJsonEscape(gSubtitleSourceClipId, escapedSourceId, sizeof(escapedSourceId));
-    int requestLength = snprintf(request, requestCapacity,
-        "{\"command\":\"timeline_replace_subtitles\",\"sourceClipId\":\"%s\",\"clips\":[",
-        escapedSourceId);
-    if (requestLength <= 0 || (size_t)requestLength >= requestCapacity) {
-        free(request); gSubtitleSourceClipId[0] = 0;
-        strcpy(gBackendMessage, "Could not prepare subtitle clips");
-        return;
-    }
-    requestUsed = (size_t)requestLength;
-    int existingFromSource = 0;
-    for (int i = 0; i < gTimelineClipCount; i++)
-        if (gTimelineClips[i].isSubtitle && strcmp(gTimelineClips[i].subtitleSourceId, gSubtitleSourceClipId) == 0)
-            existingFromSource++;
-    int availableSlots = MAX_TIMELINE_CLIPS - (gTimelineClipCount - existingFromSource);
-    int cueLimit = availableSlots < 400 ? availableSlots : 400;
-    if (cueLimit < 1) {
-        free(request);
-        gSubtitleSourceClipId[0] = 0;
-        gSubtitleGenerating = false;
-        strcpy(gBackendMessage, "The timeline is full; remove some clips before generating subtitles");
-        return;
-    }
-    int created = 0;
-    char lastSubtitleId[64] = {0};
-    const char *p = arrayBegin + 1, *limit = arrayEnd - 1;
-    while (p < limit && created < cueLimit) {
-        if (*p == ',' || *p == ' ' || *p == '\r' || *p == '\n' || *p == '\t') { p++; continue; }
-        if (*p != '{') break;
-        const char *begin = p, *end = NULL;
-        int depth = 0; bool inString = false, escaped = false;
-        for (; p < limit; p++) {
-            char c = *p;
-            if (inString) {
-                if (escaped) escaped = false;
-                else if (c == '\\') escaped = true;
-                else if (c == '"') inString = false;
-                continue;
-            }
-            if (c == '"') inString = true;
-            else if (c == '{') depth++;
-            else if (c == '}' && --depth == 0) { end = p + 1; p++; break; }
-        }
-        if (!end) break;
-        char text[STELLA_TEXT_MAX] = {0}; double start = 0.0, finish = 0.0;
-        if (PlutoJsonStringRange(begin, end, "text", text, sizeof(text)) &&
-            PlutoJsonNumberRange(begin, end, "start", &start) &&
-            PlutoJsonNumberRange(begin, end, "end", &finish) &&
-            PlutoAppendSubtitleCue(request, requestCapacity, &requestUsed, text,
-                                  (float)start, (float)finish, created == 0,
-                                  lastSubtitleId, sizeof(lastSubtitleId))) {
-            created++;
-        } else {
-            break;
-        }
-    }
-    if (created > 0) {
-        int closeLength = snprintf(request + requestUsed, requestCapacity - requestUsed, "]}");
-        if (closeLength > 0 && (size_t)closeLength < requestCapacity - requestUsed && PlutoTimelineCall(request)) {
-            for (int i = 0; i < gTimelineClipCount; i++)
-                if (strcmp(gTimelineClips[i].id, lastSubtitleId) == 0) { PlutoTimelineSelect(i); break; }
-        } else {
-            created = 0;
-            strcpy(gBackendMessage, "Could not add generated subtitle clips to the timeline");
-        }
-    }
-    free(request);
-    gSubtitleCueCount = created;
-    gSubtitleSourceClipId[0] = 0;
-    gSubtitleGenerating = false;
-    gRightTab = 3;
-    gSubtitleCardOpen = true;
-    gPreviewDirty = true;
-    if (created > 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "Generated %d subtitle cues", created);
-    else snprintf(gBackendMessage, sizeof(gBackendMessage), "No subtitle cues were generated");
-}
-
 static bool PlutoTextApply(bool forceNew, bool liveUpdate) {
     if (forceNew && !gTextContent[0]) {
         strcpy(gBackendMessage, "Enter some text first");
@@ -3002,29 +2866,11 @@ static void TextView(void) {
         TextColorEditorReset();
     }
 
-    /* Subtitle generation owns its own card above manual text. Generated cues
-       are normal rendered title assets, grouped into the conditional S lane. */
-    int subtitleCount = 0, subtitleSource = -1;
-    for (int i = 0; i < gTimelineClipCount; i++) {
+    /* Subtitle creation is intentionally deferred. The card stays visible as a
+       future entry point; existing subtitle clips continue to use the S lane. */
+    int subtitleCount = 0;
+    for (int i = 0; i < gTimelineClipCount; i++)
         if (gTimelineClips[i].isSubtitle) subtitleCount++;
-        if (subtitleSource < 0 && strcmp(gTimelineClips[i].kind, "video") == 0 && gTimelineClips[i].hasAudio)
-            subtitleSource = i;
-    }
-    if (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
-        TimelineClipUi *selected = &gTimelineClips[gTimelineSelected];
-        if (strcmp(selected->kind, "video") == 0 && selected->hasAudio) {
-            subtitleSource = gTimelineSelected;
-        } else if (selected->isSubtitle && selected->subtitleSourceId[0]) {
-            for (int i = 0; i < gTimelineClipCount; i++) {
-                if (strcmp(gTimelineClips[i].id, selected->subtitleSourceId) == 0 &&
-                    strcmp(gTimelineClips[i].kind, "video") == 0 && gTimelineClips[i].hasAudio) {
-                    subtitleSource = i;
-                    break;
-                }
-            }
-        }
-    }
-    if (gSubtitleGenerating && !gSubtitleCardOpen) gSubtitleCardOpen = true;
     CLAY(CLAY_ID("SubtitleCard"), {.layout = {COLM, .sizing = {GROW, FIT}},
                                    .backgroundColor = C_RCARD,
                                    .cornerRadius = CLAY_CORNER_RADIUS(16),
@@ -3040,16 +2886,13 @@ static void TextView(void) {
                                                   .cornerRadius = {0.f, 0.f, 16.f, 16.f}}) {
                 CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 4}}) {
                     Tx(subtitleCount ? Fmt("%d subtitle cues", subtitleCount) : "No subtitles yet", 13.5f, C_TEXT, 0);
-                    Tx(gSubtitleGenerating ? "Transcribing audio…" :
-                       (subtitleCount ? "Regenerate from selected video" : "Generate from video audio"), 11.5f, C_MUTED, 0);
+                    Tx(subtitleCount ? "Existing captions on the timeline" : "Subtitle creation is coming soon", 11.5f, C_MUTED, 0);
                 }
                 HSPACE
                 Clay_ElementId addSubtitle = CLAY_ID("SubtitleGenerateButton");
                 Bs addHover = Interact(addSubtitle);
-                if (addHover.clicked && !gSubtitleGenerating) {
-                    if (subtitleSource >= 0) PlutoRequestSubtitleGeneration(subtitleSource);
-                    else strcpy(gBackendMessage, "Import or select a video clip with audio first");
-                }
+                if (addHover.clicked)
+                    strcpy(gBackendMessage, "Subtitle creation will be added in a later update");
                 CLAY(addSubtitle, {.layout = {.sizing = {FIX(42), FIX(42)}, .childAlignment = AL_C},
                                    .backgroundColor = BtnBg(C_RCARDB, RGB(54, 56, 63), addHover),
                                    .cornerRadius = CLAY_CORNER_RADIUS(13),
