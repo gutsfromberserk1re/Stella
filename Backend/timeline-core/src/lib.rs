@@ -244,7 +244,8 @@ impl Timeline {
             moved.start = if self.snapping {
                 self.snap_start(id, start, moved.duration, playhead, snap_threshold, None)
             } else { start };
-            shift_clip_keyframes(&mut moved, moved.start - original.start);
+            let keyframe_delta = moved.start - original.start;
+            shift_clip_keyframes(&mut moved, keyframe_delta);
             self.replace(moved);
             self.refresh_duration();
             return Ok(self.find(id)?.clone());
