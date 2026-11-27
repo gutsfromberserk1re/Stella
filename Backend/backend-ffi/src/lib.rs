@@ -1540,16 +1540,18 @@ fn render_wgpu_export_frame(
             .filter(|path| !path.is_empty())
             .ok_or_else(|| format!("Video clip '{}' has no source path", clip.id))?;
         let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+        let props = clip.extra.get("props").unwrap_or(&Value::Null);
+        let speed = props.pointer("/transform/speed").and_then(Value::as_f64)
+            .unwrap_or(1.0).clamp(0.25, 4.0);
         let source_time = if let Some(duration) = transition_source_context.get(&clip.id) {
             if frame_at < clip.start {
-                transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+                transition_preroll_source_time(source_offset, *duration * speed, (frame_at - (clip.start - duration)) * speed)
             } else {
-                transition_postroll_source_offset(source_offset, *duration) + (frame_at - clip.start).max(0.0)
+                transition_postroll_source_offset(source_offset, *duration * speed) + (frame_at - clip.start).max(0.0) * speed
             }
         } else {
-            (source_offset + (frame_at - clip.start)).max(0.0)
+            (source_offset + (frame_at - clip.start) * speed).max(0.0)
         };
-        let props = clip.extra.get("props").unwrap_or(&Value::Null);
         let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
         let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
             (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)
@@ -2099,17 +2101,19 @@ impl PreviewEngine {
                 return note_wgpu_preview_failure(4, format!("source media is missing: {source}"));
             }
             let source_offset = clip.extra.get("sourceOffset").and_then(Value::as_f64).unwrap_or(0.0);
+            let props = clip.extra.get("props").unwrap_or(&Value::Null);
+            let speed = props.pointer("/transform/speed").and_then(Value::as_f64)
+                .unwrap_or(1.0).clamp(0.25, 4.0);
             let source_time = if let Some(duration) = transition_source_context.get(&clip.id) {
                 if frame_at < clip.start {
-                    transition_preroll_source_time(source_offset, *duration, frame_at - (clip.start - duration))
+                    transition_preroll_source_time(source_offset, *duration * speed, (frame_at - (clip.start - duration)) * speed)
                 } else {
-                    transition_postroll_source_offset(source_offset, *duration) + (frame_at - clip.start).max(0.0)
+                    transition_postroll_source_offset(source_offset, *duration * speed) + (frame_at - clip.start).max(0.0) * speed
                 }
             } else {
-                (source_offset + (frame_at - clip.start)).max(0.0)
+                (source_offset + (frame_at - clip.start) * speed).max(0.0)
             };
-            let remaining = (clip.end() - frame_at).max(0.0);
-            let props = clip.extra.get("props").unwrap_or(&Value::Null);
+            let remaining = (clip.end() - frame_at).max(0.0) * speed;
             let keyframes = clip.extra.get("keyframes").unwrap_or(&Value::Null);
             let transition = incoming_transitions.get(&clip.id).map(|(kind, duration)| {
                 (kind.as_str(), ((frame_at - (clip.start - duration)) / duration.max(1e-9)) as f32)

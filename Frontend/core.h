@@ -330,7 +330,8 @@ static int   gResize;                                 /* cursor: 0 normal, 1 hor
 /* values */
 static float gNum[4] = {0, 0, 100, 100};              /* X, Y, W, H */
 static float gMini[8];                                /* crop/distort numeric fields */
-static float gRot, gRotT; static bool gRotDrag;       /* degrees -180..180 */
+static float gRot, gRotT; static bool gRotDrag;
+static float gSpeed = 1.0f;       /* playback multiplier: 0.25x..10x */
 #define NSL 48
 static float gSl[NSL], gSlT[NSL]; static bool gSlDrag[NSL]; /* slider 0..1 (0 = opacity, 40/41 = fades) */
 static Vector2 gWh[3], gWhT[3]; static bool gWhDrag[3], gWhResetPending[3]; /* wheel puck, unit disk */

@@ -193,6 +193,7 @@ static void PlutoHydrateInspector(const char *clipBegin, const char *clipEnd) {
     gNum[2] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.scale.w", 100.f);
     gNum[3] = PlutoReadNumber(clipBegin, clipEnd, "props.transform.scale.h", 100.f);
     gRot = gRotT = PlutoReadNumber(clipBegin, clipEnd, "props.transform.rotation", 0.f);
+    gSpeed = fmaxf(0.25f, fminf(10.0f, PlutoReadNumber(clipBegin, clipEnd, "props.transform.speed", 1.0f)));
     gSl[0] = gSlT[0] = fmaxf(0.f, fminf(1.f, PlutoReadNumber(clipBegin, clipEnd, "props.transform.opacity", 100.f) / 100.f));
     PlutoApplyKeyframeValues();
     gLink[0] = false; gLink[1] = true; gLink[2] = false; gLink[3] = false;
@@ -973,7 +974,26 @@ static void TransformView(void) {
             CLAY(sid, {.layout = {.sizing = {GROW, FIX(26)}},
                        .custom = {.customData = NC(K_SLIDER, RGB(38, 39, 43), RGB(150, 152, 160), C_CARD, gSl[0], (b.hover + (gSlDrag[0] ? 1.f : 0.f)) * 1.5f, 1)}}) {}
         }
-        CLAY_AUTO_ID({.layout = {.sizing = {GROW, CLAY_SIZING_GROW(10)}}}) {}   /* min 10px, grows when the window is taller */
+        /* Playback speed sits directly below Opacity; Crop/Distort remain lower. */
+        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 7}}) {
+            CLAY_AUTO_ID({.layout = {.sizing = {GROW, FIX(28)}, .childAlignment = AL_Y}}) {
+                Tx("Speed", 18, C_TEXT, 0);
+                HSPACE
+                float speedValue = gSpeed;
+                Clay_ElementId speedValueId = CLAY_ID("SpeedValue");
+                if (ValBoxEditable(speedValueId, &speedValue, "x", 76, 27, 16, 13, 8, 0.25f, 10.0f, 2)) {
+                    gSpeed = speedValue;
+                    PlutoTimelineSetProperty("props.transform.speed", speedValue);
+                    gPreviewDirty = true;
+                }
+                if (gValueDragging && gValueDragId == speedValueId.id) {
+                    gSpeed = speedValue;
+                    PlutoTimelineSetPropertyLive("props.transform.speed", speedValue);
+                    gPreviewDirty = true;
+                }
+            }
+        }
+        CLAY_AUTO_ID({.layout = {GROW, CLAY_SIZING_GROW(10)}}) {}   /* min 10px, grows when the window is taller */
         NavSection();
         GAPY(26)
     }
