@@ -257,7 +257,11 @@ impl Timeline {
         if needs_ripple && self.magnetic {
             self.ripple_lane_after(&id)?;
         }
-        if !subtitle && self.magnetic {
+        // A title only participates in the shared video compaction pass when
+        // its requested video lane already had ordinary clips. Otherwise a
+        // title dropped onto an empty lane must retain the playhead time; lower
+        // video-row cuts are not valid placement anchors for that title lane.
+        if !subtitle && self.magnetic && (!title || lane_has_content) {
             self.compact_lane_kind(requested_track, &HashSet::new(), title);
         }
         self.refresh_duration();
