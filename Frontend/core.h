@@ -227,6 +227,16 @@ static Rectangle gTextFontPickerRect, gTextFontMenuRect;
 static float gTextFontMenuScroll;
 static bool gTextIsSubtitle;
 static bool gSubtitleCardOpen;
+static bool gSubtitleModelManagerOpen;
+typedef struct {
+    bool installed;
+    bool downloading;
+    float progress;
+    uint64_t requestId;
+    int state; /* 0 idle, 1 queued/downloading, 2 verifying, 3 complete, 4 cancelled, 5 error */
+    char detail[128];
+} StellaWhisperModelUi;
+static StellaWhisperModelUi gWhisperModels[3];
 static char gTextSubtitleSourceId[64];
 static double gTextCaretT;
 static double gTextFocusStartedAt;

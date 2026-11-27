@@ -7,6 +7,7 @@ use pluto_timeline_core::{Clip, Timeline, TrackId};
 use serde_json::{json, Value};
 mod decoder;
 mod filters;
+mod models;
 mod renderer;
 use decoder::{DecodedFrame, DecoderPool};
 use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms, SharedGlPreviewFrame};
@@ -39,6 +40,8 @@ struct Backend {
     preview_task_txs: Vec<Sender<(u64, Value)>>,
     preview_next_worker: AtomicU64,
     proxy_task_tx: Sender<(u64, Value)>,
+    model_task_tx: Sender<(u64, String, Arc<std::sync::atomic::AtomicBool>)>,
+    model_cancellations: Arc<Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>>,
     event_rx: Mutex<Receiver<String>>,
     preview_inflight: Arc<AtomicUsize>,
 }
@@ -508,7 +511,11 @@ fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
         let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
+        let (model_task_tx, model_task_rx) = mpsc::channel::<(u64, String, Arc<std::sync::atomic::AtomicBool>)>();
+        let model_cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let model_cancel_worker = Arc::clone(&model_cancellations);
         let (event_tx, event_rx) = mpsc::channel::<String>();
+        let model_events = event_tx.clone();
         let preview_inflight = Arc::new(AtomicUsize::new(0));
         let (preview_completion_tx, preview_completion_rx) = mpsc::channel::<PendingPreview>();
         let completion_events = event_tx.clone();
@@ -539,6 +546,10 @@ fn backend() -> &'static Backend {
             .name("stella-proxy-worker".into())
             .spawn(move || proxy_worker(proxy_task_rx, proxy_events))
             .expect("failed to start Stella proxy worker");
+        thread::Builder::new()
+            .name("stella-model-download-worker".into())
+            .spawn(move || models::model_worker(model_task_rx, model_events, model_cancel_worker))
+            .expect("failed to start Stella model download worker");
         Backend {
             timeline: Mutex::new(Timeline::default()),
             property_edit: Mutex::new(None),
@@ -549,6 +560,8 @@ fn backend() -> &'static Backend {
             preview_task_txs,
             preview_next_worker: AtomicU64::new(0),
             proxy_task_tx,
+            model_task_tx,
+            model_cancellations,
             event_rx: Mutex::new(event_rx),
             preview_inflight,
         }
@@ -2285,6 +2298,9 @@ impl PreviewEngine {
 }
 
 fn dispatch(request: Value) -> Result<Value, String> {
+    if request["command"].as_str() == Some("models_status") {
+        return models::model_status();
+    }
     let backend = backend();
     let mut timeline = backend
         .timeline
@@ -2828,6 +2844,29 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
         };
         let backend = backend();
         let command = request["command"].as_str().unwrap_or_default().to_owned();
+        if command == "cancel_model_download" {
+            let download_id = request["downloadId"].as_u64().unwrap_or(0);
+            if let Ok(active) = backend.model_cancellations.lock() {
+                if let Some(cancel) = active.get(&download_id) {
+                    cancel.store(true, Ordering::Release);
+                }
+            }
+            return download_id;
+        }
+        if command == "download_model" {
+            let tier = request["tier"].as_str().unwrap_or_default();
+            if models::model_for_tier(tier).is_none() { return 0; }
+            let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Ok(mut active) = backend.model_cancellations.lock() {
+                active.insert(id, Arc::clone(&cancel));
+            } else { return 0; }
+            if backend.model_task_tx.send((id, tier.to_owned(), cancel)).is_ok() {
+                return id;
+            }
+            if let Ok(mut active) = backend.model_cancellations.lock() { active.remove(&id); }
+            return 0;
+        }
         let is_preview = command == "preview_frame";
         if is_preview {
             let mut current = backend.preview_inflight.load(Ordering::Acquire);

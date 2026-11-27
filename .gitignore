@@ -2,3 +2,8 @@
 # WGPU/WGL interop checkout and generated Cargo patch config
 Backend/.interop/
 .cargo/config.toml
+
+# Whisper model weights are downloaded to per-user application data.
+ML/*.bin
+ML/*.part
+*.ggml.part

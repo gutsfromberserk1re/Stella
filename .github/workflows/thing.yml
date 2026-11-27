@@ -239,6 +239,14 @@ jobs:
           The FFmpeg command-line tools bundled in the full package are distributed separately and have their own GPL notices.
           '@ | Set-Content -LiteralPath (Join-Path $decoderDir 'THIRD_PARTY_NOTICES.txt') -Encoding UTF8
 
+      - name: Package third-party model notices (no model weights)
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath WHISPER_MODEL_NOTICES.md -Destination ci-build/out/dist/WHISPER_MODEL_NOTICES.md -Force
+          if (Get-ChildItem -Path ci-build/out/dist -Filter 'ggml-*.bin' -Recurse -ErrorAction SilentlyContinue) {
+            throw 'Whisper model binaries must be downloaded by the user and must not be included in Stella artifacts.'
+          }
+
       - name: Package UI icons
         shell: pwsh
         run: |

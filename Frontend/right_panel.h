@@ -2967,6 +2967,59 @@ static void DrawTextFontMenuOverlay(void) {
     EndScissorMode();
 }
 
+static void SubtitleModelRow(int index) {
+    static const char *labels[3] = {"Performance", "Balanced", "Quality"};
+    static const char *models[3] = {"Base Q8_0 · fastest · 78 MiB", "Small Q8_0 · balanced · 252 MiB", "Medium Q5_0 · best accuracy · 514 MiB"};
+    if (index < 0 || index >= 3) return;
+    StellaWhisperModelUi *model = &gWhisperModels[index];
+    Clay_ElementId rowId = CLAY_IDI("SubtitleModelRow", index);
+    CLAY(rowId, {.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(model->downloading ? 57 : 49)},
+                            .padding = {9, 9, 8, 8}, .childAlignment = AL_Y, .childGap = 8},
+                           .backgroundColor = RGB(29, 30, 34), .cornerRadius = CLAY_CORNER_RADIUS(9),
+                           .border = {.color = Mix(C_RCARDB, C_TEXT, model->installed ? .17f : .05f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+        CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 3}}) {
+            Tx(labels[index], 13.f, C_TEXT, 1);
+            Tx(models[index], 10.5f, C_MUTED, 0);
+            if (model->downloading) {
+                const char *status = model->state == 2 ? "Verifying model…" :
+                                     model->progress > 0.f ? Fmt("Downloading · %.0f%%", model->progress * 100.f) :
+                                     "Preparing download…";
+                Tx(status, 10.f, C_DIM, 0);
+            } else if (model->installed) {
+                Tx("Downloaded and ready", 10.f, C_DIM, 0);
+            } else if (model->state == 4) {
+                Tx("Cancelled · partial download kept", 10.f, C_MUTED, 0);
+            } else if (model->state == 5 && model->detail[0]) {
+                Tx(Fmt("%.70s", model->detail), 10.f, RGB(220, 150, 140), 0);
+            }
+        }
+        Clay_ElementId actionId = CLAY_IDI("SubtitleModelAction", index);
+        Bs action = Interact(actionId);
+        const char *actionText = model->downloading ? "Cancel" : model->installed ? "Downloaded" : "Download";
+        Clay_Color actionColor = model->downloading ? RGB(75, 48, 48) : model->installed ? RGB(39, 67, 54) : RGB(46, 61, 88);
+        if (action.clicked) {
+            if (model->downloading) PlutoWhisperModelCancel(index);
+            else if (!model->installed) PlutoWhisperModelStart(index);
+        }
+        CLAY(actionId, {.layout = {.sizing = {FIX(76), FIX(30)}, .childAlignment = AL_C},
+                        .backgroundColor = BtnBg(actionColor, RGB(62, 65, 73), action),
+                        .cornerRadius = CLAY_CORNER_RADIUS(8),
+                        .border = {.color = Mix(actionColor, C_TEXT, action.hover * .18f), .width = CLAY_BORDER_OUTSIDE(1)}}) {
+            Tx(actionText, 10.5f, model->installed ? RGB(153, 213, 171) : C_TEXT, 1);
+        }
+    }
+    if (model->downloading) {
+        CLAY(CLAY_IDI("SubtitleModelProgressTrack", index), {.layout = {.sizing = {GROW, FIX(4)}},
+                                                             .backgroundColor = RGB(43, 44, 49),
+                                                             .cornerRadius = CLAY_CORNER_RADIUS(2)}) {
+            int width = (int)fmaxf(2.f, 200.f * fminf(1.f, fmaxf(0.f, model->progress)));
+            CLAY(CLAY_IDI("SubtitleModelProgressFill", index), {.layout = {.sizing = {FIX(width), GROW}},
+                                                                .backgroundColor = C_ACCENT,
+                                                                .cornerRadius = CLAY_CORNER_RADIUS(2)}) {}
+        }
+    }
+}
+
 static void TextView(void) {
     /* A selected title owns its own open colour editor. Do not carry an open
        wheel across clips when the user changes selection in the timeline. */
@@ -2979,8 +3032,8 @@ static void TextView(void) {
         TextColorEditorReset();
     }
 
-    /* Subtitle creation is intentionally deferred. The card stays visible as a
-       future entry point; existing subtitle clips continue to use the S lane. */
+    /* Model downloads are available here; speech recognition and cue insertion
+       remain a separate follow-up integration. Existing subtitle clips keep using S. */
     int subtitleCount = 0;
     for (int i = 0; i < gTimelineClipCount; i++)
         if (gTimelineClips[i].isSubtitle) subtitleCount++;
@@ -2999,19 +3052,37 @@ static void TextView(void) {
                                                   .cornerRadius = {0.f, 0.f, 16.f, 16.f}}) {
                 CLAY_AUTO_ID({.layout = {COLM, .sizing = {GROW, FIT}, .childGap = 4}}) {
                     Tx(subtitleCount ? Fmt("%d subtitle cues", subtitleCount) : "No subtitles yet", 13.5f, C_TEXT, 0);
-                    Tx(subtitleCount ? "Existing captions on the timeline" : "Subtitle creation is coming soon", 11.5f, C_MUTED, 0);
+                    Tx(subtitleCount ? "Existing captions on the timeline" : "Choose a Whisper model for offline transcription", 11.5f, C_MUTED, 0);
                 }
                 HSPACE
                 Clay_ElementId addSubtitle = CLAY_ID("SubtitleGenerateButton");
                 Bs addHover = Interact(addSubtitle);
-                if (addHover.clicked)
-                    strcpy(gBackendMessage, "Subtitle creation will be added in a later update");
+                if (addHover.clicked) {
+                    gSubtitleModelManagerOpen = !gSubtitleModelManagerOpen;
+                    if (gSubtitleModelManagerOpen) PlutoWhisperModelsRefresh();
+                }
                 CLAY(addSubtitle, {.layout = {.sizing = {FIX(42), FIX(42)}, .childAlignment = AL_C},
                                    .backgroundColor = BtnBg(C_RCARDB, RGB(54, 56, 63), addHover),
                                    .cornerRadius = CLAY_CORNER_RADIUS(13),
                                    .border = {.color = Mix(C_RCARDB, C_TEXT, addHover.hover * .22f),
                                               .width = CLAY_BORDER_OUTSIDE(1)}}) {
                     Icon(I_PLUS, 19, C_TEXT);
+                }
+            }
+            if (gSubtitleModelManagerOpen) {
+                CLAY(CLAY_ID("SubtitleModelManager"), {.layout = {COLM, .sizing = {GROW, FIT}, .padding = {10, 10, 10, 10}, .childGap = 7},
+                                                        .backgroundColor = RGB(20, 21, 24),
+                                                        .cornerRadius = CLAY_CORNER_RADIUS(12),
+                                                        .border = {.color = C_RCARDB, .width = CLAY_BORDER_OUTSIDE(1)}}) {
+                    CLAY_AUTO_ID({.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {GROW, FIX(23)}, .childAlignment = AL_Y}}) {
+                        Tx("Whisper models", 13.f, C_TEXT, 1);
+                        HSPACE
+                        Tx("All models are optional downloads", 10.f, C_MUTED, 0);
+                    }
+                    SubtitleModelRow(0);
+                    SubtitleModelRow(1);
+                    SubtitleModelRow(2);
+                    Tx("Models are saved in your user data folder and remain installed after Stella updates.", 10.f, C_MUTED, 0);
                 }
             }
             if (subtitleCount > 0) {

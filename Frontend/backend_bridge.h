@@ -1187,12 +1187,93 @@ static bool PlutoTimelineHistory(bool redo) {
     return okay;
 }
 
+static const char *PlutoWhisperTierName(int index) {
+    static const char *tiers[3] = {"performance", "balanced", "quality"};
+    return index >= 0 && index < 3 ? tiers[index] : "performance";
+}
+
+static void PlutoWhisperModelsRefresh(void) {
+    if (!gBackend.request || !gBackend.release) return;
+    char *response = gBackend.request("{\"command\":\"models_status\"}");
+    if (!response) return;
+    if (strstr(response, "\"ok\":true")) {
+        static const char *keys[3] = {"performanceInstalled", "balancedInstalled", "qualityInstalled"};
+        for (int i = 0; i < 3; i++) {
+            char token[64];
+            snprintf(token, sizeof(token), "\"%s\":true", keys[i]);
+            gWhisperModels[i].installed = strstr(response, token) != NULL;
+        }
+    } else {
+        PlutoJsonString(response, "error", gBackendMessage, sizeof(gBackendMessage));
+    }
+    gBackend.release(response);
+}
+
+static void PlutoWhisperModelStart(int index) {
+    if (index < 0 || index >= 3 || !gBackend.submit) return;
+    char request[128];
+    snprintf(request, sizeof(request), "{\"command\":\"download_model\",\"tier\":\"%s\"}", PlutoWhisperTierName(index));
+    uint64_t id = gBackend.submit(request);
+    if (!id) {
+        strcpy(gBackendMessage, "Could not queue model download");
+        return;
+    }
+    gWhisperModels[index].downloading = true;
+    gWhisperModels[index].progress = 0.f;
+    gWhisperModels[index].requestId = id;
+    gWhisperModels[index].state = 1;
+    snprintf(gWhisperModels[index].detail, sizeof(gWhisperModels[index].detail), "Queued");
+    gBackendMessage[0] = 0;
+}
+
+static void PlutoWhisperModelCancel(int index) {
+    if (index < 0 || index >= 3 || !gBackend.submit || !gWhisperModels[index].requestId) return;
+    char request[128];
+    snprintf(request, sizeof(request), "{\"command\":\"cancel_model_download\",\"downloadId\":%llu}",
+             (unsigned long long)gWhisperModels[index].requestId);
+    (void)gBackend.submit(request);
+    snprintf(gWhisperModels[index].detail, sizeof(gWhisperModels[index].detail), "Cancelling…");
+}
+
 static void PlutoPollBackend(void) {
     if (!gBackend.poll) return;
     for (int i = 0; i < 16; i++) {
         char *event = gBackend.poll();
         if (!event) break;
-        if (strstr(event, "\"command\":\"preview_frame\"")) {
+        if (strstr(event, "\"command\":\"model_download\"")) {
+            char tier[32] = {0}, state[32] = {0}, detail[128] = {0};
+            double requestId = 0.0, percent = 0.0;
+            PlutoJsonString(event, "tier", tier, sizeof(tier));
+            PlutoJsonString(event, "state", state, sizeof(state));
+            PlutoJsonString(event, "detail", detail, sizeof(detail));
+            PlutoJsonNumber(event, "requestId", &requestId);
+            bool hasPercent = PlutoJsonNumber(event, "percent", &percent);
+            int index = strcmp(tier, "performance") == 0 ? 0 :
+                        strcmp(tier, "balanced") == 0 ? 1 :
+                        strcmp(tier, "quality") == 0 ? 2 : -1;
+            if (index >= 0 && (uint64_t)requestId == gWhisperModels[index].requestId) {
+                StellaWhisperModelUi *model = &gWhisperModels[index];
+                if (state[0]) {
+                    if (strcmp(state, "downloading") == 0 || strcmp(state, "starting") == 0) {
+                        model->state = 1; model->downloading = true;
+                    } else if (strcmp(state, "verifying") == 0) {
+                        model->state = 2; model->downloading = true;
+                    } else if (strcmp(state, "complete") == 0) {
+                        model->state = 3; model->installed = true; model->downloading = false;
+                        model->progress = 1.f; model->requestId = 0;
+                    } else if (strcmp(state, "cancelled") == 0) {
+                        model->state = 4; model->downloading = false; model->requestId = 0;
+                    } else if (strcmp(state, "error") == 0) {
+                        model->state = 5; model->downloading = false; model->requestId = 0;
+                    }
+                }
+                if (hasPercent && percent >= 0.0 && percent <= 100.0) model->progress = (float)(percent / 100.0);
+                if (detail[0]) snprintf(model->detail, sizeof(model->detail), "%.127s", detail);
+                if (strcmp(state, "error") == 0 && detail[0]) snprintf(gBackendMessage, sizeof(gBackendMessage), "%.255s", detail);
+                else if (strcmp(state, "complete") == 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "%s model ready", index == 0 ? "Performance" : index == 1 ? "Balanced" : "Quality");
+                else if (strcmp(state, "cancelled") == 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "Model download cancelled");
+            }
+        } else if (strstr(event, "\"command\":\"preview_frame\"")) {
             double requestId = 0.0;
             StellaPreviewRequest completedRequest = {0};
             bool matchingRequest = PlutoJsonNumber(event, "requestId", &requestId) &&
