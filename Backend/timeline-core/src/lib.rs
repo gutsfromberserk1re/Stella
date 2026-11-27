@@ -158,6 +158,19 @@ fn clip_is_subtitle(clip: &Clip) -> bool {
         .unwrap_or(false)
 }
 
+/// Text created by the UI is placed as an overlay in a free video lane. It is
+/// still a regular title/image clip, but its initial placement must not be
+/// magnetically pulled onto cuts from the underlying video sequence.
+fn clip_uses_free_title_placement(clip: &Clip) -> bool {
+    clip_is_title(clip)
+        && !clip_is_subtitle(clip)
+        && clip.extra.get("props")
+            .and_then(|props| props.get("text"))
+            .and_then(|text| text.get("freePlacement"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn shift_clip_keyframes(clip: &mut Clip, delta: f64) {
     if !delta.is_finite() || delta.abs() <= EPSILON {
         return;
@@ -207,17 +220,18 @@ impl Timeline {
 
         let subtitle = clip_is_subtitle(&clip);
         let title = clip_is_title(&clip);
+        let free_title = clip_uses_free_title_placement(&clip);
         let requested_track = clip.track;
         let same_destination_sequence = |current: &Clip| {
             !clip_is_subtitle(current)
                 && (if title { current.track == requested_track && !clip_is_title(current) }
                     else { same_magnetic_lane(current.track, requested_track) && !clip_is_title(current) })
         };
-        let mut lane_has_content = self.clips.iter().any(same_destination_sequence);
+        let mut lane_has_content = !free_title && self.clips.iter().any(same_destination_sequence);
 
         /* V1-V6 share one magnetic video storyline. Audio rows remain independent.
            Compact legacy gaps before choosing the global video cut. */
-        if !subtitle && self.magnetic && lane_has_content {
+        if !subtitle && !free_title && self.magnetic && lane_has_content {
             self.compact_lane_kind(requested_track, &HashSet::new(), title);
             lane_has_content = self.clips.iter().any(same_destination_sequence);
         }
@@ -237,7 +251,7 @@ impl Timeline {
             shift_clip_keyframes(&mut clip, keyframe_delta);
         }
 
-        if !subtitle && self.magnetic && lane_has_content {
+        if !subtitle && !free_title && self.magnetic && lane_has_content {
             let lane_cut = self.magnetic_start(&clip.id, clip.start, clip.duration, clip.track, None, title);
             /* A cross-row snap remains valid only when it is also a cut point
                on this row; otherwise it would leave a gap in the destination. */
@@ -247,11 +261,11 @@ impl Timeline {
                 let keyframe_delta = clip.start - previous_start;
                 shift_clip_keyframes(&mut clip, keyframe_delta);
             }
-        } else if !subtitle && self.magnetic && !snapped_to_another_lane {
+        } else if !subtitle && self.magnetic && !free_title && !snapped_to_another_lane {
             clip.start = clip.start.max(0.0);
         }
 
-        let needs_ripple = !subtitle && self.lane_overlaps(&clip.id, clip.track, clip.start, clip.duration);
+        let needs_ripple = !subtitle && !free_title && self.lane_overlaps(&clip.id, clip.track, clip.start, clip.duration);
         let id = clip.id.clone();
         self.clips.push(clip);
         if needs_ripple && self.magnetic {
@@ -261,7 +275,7 @@ impl Timeline {
         // its requested video lane already had ordinary clips. Otherwise a
         // title dropped onto an empty lane must retain the playhead time; lower
         // video-row cuts are not valid placement anchors for that title lane.
-        if !subtitle && self.magnetic && (!title || lane_has_content) {
+        if !subtitle && !free_title && self.magnetic && (!title || lane_has_content) {
             self.compact_lane_kind(requested_track, &HashSet::new(), title);
         }
         self.refresh_duration();
@@ -611,7 +625,7 @@ impl Timeline {
 
         let left_id = left.id.clone();
         let right_id = right.id.clone();
-        if self.magnetic && !clip_is_subtitle(&left) {
+        if self.magnetic && !clip_is_subtitle(&left) && !clip_uses_free_title_placement(&left) {
             self.compact_lane(left.track, &HashSet::new());
         }
         self.refresh_duration();
@@ -1864,6 +1878,49 @@ mod tests {
             "the shared video sequence closes the vacated interval across rows");
         assert!((find("v3-b").start - 4.0).abs() < 1e-9,
             "the destination row remains correctly ordered after insertion");
+    }
+
+    #[test]
+    fn ui_text_uses_its_free_video_lane_position_without_rippling_media() {
+        let mut timeline = Timeline::default();
+        let mut before = video_clip("text-lane-before", 0.0, 2.0);
+        before.track = TrackId::V6;
+        let mut after = video_clip("text-lane-after", 6.0, 2.0);
+        after.track = TrackId::V6;
+        let mut lower = video_clip("lower-video", 0.0, 8.0);
+        lower.track = TrackId::V1;
+        timeline.clips.extend([before, after, lower]);
+
+        let mut title = video_clip("free-text", 3.0, 2.0);
+        title.track = TrackId::V6;
+        title.extra.insert("props".into(), serde_json::json!({
+            "text": {"isTitle": true, "freePlacement": true}
+        }));
+        timeline.add_clip(title).unwrap();
+
+        let find = |id: &str| timeline.clips.iter().find(|clip| clip.id == id).unwrap();
+        assert_eq!(find("free-text").track, TrackId::V6);
+        assert!((find("free-text").start - 3.0).abs() < 1e-9);
+        assert!((find("text-lane-after").start - 6.0).abs() < 1e-9);
+        assert!((find("lower-video").start - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn splitting_free_placed_text_does_not_compact_video_footage() {
+        let mut timeline = Timeline::default();
+        timeline.clips.push(video_clip("split-video-a", 0.0, 2.0));
+        timeline.clips.push(video_clip("split-video-b", 5.0, 2.0));
+        let mut title = video_clip("split-free-text", 3.0, 4.0);
+        title.track = TrackId::V6;
+        title.extra.insert("props".into(), serde_json::json!({
+            "text": {"isTitle": true, "freePlacement": true}
+        }));
+        timeline.clips.push(title);
+
+        timeline.split_clip("split-free-text", 5.0, "split-free-text-right".into()).unwrap();
+        let video_b = timeline.clips.iter().find(|clip| clip.id == "split-video-b").unwrap();
+        assert!((video_b.start - 5.0).abs() < 1e-9,
+            "splitting an overlay title must not close unrelated video gaps");
     }
 
     #[test]

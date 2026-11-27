@@ -905,6 +905,48 @@ static bool PlutoTimelineAddMedia(int mediaIndex, float start, int track) {
     return true;
 }
 
+static void PlutoResolveTextPlacement(float requestedStart, float duration, bool isSubtitle,
+                                      int *outTrack, float *outStart) {
+    int chosenTrack = TIMELINE_MAX_VIDEO_TRACKS - 1; /* V6 is the topmost video lane. */
+    float chosenStart = fmaxf(0.f, requestedStart);
+    if (isSubtitle) {
+        if (outTrack) *outTrack = chosenTrack;
+        if (outStart) *outStart = chosenStart;
+        return;
+    }
+
+    const float safeDuration = fmaxf(.05f, duration);
+    for (int track = TIMELINE_MAX_VIDEO_TRACKS - 1; track >= 0; track--) {
+        bool occupied = false;
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            const TimelineClipUi *other = &gTimelineClips[i];
+            if (other->isSubtitle || other->track != track) continue;
+            float otherEnd = other->start + other->duration;
+            if (chosenStart < otherEnd - .001f && chosenStart + safeDuration > other->start + .001f) {
+                occupied = true;
+                break;
+            }
+        }
+        if (!occupied) {
+            chosenTrack = track;
+            if (outTrack) *outTrack = chosenTrack;
+            if (outStart) *outStart = chosenStart;
+            return;
+        }
+    }
+
+    /* All six layers are busy for the requested interval. Append the text
+       after the last video clip rather than covering unrelated media. */
+    float videoEnd = 0.f;
+    for (int i = 0; i < gTimelineClipCount; i++) {
+        const TimelineClipUi *other = &gTimelineClips[i];
+        if (!other->isSubtitle && other->track >= 0 && other->track < TIMELINE_MAX_VIDEO_TRACKS)
+            videoEnd = fmaxf(videoEnd, other->start + other->duration);
+    }
+    if (outTrack) *outTrack = TIMELINE_MAX_VIDEO_TRACKS - 1;
+    if (outStart) *outStart = fmaxf(chosenStart, videoEnd);
+}
+
 static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, float start, float duration) {
     if (!path || !*path || !textJson || gTimelineClipCount >= MAX_TIMELINE_CLIPS) return false;
     char escapedPath[2048], id[64], request[8192];
@@ -918,17 +960,21 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
             if (strcmp(gTimelineClips[i].id, id) == 0) { idInUse = true; break; }
         }
     } while (idInUse);
+    int destinationTrack = TIMELINE_MAX_VIDEO_TRACKS - 1;
+    float destinationStart = fmaxf(0.f, start);
+    PlutoResolveTextPlacement(destinationStart, duration, isSubtitle, &destinationTrack, &destinationStart);
     int n = snprintf(request, sizeof(request),
-        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"v6\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
-        id, fmaxf(0.f, start), fmaxf(.05f, duration), isSubtitle ? "Subtitle" : "Title", escapedPath, fmaxf(.05f, duration), textJson);
+        "{\"command\":\"timeline_add_clip\",\"clip\":{\"id\":\"%s\",\"track\":\"%s\",\"start\":%.4f,\"dur\":%.4f,\"label\":\"%s\",\"path\":\"%s\",\"kind\":\"image\",\"hasAudio\":false,\"sourceOffset\":0,\"sourceDuration\":%.4f,\"props\":{\"text\":%s}}}",
+        id, PlutoTrackName(destinationTrack), destinationStart, fmaxf(.05f, duration),
+        isSubtitle ? "Subtitle" : "Title", escapedPath, fmaxf(.05f, duration), textJson);
     if (n <= 0 || (size_t)n >= sizeof(request) || !PlutoTimelineCall(request)) return false;
     int createdIndex = -1;
     for (int i = 0; i < gTimelineClipCount; i++) {
         if (strcmp(gTimelineClips[i].id, id) == 0) { createdIndex = i; break; }
     }
-    /* A successful backend response should include the new V6 title. Refresh
-       once if the frontend snapshot lagged, rather than silently leaving the
-       user with a title that exists in Rust but is not visible/selectable. */
+    /* A successful backend response should include the new text clip. Refresh
+       once if the frontend snapshot lagged, rather than silently leaving it
+       present in Rust but not visible/selectable. */
     if (createdIndex < 0 && PlutoTimelineCall("{\"command\":\"timeline_get\"}")) {
         for (int i = 0; i < gTimelineClipCount; i++) {
             if (strcmp(gTimelineClips[i].id, id) == 0) { createdIndex = i; break; }
@@ -939,7 +985,7 @@ static bool PlutoTimelineAddTitleClip(const char *path, const char *textJson, fl
         return false;
     }
     PlutoTimelineSelect(createdIndex);
-    gTimelinePendingVideoTrack = 5;
+    gTimelinePendingVideoTrack = isSubtitle ? -1 : destinationTrack;
     gRightTab = 3;
     gTextTitleSelected = true;
     gPreviewDirty = true;

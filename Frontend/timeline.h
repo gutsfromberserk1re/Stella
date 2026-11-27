@@ -569,7 +569,7 @@ static float TimelineMagneticStart(float start, float duration, int targetTrack,
 
 static const char *TimelineTrackLabel(int track) {
     static const char *labels[] = {"V1", "V2", "V3", "V4", "V5", "V6", "A1", "A2", "A3", "A4", "A5", "A6"};
-    if (track == TIMELINE_SUBTITLE_TRACK) return "S";
+    if (track == TIMELINE_SUBTITLE_TRACK) return "SUB";
     int last = TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS - 1;
     return labels[track < 0 ? 0 : track > last ? last : track];
 }
@@ -747,6 +747,40 @@ static bool TimelineKeyframeAtPointer(Vector2 mouse) {
     return false;
 }
 
+/* Add an edit at the playhead without requiring a second click on a clip.
+   Snapshot clip IDs because each split refreshes/reorders the Rust timeline. */
+static int TimelineCutAtPlayhead(bool includeVideo, bool includeAudio) {
+    char splitIds[MAX_TIMELINE_CLIPS][64];
+    int splitCount = 0;
+    for (int i = 0; i < gTimelineClipCount && splitCount < MAX_TIMELINE_CLIPS; i++) {
+        const TimelineClipUi *clip = &gTimelineClips[i];
+        bool isVideo = TimelineTrackIsVideo(clip->track);
+        bool isAudio = TimelineTrackIsAudio(clip->track);
+        if ((!isVideo || !includeVideo) && (!isAudio || !includeAudio)) continue;
+        /* The video half of a linked pair already splits its audio partner. */
+        if (includeVideo && includeAudio && isAudio && clip->linkedId[0]) continue;
+        if (gPlayhead <= clip->start + .001f ||
+            gPlayhead >= clip->start + clip->duration - .001f) continue;
+        snprintf(splitIds[splitCount++], sizeof(splitIds[0]), "%s", clip->id);
+    }
+
+    int splitDone = 0;
+    for (int n = 0; n < splitCount; n++) {
+        for (int i = 0; i < gTimelineClipCount; i++) {
+            TimelineClipUi *clip = &gTimelineClips[i];
+            if (strcmp(clip->id, splitIds[n]) != 0) continue;
+            bool isVideo = TimelineTrackIsVideo(clip->track);
+            bool isAudio = TimelineTrackIsAudio(clip->track);
+            if ((!isVideo || !includeVideo) && (!isAudio || !includeAudio)) break;
+            if (gPlayhead > clip->start + .001f &&
+                gPlayhead < clip->start + clip->duration - .001f &&
+                PlutoTimelineSplit(i, gPlayhead)) splitDone++;
+            break;
+        }
+    }
+    return splitDone;
+}
+
 static int TimelineClipStartCompare(const void *left, const void *right) {
     int a = *(const int *)left, b = *(const int *)right;
     float delta = gTimelineClips[a].start - gTimelineClips[b].start;
@@ -767,7 +801,7 @@ static void TimelineClipLane(int track, float height) {
         return;
     }
     float pps = TimelinePps();
-    if ((gTimelineTool == 2 || gTimelineTool == 4) && Clay_PointerOver(laneId)) gCross = true;
+    if (gTimelineTool == 2 && Clay_PointerOver(laneId)) gCross = true;
     bool transitionPressed = false;
     int order[MAX_TIMELINE_CLIPS], count = 0;
     for (int i = 0; i < gTimelineClipCount; i++) {
@@ -1059,9 +1093,8 @@ static void TimelineClipLane(int track, float height) {
                     gMediaDropPreviewMedia = -1;
                 }
             }
-            if (b.clicked && (gTimelineTool == 2 || gTimelineTool == 4)) {
-                float cutAt = gTimelineTool == 4 ? gPlayhead :
-                    (GetMousePosition().x - lane.x - gTimelinePan) / pps;
+            if (b.clicked && gTimelineTool == 2) {
+                float cutAt = (GetMousePosition().x - lane.x - gTimelinePan) / pps;
                 bool insideClip = cutAt > gTimelineClips[i].start + .001f &&
                     cutAt < gTimelineClips[i].start + gTimelineClips[i].duration - .001f;
                 double now = GetTime();
@@ -1494,8 +1527,14 @@ static void Timeline(void) {
         CLAY(CLAY_ID("TlBar"), {.layout = {.sizing = {GROW, FIX(56)}, .padding = {14, 12, 0, 0}, .childGap = 4, .childAlignment = AL_Y}}) {
             if (IconBtn(CLAY_ID("ToolPtr"), I_POINTER, 36, 18, C_TEXT, gTimelineTool == 0, 9)) { gTimelineTool = 0; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
             if (IconBtn(CLAY_ID("ToolHand"), I_HAND, 36, 18, C_DIM, gTimelineTool == 1, 9)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
-            if (IconBtn(CLAY_ID("ToolCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
-            if (IconBtn(CLAY_ID("ToolPlayheadCut"), I_SCISSORS, 36, 18, C_DIM, gTimelineTool == 4, 9)) { gTimelineTool = 4; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+            if (IconBtn(CLAY_ID("ToolCut"), I_BLADE, 36, 18, C_DIM, gTimelineTool == 2, 9)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
+            if (IconBtn(CLAY_ID("ToolPlayheadCut"), I_PLAYHEAD_CUT, 36, 18, C_DIM, false, 9)) {
+                gTimelineTool = 0;
+                gTextInputFocused = false;
+                gTextFocusStartedAt = 0.0;
+                PlutoTimelineEndPropertyEdit();
+                TimelineCutAtPlayhead(true, true);
+            }
             if (IconBtn(CLAY_ID("ToolText"), I_TEXT, 36, 18, C_DIM, gTimelineTool == 3, 9)) {
                 gTimelineTool = 3;
                 gRightTab = 3;

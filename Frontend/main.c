@@ -902,7 +902,6 @@ int main(void) {
                 if (IsKeyPressed(KEY_V)) { gTimelineTool = 0; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_H)) { gTimelineTool = 1; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_C)) { gTimelineTool = 2; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
-                if (IsKeyPressed(KEY_K) && !gShiftDown) { gTimelineTool = 4; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_T)) { gTimelineTool = 3; gRightTab = 3; gTextInputFocused = false; gTextFocusStartedAt = 0.0; }
                 if (IsKeyPressed(KEY_S)) PlutoTimelineSnap(!gTimelineSnap);
             }
@@ -910,34 +909,13 @@ int main(void) {
         bool kPressed = IsKeyPressed(KEY_K);
         bool kShift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         bool kCtrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && kPressed && (kShift || kCtrl)) {
-            /* Snapshot IDs before editing: the Rust timeline mutates and reorders
-               its clip array after each split, so indexes are not stable here. */
-            char splitIds[MAX_TIMELINE_CLIPS][64];
-            int splitTracks[MAX_TIMELINE_CLIPS], splitCount = 0;
-            for (int i = 0; i < gTimelineClipCount && splitCount < MAX_TIMELINE_CLIPS; i++) {
-                int track = gTimelineClips[i].track;
-                bool include = kCtrl && kShift ? (TimelineTrackIsVideo(track) || TimelineTrackIsAudio(track)) :
-                               kCtrl ? TimelineTrackIsAudio(track) : TimelineTrackIsVideo(track);
-                /* A linked pair is split atomically by the video half. Do not
-                   queue its audio half a second time in the all-track command. */
-                if (kCtrl && kShift && TimelineTrackIsAudio(track) && gTimelineClips[i].linkedId[0]) continue;
-                if (!include || gPlayhead <= gTimelineClips[i].start + .001f ||
-                    gPlayhead >= gTimelineClips[i].start + gTimelineClips[i].duration - .001f) continue;
-                snprintf(splitIds[splitCount], sizeof(splitIds[splitCount]), "%s", gTimelineClips[i].id);
-                splitTracks[splitCount++] = track;
-            }
-            for (int n = 0; n < splitCount; n++) {
-                for (int i = 0; i < gTimelineClipCount; i++) {
-                    if (strcmp(gTimelineClips[i].id, splitIds[n]) == 0 &&
-                        gTimelineClips[i].track == splitTracks[n] &&
-                        gPlayhead > gTimelineClips[i].start + .001f &&
-                        gPlayhead < gTimelineClips[i].start + gTimelineClips[i].duration - .001f) {
-                        PlutoTimelineSplit(i, gPlayhead);
-                        break;
-                    }
-                }
-            }
+        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && kPressed) {
+            /* Plain K cuts every clip under the playhead. Shift+K scopes to
+               video, Ctrl+K to audio, and Ctrl+Shift+K to both. */
+            bool includeVideo = !kCtrl || kShift;
+            bool includeAudio = !kShift || kCtrl;
+            TimelineCutAtPlayhead(includeVideo, includeAudio);
+            gTimelineTool = 0;
         }
         if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
             gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {

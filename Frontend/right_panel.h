@@ -2121,12 +2121,26 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
         snprintf(folder, sizeof(folder), "%s\\Titles", parent) >= (int)sizeof(folder)) return false;
     CreateDirectoryA(parent, NULL);
     CreateDirectoryA(folder, NULL);
+    DWORD folderAttributes = GetFileAttributesA(folder);
+    if (folderAttributes == INVALID_FILE_ATTRIBUTES || !(folderAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        DWORD tempLength = GetTempPathA((DWORD)sizeof(root), root);
+        if (!tempLength || tempLength >= sizeof(root)) return false;
+        size_t rootLength = strlen(root);
+        while (rootLength > 0 && (root[rootLength - 1] == '\\' || root[rootLength - 1] == '/'))
+            root[--rootLength] = 0;
+        if (snprintf(parent, sizeof(parent), "%s\\Stella", root) >= (int)sizeof(parent) ||
+            snprintf(folder, sizeof(folder), "%s\\Titles", parent) >= (int)sizeof(folder)) return false;
+        CreateDirectoryA(parent, NULL);
+        CreateDirectoryA(folder, NULL);
+        folderAttributes = GetFileAttributesA(folder);
+        if (folderAttributes == INVALID_FILE_ATTRIBUTES || !(folderAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    }
 
     if (clipId && *clipId) {
         char slots[4][MAX_PATH];
         unsigned long long hash = PlutoTextPathHash(clipId);
         for (int i = 0; i < 4; i++)
-            if (snprintf(slots[i], sizeof(slots[i]), "%s\\title-%016llx-%d.tga", folder, hash, i) >= (int)sizeof(slots[i])) return false;
+            if (snprintf(slots[i], sizeof(slots[i]), "%s\\title-%016llx-%d.png", folder, hash, i) >= (int)sizeof(slots[i])) return false;
         /* Preview decode is asynchronous. Protect any title image currently
            being read and write edits into a different slot. */
         const char *chosen = NULL;
@@ -2143,17 +2157,17 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
     /* New titles receive a unique file so they cannot overwrite another clip. */
     char temporary[MAX_PATH];
     if (!GetTempFileNameA(folder, "stl", 0, temporary)) return false;
-    DeleteFileA(temporary); /* ExportImage creates the final TGA. */
+    DeleteFileA(temporary); /* ExportImage creates the final PNG. */
     char *extension = strrchr(temporary, '.');
     if (!extension) return false;
-    strcpy(extension, ".tga");
+    strcpy(extension, ".png");
     int n = snprintf(path, capacity, "%s", temporary);
     return n > 0 && (size_t)n < capacity;
 #else
     if (clipId && *clipId) {
         char slots[4][256];
         unsigned long long hash = PlutoTextPathHash(clipId);
-        for (int i = 0; i < 4; i++) snprintf(slots[i], sizeof(slots[i]), "Stella-title-%016llx-%d.tga", hash, i);
+        for (int i = 0; i < 4; i++) snprintf(slots[i], sizeof(slots[i]), "Stella-title-%016llx-%d.png", hash, i);
         const char *chosen = NULL;
         if (gPreviewInFlightCount > 0) {
             for (int i = 0; i < 4; i++) if (!PlutoPreviewPathInFlight(slots[i])) { chosen = slots[i]; break; }
@@ -2165,7 +2179,25 @@ static bool PlutoTextOutputPath(char *path, size_t capacity, bool forceNew) {
         return n > 0 && (size_t)n < capacity;
     }
     unsigned long long serial = (unsigned long long)gClipSerial++;
-    int n = snprintf(path, capacity, "Stella-title-%llu.tga", serial);
+    int n = snprintf(path, capacity, "Stella-title-%llu.png", serial);
+    return n > 0 && (size_t)n < capacity;
+#endif
+}
+
+static bool PlutoTextFallbackOutputPath(char *path, size_t capacity) {
+#ifdef _WIN32
+    char tempRoot[MAX_PATH] = {0}, temporary[MAX_PATH] = {0};
+    DWORD length = GetTempPathA((DWORD)sizeof(tempRoot), tempRoot);
+    if (!length || length >= sizeof(tempRoot) || !GetTempFileNameA(tempRoot, "stl", 0, temporary)) return false;
+    DeleteFileA(temporary);
+    char *extension = strrchr(temporary, '.');
+    if (!extension) return false;
+    strcpy(extension, ".png");
+    int n = snprintf(path, capacity, "%s", temporary);
+    return n > 0 && (size_t)n < capacity;
+#else
+    unsigned long long serial = (unsigned long long)gClipSerial++;
+    int n = snprintf(path, capacity, "Stella-title-fallback-%llu.png", serial);
     return n > 0 && (size_t)n < capacity;
 #endif
 }
@@ -2214,7 +2246,8 @@ static uint64_t PlutoTextFitSignature(void) {
 }
 
 static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity, bool forceNew) {
-    if (!PlutoTextOutputPath(outPath, pathCapacity, forceNew)) return false;
+    if (!PlutoTextOutputPath(outPath, pathCapacity, forceNew) &&
+        !PlutoTextFallbackOutputPath(outPath, pathCapacity)) return false;
     /* The title TGA contains only its text frame, not a transparent 1080p
        canvas. WGPU positions/scales that smaller texture using the matching
        transform props, so editing uploads far fewer pixels. */
@@ -2318,6 +2351,16 @@ static bool PlutoTextWriteImage(char *outPath, size_t pathCapacity, bool forceNe
         UnloadImage(glyphLayer);
     }
     bool okay = ExportImage(textLayer, outPath);
+    if (!okay) {
+        /* Keep title creation resilient when the per-user cache folder is
+           unavailable (for example, a locked-down or redirected AppData). */
+        char fallbackPath[1024];
+        if (PlutoTextFallbackOutputPath(fallbackPath, sizeof(fallbackPath)) &&
+            ExportImage(textLayer, fallbackPath)) {
+            snprintf(outPath, pathCapacity, "%s", fallbackPath);
+            okay = true;
+        }
+    }
     UnloadImage(textLayer);
     return okay;
 }
@@ -2341,7 +2384,7 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
     float posX = (effectiveX - .5f) * 1920.f;
     float posY = (effectiveY - .5f) * 1080.f;
     int n = snprintf(out, capacity,
-        "{\"isTitle\":true,\"isSubtitle\":%s,\"sourceClipId\":\"%s\",\"content\":\"%s\",\"fontSize\":%d,\"fontFamily\":%d,\"fontName\":\"%s\",\"fontPath\":\"%s\",\"color\":%d,\"align\":%d,"
+        "{\"isTitle\":true,\"isSubtitle\":%s,\"freePlacement\":%s,\"sourceClipId\":\"%s\",\"content\":\"%s\",\"fontSize\":%d,\"fontFamily\":%d,\"fontName\":\"%s\",\"fontPath\":\"%s\",\"color\":%d,\"align\":%d,"
         "\"bold\":%s,\"italic\":%s,\"underline\":%s,\"outline\":%s,\"shadow\":%s,\"background\":%s,\"autoFit\":%s,"
         "\"x\":%.5f,\"y\":%.5f,\"boxW\":%.5f,\"boxH\":%.5f,"
         "\"layout\":{\"position\":{\"x\":%.5f,\"y\":%.5f},\"scale\":{\"w\":%.5f,\"h\":%.5f}},"
@@ -2349,7 +2392,8 @@ static bool PlutoTextBuildPropsJson(char *out, size_t capacity) {
         "\"outlineR\":%u,\"outlineG\":%u,\"outlineB\":%u,\"outlineA\":%u,"
         "\"shadowR\":%u,\"shadowG\":%u,\"shadowB\":%u,\"shadowA\":%u,"
         "\"backgroundR\":%u,\"backgroundG\":%u,\"backgroundB\":%u,\"backgroundA\":%u}",
-        gTextIsSubtitle ? "true" : "false", escapedSourceId, escaped, gTextFontSize, gTextFontFamily,
+        gTextIsSubtitle ? "true" : "false", gTextIsSubtitle ? "false" : "true",
+        escapedSourceId, escaped, gTextFontSize, gTextFontFamily,
         escapedFontName, escapedFontPath, gTextColorIndex, gTextAlign,
         gTextBold ? "true" : "false", gTextItalic ? "true" : "false", gTextUnderline ? "true" : "false",
         gTextOutline ? "true" : "false", gTextShadow ? "true" : "false",
