@@ -142,6 +142,14 @@ fn magnetic_lane_key(track: TrackId) -> TrackId {
 
 /// Keyframe `time` values are absolute timeline timestamps. Keep them attached
 /// to their clip whenever a timeline operation changes that clip's start.
+fn clip_is_title(clip: &Clip) -> bool {
+    clip.extra.get("props")
+        .and_then(|props| props.get("text"))
+        .and_then(|text| text.get("isTitle"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn clip_is_subtitle(clip: &Clip) -> bool {
     clip.extra.get("props")
         .and_then(|props| props.get("text"))
@@ -198,24 +206,27 @@ impl Timeline {
         }
 
         let subtitle = clip_is_subtitle(&clip);
+        let title = clip_is_title(&clip);
         let requested_track = clip.track;
-        let mut lane_has_content = self.clips.iter().any(|current| {
-            same_magnetic_lane(current.track, requested_track) && !clip_is_subtitle(current)
-        });
+        let same_destination_sequence = |current: &Clip| {
+            !clip_is_subtitle(current)
+                && clip_is_title(current) == title
+                && (if title { current.track == requested_track }
+                    else { same_magnetic_lane(current.track, requested_track) })
+        };
+        let mut lane_has_content = self.clips.iter().any(same_destination_sequence);
 
         /* V1-V6 share one magnetic video storyline. Audio rows remain independent.
            Compact legacy gaps before choosing the global video cut. */
         if !subtitle && self.magnetic && lane_has_content {
-            self.compact_lane(magnetic_lane_key(requested_track), &HashSet::new());
-            lane_has_content = self.clips.iter().any(|current| {
-                same_magnetic_lane(current.track, requested_track) && !clip_is_subtitle(current)
-            });
+            self.compact_lane_kind(requested_track, &HashSet::new(), title);
+            lane_has_content = self.clips.iter().any(same_destination_sequence);
         }
 
         let mut snapped_to_another_lane = false;
         /* Cross-row snapping is a proximity aid on every destination row. The
            threshold is strict; distant splits never become magnetic targets. */
-        if !subtitle && self.snapping {
+        if !subtitle && !title && self.snapping {
             let previous_start = clip.start;
             let (snapped_start, snap_engaged) = self.snap_start(
                 &clip.id, clip.start.max(0.0), clip.duration, clip.track,
@@ -228,7 +239,7 @@ impl Timeline {
         }
 
         if !subtitle && self.magnetic && lane_has_content {
-            let lane_cut = self.magnetic_start(&clip.id, clip.start, clip.duration, clip.track, None);
+            let lane_cut = self.magnetic_start(&clip.id, clip.start, clip.duration, clip.track, None, title);
             /* A cross-row snap remains valid only when it is also a cut point
                on this row; otherwise it would leave a gap in the destination. */
             if !snapped_to_another_lane || (lane_cut - clip.start).abs() > EPSILON {
@@ -236,7 +247,6 @@ impl Timeline {
                 clip.start = lane_cut;
                 let keyframe_delta = clip.start - previous_start;
                 shift_clip_keyframes(&mut clip, keyframe_delta);
-                snapped_to_another_lane = false;
             }
         } else if !subtitle && self.magnetic && !snapped_to_another_lane {
             clip.start = clip.start.max(0.0);
@@ -249,7 +259,7 @@ impl Timeline {
             self.ripple_lane_after(&id)?;
         }
         if !subtitle && self.magnetic {
-            self.compact_lane(magnetic_lane_key(requested_track), &HashSet::new());
+            self.compact_lane_kind(requested_track, &HashSet::new(), title);
         }
         self.refresh_duration();
         Ok(())
@@ -317,25 +327,27 @@ impl Timeline {
             self.close_lane_gaps(&vacated, &moving_ids);
             let mut affected_tracks: Vec<TrackId> = vacated.iter()
                 .filter(|clip| !clip_is_subtitle(clip))
-                .map(|clip| magnetic_lane_key(clip.track))
-                .chain(std::iter::once(magnetic_lane_key(desired_track)))
+                .map(|clip| if clip_is_title(clip) { clip.track } else { magnetic_lane_key(clip.track) })
+                .chain(std::iter::once(if clip_is_title(&original) { desired_track } else { magnetic_lane_key(desired_track) }))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
             affected_tracks.sort_by_key(|track| track.sort_index());
             for track in affected_tracks {
-                self.compact_lane(track, &moving_ids);
+                self.compact_lane_kind(track, &moving_ids, clip_is_title(&original));
             }
         }
 
+        let moving_is_title = clip_is_title(&original);
         let destination_has_content = self.clips.iter().any(|clip| {
-            same_magnetic_lane(clip.track, desired_track)
-                && !clip_is_subtitle(clip)
+            !clip_is_subtitle(clip) && clip_is_title(clip) == moving_is_title
+                && (if moving_is_title { clip.track == desired_track }
+                    else { same_magnetic_lane(clip.track, desired_track) })
                 && !moving_ids.contains(&clip.id)
         });
         let mut start = desired_start.max(0.0);
         let mut snapped_to_another_lane = false;
-        if self.snapping {
+        if self.snapping && !moving_is_title {
             /* Cross-row snapping is only proximity-based (snap_threshold); it
                remains available even when the destination row is populated. */
             let (snapped_start, snap_engaged) = self.snap_start(
@@ -346,12 +358,11 @@ impl Timeline {
             snapped_to_another_lane = snap_engaged;
         }
         if self.magnetic && destination_has_content {
-            let lane_cut = self.magnetic_start(id, start, original.duration, desired_track, group_id.as_deref());
+            let lane_cut = self.magnetic_start(id, start, original.duration, desired_track, group_id.as_deref(), moving_is_title);
             /* Cross-row snapping is kept only when it lands on a cut in this
                destination lane too. Otherwise use the lane's nearest cut. */
             if !snapped_to_another_lane || (lane_cut - start).abs() > EPSILON {
                 start = lane_cut;
-                snapped_to_another_lane = false;
             }
         }
 
@@ -503,7 +514,7 @@ impl Timeline {
             /* Keep linked A/V clips aligned while closing gaps on the edited
                row. compact_lane shifts the linked partner by the same delta;
                independently packing its row could break the link. */
-            self.compact_lane(clip.track, &HashSet::new());
+            self.compact_lane_kind(clip.track, &HashSet::new(), clip_is_title(&clip));
         }
         self.refresh_duration();
         self.find(id).cloned()
@@ -727,7 +738,7 @@ impl Timeline {
         clip.duration = clip.duration.min((source_duration - offset).max(0.05));
         self.replace(clip.clone());
         if self.magnetic && !clip_is_subtitle(&clip) {
-            self.compact_lane(clip.track, &HashSet::new());
+            self.compact_lane_kind(clip.track, &HashSet::new(), clip_is_title(&clip));
             clip = self.find(id)?.clone();
         }
         self.refresh_duration();
@@ -841,12 +852,18 @@ impl Timeline {
         _duration: f64,
         track: TrackId,
         exclude_group: Option<&str>,
+        title_only: bool,
     ) -> f64 {
         let mut best_start = start.max(0.0);
+        let in_sequence = |clip: &&Clip| {
+            !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
+                && (if title_only { clip.track == track }
+                    else { same_magnetic_lane(clip.track, track) })
+        };
         // Dropping onto the body of a different video row is an explicit
         // overlay gesture, not a request to join the sequence at a cut.
         if track.is_video() && self.clips.iter().any(|clip| {
-            clip.track.is_video() && clip.track != track && !clip_is_subtitle(clip)
+            !title_only && clip.track.is_video() && clip.track != track && !clip_is_subtitle(clip) && !clip_is_title(clip)
                 && clip.id != id
                 && exclude_group.map_or(true, |group| {
                     clip.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group)
@@ -856,7 +873,7 @@ impl Timeline {
             return best_start;
         }
         let lane_first_start = self.clips.iter()
-            .filter(|clip| same_magnetic_lane(clip.track, track) && !clip_is_subtitle(clip)
+            .filter(|clip| in_sequence(clip)
                 && clip.id != id
                 && exclude_group.map_or(true, |group| {
                     clip.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group)
@@ -870,8 +887,7 @@ impl Timeline {
         }
         let mut best_distance = f64::INFINITY;
         for clip in self.clips.iter().filter(|clip| {
-            same_magnetic_lane(clip.track, track)
-                && !clip_is_subtitle(clip)
+            in_sequence(&clip)
                 && clip.id != id
                 && exclude_group.map_or(true, |group| {
                     clip.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group)
@@ -880,7 +896,7 @@ impl Timeline {
             for candidate in [clip.start, clip.end()] {
                 if !candidate.is_finite() || candidate < 0.0 { continue; }
                 let starts_inside_existing = self.clips.iter().any(|other| {
-                    same_magnetic_lane(other.track, track) && !clip_is_subtitle(other)
+                    in_sequence(&other)
                         && other.id != id
                         && exclude_group.map_or(true, |group| {
                             other.extra.get("groupId").and_then(serde_json::Value::as_str) != Some(group)
@@ -922,17 +938,19 @@ impl Timeline {
     /// Close removed time in the shared video sequence, or on each affected
     /// audio row. Video overlaps on other rows keep the covered interval alive.
     fn close_lane_gaps(&mut self, removed: &[Clip], excluded_ids: &HashSet<String>) {
-        let mut intervals_by_lane: HashMap<TrackId, Vec<(f64, f64)>> = HashMap::new();
+        let mut intervals_by_lane: HashMap<(TrackId, bool), Vec<(f64, f64)>> = HashMap::new();
         for clip in removed.iter().filter(|clip| !clip_is_subtitle(clip) && clip.duration > EPSILON) {
-            intervals_by_lane.entry(magnetic_lane_key(clip.track)).or_default().push((clip.start, clip.end()));
+            let title_only = clip_is_title(clip);
+            let lane = if title_only { clip.track } else { magnetic_lane_key(clip.track) };
+            intervals_by_lane.entry((lane, title_only)).or_default().push((clip.start, clip.end()));
         }
 
         let mut shifted_ids: HashSet<String> = HashSet::new();
         let mut linked_followers_to_ripple: HashSet<String> = HashSet::new();
-        let mut ordered_lanes: Vec<TrackId> = intervals_by_lane.keys().copied().collect();
-        ordered_lanes.sort_by_key(|track| track.sort_index());
-        for lane in ordered_lanes {
-            let mut intervals = intervals_by_lane.remove(&lane).unwrap_or_default();
+        let mut ordered_lanes: Vec<(TrackId, bool)> = intervals_by_lane.keys().copied().collect();
+        ordered_lanes.sort_by_key(|(track, title)| (track.sort_index(), *title));
+        for (lane, title_only) in ordered_lanes {
+            let mut intervals = intervals_by_lane.remove(&(lane, title_only)).unwrap_or_default();
             intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut removed_union: Vec<(f64, f64)> = Vec::with_capacity(intervals.len());
             for (start, end) in intervals {
@@ -949,7 +967,8 @@ impl Timeline {
             // in the shared magnetic lane. An overlay covering the deleted
             // interval keeps that part of the composition alive.
             let mut coverage: Vec<(f64, f64)> = self.clips.iter()
-                .filter(|clip| same_magnetic_lane(clip.track, lane) && !clip_is_subtitle(clip)
+                .filter(|clip| !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
+                    && (if title_only { clip.track == lane } else { same_magnetic_lane(clip.track, lane) })
                     && !excluded_ids.contains(&clip.id))
                 .map(|clip| (clip.start, clip.end())).collect();
             coverage.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -981,7 +1000,8 @@ impl Timeline {
             }
 
             let mut followers: Vec<Clip> = self.clips.iter()
-                .filter(|clip| same_magnetic_lane(clip.track, lane) && !clip_is_subtitle(clip)
+                .filter(|clip| !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
+                    && (if title_only { clip.track == lane } else { same_magnetic_lane(clip.track, lane) })
                     && !excluded_ids.contains(&clip.id))
                 .cloned().collect();
             followers.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
@@ -1026,22 +1046,22 @@ impl Timeline {
             let _ = self.ripple_lane_after(&linked.id);
         }
 
-        // The removed interval has now been ripple-closed. Compact any remaining
-        // pre-existing gaps in the shared video sequence or affected audio row.
-        let mut lanes: Vec<TrackId> = removed.iter().filter(|clip| !clip_is_subtitle(clip))
-            .map(|clip| magnetic_lane_key(clip.track)).collect();
-        lanes.sort_by_key(|track| track.sort_index());
-        lanes.dedup();
-        for lane in lanes { self.compact_lane(lane, excluded_ids); }
+        // Do not compact here: ripple-delete removes only the deleted time.
+        // Packing the row afterward would also erase unrelated pre-existing gaps.
     }
 
     /// Close uncovered gaps in the selected magnetic sequence. For video this
     /// spans V1-V6; overlapping clips retain their starts as intentional layers.
     /// Audio remains lane-local. The first clip keeps its absolute start.
     fn compact_lane(&mut self, track: TrackId, excluded_ids: &HashSet<String>) {
+        self.compact_lane_kind(track, excluded_ids, false);
+    }
+
+    fn compact_lane_kind(&mut self, track: TrackId, excluded_ids: &HashSet<String>, title_only: bool) {
         let ordered_lane = magnetic_lane_key(track);
         let mut ordered: Vec<Clip> = self.clips.iter()
-            .filter(|clip| same_magnetic_lane(clip.track, ordered_lane) && !clip_is_subtitle(clip)
+            .filter(|clip| !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
+                && (if title_only { clip.track == track } else { same_magnetic_lane(clip.track, ordered_lane) })
                 && !excluded_ids.contains(&clip.id))
             .cloned().collect();
         ordered.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
@@ -1891,15 +1911,15 @@ mod tests {
         v2.track = TrackId::V2;
         timeline.clips.push(v2);
 
-        let mut title = video_clip("title-at-playhead", 12.0, 4.0);
+        let mut title = video_clip("title-at-playhead", 7.1, 4.0);
         title.track = TrackId::V6;
         title.extra.insert("props".into(), serde_json::json!({"text": {"isTitle": true}}));
         timeline.add_clip(title).unwrap();
 
         let placed = timeline.clips.iter().find(|clip| clip.id == "title-at-playhead").unwrap();
         assert_eq!(placed.track, TrackId::V6);
-        assert!((placed.start - 12.0).abs() < 1e-9,
-            "creating text on an empty V6 lane must not magnetize to a V1/V2 split");
+        assert!((placed.start - 7.1).abs() < 1e-9,
+            "creating text on an empty V6 lane must not magnetize to a nearby V1/V2 cut");
     }
 
     #[test]
