@@ -210,9 +210,8 @@ impl Timeline {
         let requested_track = clip.track;
         let same_destination_sequence = |current: &Clip| {
             !clip_is_subtitle(current)
-                && clip_is_title(current) == title
-                && (if title { current.track == requested_track }
-                    else { same_magnetic_lane(current.track, requested_track) })
+                && (if title { current.track == requested_track && !clip_is_title(current) }
+                    else { same_magnetic_lane(current.track, requested_track) && !clip_is_title(current) })
         };
         let mut lane_has_content = self.clips.iter().any(same_destination_sequence);
 
@@ -340,7 +339,7 @@ impl Timeline {
 
         let moving_is_title = clip_is_title(&original);
         let destination_has_content = self.clips.iter().any(|clip| {
-            !clip_is_subtitle(clip) && clip_is_title(clip) == moving_is_title
+            !clip_is_subtitle(clip) && !clip_is_title(clip)
                 && (if moving_is_title { clip.track == desired_track }
                     else { same_magnetic_lane(clip.track, desired_track) })
                 && !moving_ids.contains(&clip.id)
@@ -856,7 +855,7 @@ impl Timeline {
     ) -> f64 {
         let mut best_start = start.max(0.0);
         let in_sequence = |clip: &&Clip| {
-            !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
+            !clip_is_subtitle(clip) && !clip_is_title(clip)
                 && (if title_only { clip.track == track }
                     else { same_magnetic_lane(clip.track, track) })
         };
@@ -1060,8 +1059,8 @@ impl Timeline {
     fn compact_lane_kind(&mut self, track: TrackId, excluded_ids: &HashSet<String>, title_only: bool) {
         let ordered_lane = magnetic_lane_key(track);
         let mut ordered: Vec<Clip> = self.clips.iter()
-            .filter(|clip| !clip_is_subtitle(clip) && clip_is_title(clip) == title_only
-                && (if title_only { clip.track == track } else { same_magnetic_lane(clip.track, ordered_lane) })
+            .filter(|clip| !clip_is_subtitle(clip)
+                && (if title_only { same_magnetic_lane(clip.track, ordered_lane) } else { same_magnetic_lane(clip.track, ordered_lane) && !clip_is_title(clip) })
                 && !excluded_ids.contains(&clip.id))
             .cloned().collect();
         ordered.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
