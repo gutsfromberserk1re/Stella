@@ -772,6 +772,7 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonBoolPath(begin, end, "props.audio.fadeOut", &clip->audioFadeOut);
             clip->track = PlutoTrackIndex(track);
             PlutoJsonBoolPath(begin, end, "props.text.isSubtitle", &clip->isSubtitle);
+            PlutoJsonBoolPath(begin, end, "props.text.isTitle", &clip->isTitle);
             PlutoJsonStringPath(begin, end, "props.text.sourceClipId", clip->subtitleSourceId, sizeof(clip->subtitleSourceId));
             if (clip->isSubtitle)
                 PlutoJsonStringPath(begin, end, "props.text.content", clip->subtitleText, sizeof(clip->subtitleText));

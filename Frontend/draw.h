@@ -626,7 +626,15 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         } else GradRR(r, 10, ShadeMediaColor(swatch, .18f), ShadeMediaColor(swatch, -.22f));
         FillRR(r, 10, (Color){255, 255, 255, U8(20 * cu->f)});
         StrokeRR(r, 10, 1, (Color){255, 255, 255, U8(20 + 60 * cu->f)});
-        if (cu->f > .03f) {
+        if (cu->v > .5f) {
+            /* Keep missing library items visible for diagnosis, but clearly unavailable. */
+            FillRR(r, 10.f, (Color){18, 19, 22, 188});
+            StrokeRR(r, 10.f, 1.f, (Color){91, 94, 103, 220});
+            float badgeWidth = fminf(72.f, fmaxf(52.f, r.width - 16.f));
+            Rectangle badge = {r.x + 8.f, r.y + r.height - 25.f, badgeWidth, 17.f};
+            FillRR(badge, 5.f, (Color){42, 44, 50, 238});
+            TxtAt(0, "MISSING", badge.x + 6.f, badge.y + 2.f, 10.f, (Color){174, 177, 185, 255});
+        } else if (cu->f > .03f) {
             Rectangle pb = {r.x + r.width - 30, r.y + 6, 24, 24};
             FillRR(pb, 7, (Color){246, 246, 249, U8(255 * fminf(1.f, cu->f * 1.4f))});
             Color d = (Color){30, 31, 36, U8(255 * fminf(1.f, cu->f * 1.4f))};
@@ -833,6 +841,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
         TimelineClipUi *clip = clipIndex >= 0 && clipIndex < gTimelineClipCount ? &gTimelineClips[clipIndex] : NULL;
         bool audioOnly = clip && clip->track >= TIMELINE_MAX_VIDEO_TRACKS;
         bool hasAudio = clip && (clip->track >= TIMELINE_MAX_VIDEO_TRACKS || clip->hasAudio);
+        bool mediaMissing = clip && !clip->isSubtitle && !clip->isTitle && clip->path[0] && !FileExists(clip->path);
         const char *mediaKey = clip ? (clip->groupId[0] ? clip->groupId : clip->path) : NULL;
         Color swatch = MediaSwatch(mediaKey, clipIndex);
         Texture2D wave = {0};
@@ -922,6 +931,17 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             }
         }
 
+        if (mediaMissing) {
+            /* A restrained desaturated veil marks offline source media while
+               retaining clip boundaries, timing, and selection affordances. */
+            FillRR(r, 6.f, (Color){18, 19, 22, 150});
+            StrokeRR(r, 6.f, 1.f, (Color){105, 108, 116, 210});
+            if (r.width >= 58.f) {
+                Rectangle offlineBadge = {r.x + 7.f, r.y + 5.f, fminf(64.f, r.width - 14.f), 16.f};
+                FillRR(offlineBadge, 5.f, (Color){35, 37, 42, 230});
+                TxtAt(0, "MISSING", offlineBadge.x + 5.f, offlineBadge.y + 2.f, 9.5f, (Color){184, 186, 192, 255});
+            }
+        }
         FillRR(r, 6, (Color){255, 255, 255, U8(18 * cu->f)});
         /* A subtle outline makes the selected clip visible without fighting
            the thumbnails, waveform or keyframe diamonds. */

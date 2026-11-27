@@ -377,7 +377,7 @@ typedef struct {
     int track, mediaIndex; /* 0..5 = video V1..V6, 6..11 = audio A1..A6 */
     float start, duration, sourceOffset, sourceDuration, transitionDuration;
     float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
-    bool hasAudio, audioFadeIn, audioFadeOut, isSubtitle;
+    bool hasAudio, audioFadeIn, audioFadeOut, isSubtitle, isTitle;
     TimelineKeyframeUi keyframes[32];
     int keyframeCount;
 } TimelineClipUi;

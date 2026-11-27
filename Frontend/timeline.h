@@ -53,6 +53,7 @@ static float TimelineDisplayStart(int index) {
 
 static bool TimelineTrackIsVideo(int track) { return track >= 0 && track < TIMELINE_MAX_VIDEO_TRACKS; }
 static bool TimelineTrackIsAudio(int track) { return track >= TIMELINE_MAX_VIDEO_TRACKS && track < TIMELINE_MAX_VIDEO_TRACKS + TIMELINE_MAX_AUDIO_TRACKS; }
+static bool TimelineClipNeedsRelink(const TimelineClipUi *clip);
 static int TimelineTrackUnderPointer(void);
 static int TimelineTrackUnderPointerForDrag(void);
 static float gTimelineLastRevealY = -1.f;
@@ -490,10 +491,14 @@ static float TimelineSnapStart(float start, float duration, int targetTrack, int
     return snapped;
 }
 
-/* Mirrors Rust's lane-local magnetic insertion. If a clip/group is moved
-   within its source lane, project the surviving edges after closing only the
-   vacated interval(s) on that lane. Nearby cross-lane edges are handled by the
-   separate proximity snap; a remote V1 cut cannot pull a V2 clip across time. */
+/* Mirrors Rust's shared video-storyline magnetic insertion. V1-V6 are one
+   sequence; audio lanes remain independent. Existing cross-track overlaps are
+   retained as intentional overlays while uncovered gaps are projected closed. */
+static bool TimelineSameMagneticLane(int a, int b) {
+    return (a >= 0 && a < TIMELINE_MAX_VIDEO_TRACKS &&
+            b >= 0 && b < TIMELINE_MAX_VIDEO_TRACKS) || a == b;
+}
+
 static float TimelineMagneticStart(float start, float duration, int targetTrack, int movingIndex,
                                    const char *excludeGroup) {
     (void)duration;
@@ -501,12 +506,13 @@ static float TimelineMagneticStart(float start, float duration, int targetTrack,
         return fmaxf(0.f, start);
 
     int order[MAX_TIMELINE_CLIPS];
+    float projectedStart[MAX_TIMELINE_CLIPS];
     int count = 0;
     for (int i = 0; i < gTimelineClipCount && count < MAX_TIMELINE_CLIPS; i++) {
         const TimelineClipUi *clip = &gTimelineClips[i];
         bool moving = i == movingIndex || (excludeGroup && *excludeGroup &&
             clip->groupId[0] && strcmp(clip->groupId, excludeGroup) == 0);
-        if (moving || clip->track != targetTrack || clip->isSubtitle) continue;
+        if (moving || !TimelineSameMagneticLane(clip->track, targetTrack) || clip->isSubtitle) continue;
         int insert = count;
         while (insert > 0) {
             const TimelineClipUi *previous = &gTimelineClips[order[insert - 1]];
@@ -519,18 +525,32 @@ static float TimelineMagneticStart(float start, float duration, int targetTrack,
         order[insert] = i;
         count++;
     }
-    if (count == 0) return fmaxf(0.f, start);
-    if (start <= gTimelineClips[order[0]].start + .0001f) return fmaxf(0.f, start);
+    if (count == 0 || start <= gTimelineClips[order[0]].start + .0001f)
+        return fmaxf(0.f, start);
 
-    /* The Rust backend compacts the destination row before insertion. Mirror
-       that projection here so the drag ghost and committed clip land together. */
-    float cursor = gTimelineClips[order[0]].start;
+    float cursor = gTimelineClips[order[0]].start + gTimelineClips[order[0]].duration;
+    projectedStart[0] = gTimelineClips[order[0]].start;
+    for (int n = 1; n < count; n++) {
+        const TimelineClipUi *clip = &gTimelineClips[order[n]];
+        projectedStart[n] = fmaxf(clip->start, cursor);
+        cursor = fmaxf(cursor, projectedStart[n] + clip->duration);
+    }
+    if (targetTrack < TIMELINE_MAX_VIDEO_TRACKS) {
+        for (int n = 0; n < count; n++) {
+            const TimelineClipUi *clip = &gTimelineClips[order[n]];
+            if (clip->track != targetTrack && start > projectedStart[n] + .0001f &&
+                start < projectedStart[n] + clip->duration - .0001f)
+                return fmaxf(0.f, start); /* explicit cross-row overlay */
+        }
+    }
+
     float bestStart = fmaxf(0.f, start);
-    float bestDistance = fabsf(bestStart - cursor);
+    float bestDistance = fabsf(bestStart - projectedStart[0]);
     for (int n = 0; n < count; n++) {
         const TimelineClipUi *clip = &gTimelineClips[order[n]];
-        float cutBefore = cursor;
-        float cutAfter = cursor + clip->duration;
+        float clipStart = projectedStart[n];
+        float cutBefore = clipStart;
+        float cutAfter = clipStart + clip->duration;
         float beforeDistance = fabsf(cutBefore - start);
         float afterDistance = fabsf(cutAfter - start);
         if (beforeDistance < bestDistance - .00001f ||
@@ -543,7 +563,6 @@ static float TimelineMagneticStart(float start, float duration, int targetTrack,
             bestDistance = afterDistance;
             bestStart = cutAfter;
         }
-        cursor = cutAfter;
     }
     return fmaxf(0.f, bestStart);
 }
@@ -1065,6 +1084,7 @@ static void TimelineClipLane(int track, float height) {
             }
             float cardWidth = fmaxf(1.f, width);
             bool clipSelected = gTimelineSelected == i || gTimelineMultiSelect[i];
+            bool clipMissing = TimelineClipNeedsRelink(&gTimelineClips[i]);
             if (Clay_PointerOver(clipId) && gTimelineTool == 0 && gClipTrimIndex < 0) {
                 float leftDistance = pointer.x - bb.x;
                 float rightDistance = bb.x + bb.width - pointer.x;
@@ -1075,12 +1095,13 @@ static void TimelineClipLane(int track, float height) {
                           .clip = {.horizontal = true, .vertical = true},
                           .custom = {.customData = NC(K_CLIP, RGB(112, 52, 140), RGB(78, 36, 108), C_CARD, 0, b.hover,
                                                      (i << 1) | (clipSelected ? 1 : 0))}}) {
+                Clay_Color clipTextColor = clipMissing ? C_MUTED : C_TEXT;
                 if (gTimelineClips[i].isSubtitle) {
-                    Icon(I_NOTE, 13, C_TEXT);
-                    if (cardWidth >= 72.f) Tx(gTimelineClips[i].label, 12, C_TEXT, 1);
+                    Icon(I_NOTE, 13, clipTextColor);
+                    if (cardWidth >= 72.f) Tx(gTimelineClips[i].label, 12, clipTextColor, 1);
                 } else if (TimelineTrackIsVideo(gTimelineClips[i].track)) {
-                    Icon(I_FILM, 13, C_TEXT);
-                    if (cardWidth >= 92.f) Tx(gTimelineClips[i].label, 13, C_TEXT, 1);
+                    Icon(I_FILM, 13, clipTextColor);
+                    if (cardWidth >= 92.f) Tx(gTimelineClips[i].label, 13, clipTextColor, 1);
                 }
             }
             cursor = fmaxf(cursor, left + width);
@@ -1194,6 +1215,11 @@ static bool TimelineDetachedAudioPairForClip(int clipIndex, int *videoIndex, int
     return true;
 }
 
+static bool TimelineClipNeedsRelink(const TimelineClipUi *clip) {
+    if (!clip || clip->isSubtitle || clip->isTitle || !clip->path[0]) return false;
+    return !FileExists(clip->path);
+}
+
 static int TimelineContextActions(int actions[10]) {
     if (gTimelineContextClip < 0 || gTimelineContextClip >= gTimelineClipCount) return 0;
     TimelineClipUi *clip = &gTimelineClips[gTimelineContextClip];
@@ -1217,7 +1243,7 @@ static int TimelineContextActions(int actions[10]) {
             !gTimelineClips[videoIndex].linkedId[0] && !gTimelineClips[audioIndex].linkedId[0])
             actions[count++] = 5;
     }
-    if (!clip->isSubtitle) actions[count++] = 6;
+    if (TimelineClipNeedsRelink(clip)) actions[count++] = 6;
     actions[count++] = 4;
     return count;
 }

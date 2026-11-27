@@ -49,6 +49,7 @@ static void MediaView(void) {
                     if (i >= mediaCount) break;
                     ImportedMedia *m = &gImported[i];
                     const char *name = m->name;
+                    bool mediaMissing = !m->path[0] || !FileExists(m->path);
                     const char *duration = Fmt("%d:%02d", (int)m->duration / 60, (int)m->duration % 60);
                     CLAY(CLAY_IDI("Media", i), {.layout = {COLM, .sizing = {FIX(tileWidth), FIT}, .childGap = 6}}) {
                         Clay_ElementId tid = CLAY_IDI("Thumb", i);
@@ -59,11 +60,12 @@ static void MediaView(void) {
                             gMediaHoverName[sizeof(gMediaHoverName) - 1] = 0;
                             gMediaHoverRect = (Rectangle){tb.x, tb.y, tb.width, tb.height};
                         }
-                        if (Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i;
+                        if (!mediaMissing && Clay_PointerOver(tid) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gMediaDragIndex = i;
                         if (b.clicked) gMediaSelected = i;
                         CLAY(tid, {.layout = {.sizing = {GROW, FIX(tileWidth * 9.f / 16.f)}, .padding = {6, 6, 6, 6}, .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}},
                                    .border = {.color = gMediaSelected == i ? C_TEXT : RGBA(0, 0, 0, 0), .width = CLAY_BORDER_OUTSIDE(gMediaSelected == i ? 2 : 0)},
-                                   .custom = {.customData = NC(K_THUMB, C_CARD, C_CARD, C_CARD, 0, b.hover, 0x1000 | (i << 4))}}) {
+                                   .custom = {.customData = NC(K_THUMB, C_CARD, C_CARD, C_CARD,
+                                       mediaMissing ? 1.f : 0.f, mediaMissing ? 0.f : b.hover, 0x1000 | (i << 4))}}) {
                             CLAY_AUTO_ID({.layout = {.sizing = {FIT, FIT}, .padding = {5, 5, 1, 2}},
                                           .backgroundColor = RGBA(0, 0, 0, 150), .cornerRadius = CLAY_CORNER_RADIUS(5)}) {
                                 Tx(duration, 12.5f, C_TEXT, 1);
