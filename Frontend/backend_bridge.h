@@ -763,6 +763,9 @@ static bool PlutoSyncTimeline(const char *json) {
             PlutoJsonNumberRange(begin, end, "dur", &duration);
             clip->sourceOffset = PlutoReadNumber(begin, end, "sourceOffset", 0.f);
             clip->sourceDuration = PlutoReadNumber(begin, end, "sourceDuration", 0.f);
+            double clipSpeed = 1.0;
+            PlutoJsonNumberPath(begin, end, "props.transform.speed", &clipSpeed);
+            clip->speed = (clipSpeed > 0.0 && isfinite(clipSpeed)) ? (float)clipSpeed : 1.f;
             clip->transitionDuration = PlutoReadNumber(begin, end, "props.transitionOut.duration", 1.f);
             clip->audioVolume = PlutoReadNumber(begin, end, "props.audio.volume", 100.f);
             clip->audioPan = PlutoReadNumber(begin, end, "props.audio.pan", 0.f);
@@ -1235,6 +1238,72 @@ static void PlutoWhisperModelCancel(int index) {
     snprintf(gWhisperModels[index].detail, sizeof(gWhisperModels[index].detail), "Cancelling…");
 }
 
+static bool PlutoWhisperCaptureSelectedSource(void) {
+    gSubtitleSourceValid = false;
+    gSubtitleSourceClipId[0] = gSubtitleSourcePath[0] = gSubtitleSourceLabel[0] = 0;
+    gSubtitleSourceStart = gSubtitleSourceDuration = gSubtitleSourceOffset = 0.f;
+    gSubtitleSourceSpeed = 1.f;
+    if (gTimelineSelected < 0 || gTimelineSelected >= gTimelineClipCount) {
+        snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "Select an audio or video clip on the timeline first.");
+        return false;
+    }
+    const TimelineClipUi *clip = &gTimelineClips[gTimelineSelected];
+    const bool audioTrack = clip->track >= TIMELINE_MAX_VIDEO_TRACKS || strcmp(clip->kind, "audio") == 0;
+    if (clip->isSubtitle || clip->isTitle || (!audioTrack && !clip->hasAudio)) {
+        snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "Select an audio clip or a video clip that contains audio.");
+        return false;
+    }
+    if (!clip->path[0] || !FileExists(clip->path)) {
+        snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "The selected clip's source media is unavailable.");
+        return false;
+    }
+    if (!(clip->duration > 0.f) || !isfinite(clip->duration)) {
+        snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "The selected clip has no valid audio duration.");
+        return false;
+    }
+    snprintf(gSubtitleSourceClipId, sizeof(gSubtitleSourceClipId), "%s", clip->id);
+    snprintf(gSubtitleSourcePath, sizeof(gSubtitleSourcePath), "%s", clip->path);
+    snprintf(gSubtitleSourceLabel, sizeof(gSubtitleSourceLabel), "%s", clip->label);
+    gSubtitleSourceStart = clip->start;
+    gSubtitleSourceDuration = clip->duration;
+    gSubtitleSourceOffset = fmaxf(0.f, clip->sourceOffset);
+    gSubtitleSourceSpeed = clip->speed > 0.f && isfinite(clip->speed) ? clip->speed : 1.f;
+    gSubtitleSourceValid = true;
+    gSubtitleTranscriptionDetail[0] = 0;
+    return true;
+}
+
+static uint64_t PlutoWhisperTranscribeStart(int index) {
+    if (index < 0 || index >= 3 || !gBackend.submit || !gSubtitleSourceValid || !gWhisperModels[index].installed) return 0;
+    char escapedId[512], escapedPath[6144], request[8192];
+    PlutoJsonEscape(gSubtitleSourceClipId, escapedId, sizeof(escapedId));
+    PlutoJsonEscape(gSubtitleSourcePath, escapedPath, sizeof(escapedPath));
+    int n = snprintf(request, sizeof(request),
+        "{\"command\":\"transcribe_clip\",\"tier\":\"%s\",\"sourceClipId\":\"%s\",\"sourcePath\":\"%s\",\"clipStart\":%.6f,\"clipDuration\":%.6f,\"sourceOffset\":%.6f,\"speed\":%.6f}",
+        PlutoWhisperTierName(index), escapedId, escapedPath,
+        (double)gSubtitleSourceStart, (double)gSubtitleSourceDuration,
+        (double)gSubtitleSourceOffset, (double)gSubtitleSourceSpeed);
+    if (n <= 0 || (size_t)n >= sizeof(request)) return 0;
+    uint64_t id = gBackend.submit(request);
+    if (id) {
+        gSubtitleTranscriptionRequestId = id;
+        gSubtitleTranscriptionState = 1;
+        gSubtitleTranscriptionProgress = 0.f;
+        gSubtitleTranscriptionJson[0] = 0;
+        snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "Preparing audio…");
+    }
+    return id;
+}
+
+static void PlutoWhisperTranscribeCancel(void) {
+    if (!gBackend.submit || !gSubtitleTranscriptionRequestId) return;
+    char request[160];
+    snprintf(request, sizeof(request), "{\"command\":\"cancel_transcription\",\"transcriptionId\":%llu}",
+             (unsigned long long)gSubtitleTranscriptionRequestId);
+    (void)gBackend.submit(request);
+    snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "Cancelling transcription…");
+}
+
 static void PlutoPollBackend(void) {
     if (!gBackend.poll) return;
     for (int i = 0; i < 16; i++) {
@@ -1272,6 +1341,33 @@ static void PlutoPollBackend(void) {
                 if (strcmp(state, "error") == 0 && detail[0]) snprintf(gBackendMessage, sizeof(gBackendMessage), "%.255s", detail);
                 else if (strcmp(state, "complete") == 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "%s model ready", index == 0 ? "Performance" : index == 1 ? "Balanced" : "Quality");
                 else if (strcmp(state, "cancelled") == 0) snprintf(gBackendMessage, sizeof(gBackendMessage), "Model download cancelled");
+            }
+        } else if (strstr(event, "\"command\":\"transcription\"")) {
+            char state[32] = {0}, detail[256] = {0}, sourceId[64] = {0};
+            double requestId = 0.0, progress = 0.0;
+            PlutoJsonString(event, "state", state, sizeof(state));
+            PlutoJsonString(event, "detail", detail, sizeof(detail));
+            PlutoJsonString(event, "sourceClipId", sourceId, sizeof(sourceId));
+            PlutoJsonNumber(event, "requestId", &requestId);
+            PlutoJsonNumber(event, "progress", &progress);
+            if (gSubtitleTranscriptionRequestId && (uint64_t)requestId == gSubtitleTranscriptionRequestId &&
+                strcmp(sourceId, gSubtitleSourceClipId) == 0) {
+                gSubtitleTranscriptionProgress = (float)fmin(1.0, fmax(0.0, progress / 100.0));
+                if (detail[0]) snprintf(gSubtitleTranscriptionDetail, sizeof(gSubtitleTranscriptionDetail), "%.255s", detail);
+                if (strcmp(state, "complete") == 0) {
+                    snprintf(gSubtitleTranscriptionJson, sizeof(gSubtitleTranscriptionJson), "%.2097151s", event);
+                    gSubtitleTranscriptionState = 2;
+                    gSubtitleTranscriptionProgress = 1.f;
+                    gSubtitleTranscriptionRequestId = 0;
+                } else if (strcmp(state, "cancelled") == 0) {
+                    gSubtitleTranscriptionState = 3;
+                    gSubtitleTranscriptionRequestId = 0;
+                } else if (strcmp(state, "error") == 0) {
+                    gSubtitleTranscriptionState = 4;
+                    gSubtitleTranscriptionRequestId = 0;
+                } else {
+                    gSubtitleTranscriptionState = 1;
+                }
             }
         } else if (strstr(event, "\"command\":\"preview_frame\"")) {
             double requestId = 0.0;

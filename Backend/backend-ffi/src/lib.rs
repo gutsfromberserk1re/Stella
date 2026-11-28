@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 mod decoder;
 mod filters;
 mod models;
+mod transcription;
 mod renderer;
 use decoder::{DecodedFrame, DecoderPool};
 use renderer::{GpuLayerFrame, GpuPreviewRenderer, LayerUniforms, SharedGlPreviewFrame};
@@ -41,6 +42,7 @@ struct Backend {
     preview_next_worker: AtomicU64,
     proxy_task_tx: Sender<(u64, Value)>,
     model_task_tx: Sender<(u64, String, Arc<std::sync::atomic::AtomicBool>)>,
+    transcription_task_tx: Sender<(u64, Value, Arc<std::sync::atomic::AtomicBool>)>,
     model_cancellations: Arc<Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>>,
     event_rx: Mutex<Receiver<String>>,
     preview_inflight: Arc<AtomicUsize>,
@@ -512,10 +514,13 @@ fn backend() -> &'static Backend {
         let (task_tx, task_rx) = mpsc::channel::<(u64, Value)>();
         let (proxy_task_tx, proxy_task_rx) = mpsc::channel::<(u64, Value)>();
         let (model_task_tx, model_task_rx) = mpsc::channel::<(u64, String, Arc<std::sync::atomic::AtomicBool>)>();
+        let (transcription_task_tx, transcription_task_rx) = mpsc::channel::<(u64, Value, Arc<std::sync::atomic::AtomicBool>)>();
         let model_cancellations = Arc::new(Mutex::new(HashMap::new()));
         let model_cancel_worker = Arc::clone(&model_cancellations);
         let (event_tx, event_rx) = mpsc::channel::<String>();
         let model_events = event_tx.clone();
+        let transcription_events = event_tx.clone();
+        let transcription_cancellations = Arc::clone(&model_cancellations);
         let preview_inflight = Arc::new(AtomicUsize::new(0));
         let (preview_completion_tx, preview_completion_rx) = mpsc::channel::<PendingPreview>();
         let completion_events = event_tx.clone();
@@ -550,6 +555,10 @@ fn backend() -> &'static Backend {
             .name("stella-model-download-worker".into())
             .spawn(move || models::model_worker(model_task_rx, model_events, model_cancel_worker))
             .expect("failed to start Stella model download worker");
+        thread::Builder::new()
+            .name("stella-whisper-transcription-worker".into())
+            .spawn(move || transcription::transcription_worker(transcription_task_rx, transcription_events, transcription_cancellations))
+            .expect("failed to start Stella transcription worker");
         Backend {
             timeline: Mutex::new(Timeline::default()),
             property_edit: Mutex::new(None),
@@ -561,6 +570,7 @@ fn backend() -> &'static Backend {
             preview_next_worker: AtomicU64::new(0),
             proxy_task_tx,
             model_task_tx,
+            transcription_task_tx,
             model_cancellations,
             event_rx: Mutex::new(event_rx),
             preview_inflight,
@@ -2370,8 +2380,11 @@ fn dispatch(request: Value) -> Result<Value, String> {
                 .ok_or("Subtitle source clip id is required")?;
             let source_clip = timeline.clips.iter().find(|clip| clip.id == source_id)
                 .ok_or("The source video clip no longer exists")?;
-            if !source_clip.track.is_video() || source_clip.extra.get("kind").and_then(Value::as_str) == Some("audio") {
-                return Err("Subtitle source must be a video clip".into());
+            let source_kind = source_clip.extra.get("kind").and_then(Value::as_str).unwrap_or_default();
+            let source_has_audio = source_clip.extra.get("hasAudio").and_then(Value::as_bool).unwrap_or(false)
+                || source_kind == "audio";
+            if !source_has_audio {
+                return Err("The selected clip has no audio stream".into());
             }
             let clips: Vec<Clip> = serde_json::from_value(request["clips"].clone())
                 .map_err(|e| e.to_string())?;
@@ -2853,6 +2866,15 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             }
             return download_id;
         }
+        if command == "cancel_transcription" {
+            let task_id = request["transcriptionId"].as_u64().unwrap_or(0);
+            if let Ok(active) = backend.model_cancellations.lock() {
+                if let Some(cancel) = active.get(&task_id) {
+                    cancel.store(true, Ordering::Release);
+                }
+            }
+            return task_id;
+        }
         if command == "download_model" {
             let tier = request["tier"].as_str().unwrap_or_default();
             if models::model_for_tier(tier).is_none() { return 0; }
@@ -2864,6 +2886,23 @@ pub unsafe extern "C" fn pluto_backend_submit(input: *const c_char) -> u64 {
             if backend.model_task_tx.send((id, tier.to_owned(), cancel)).is_ok() {
                 return id;
             }
+            if let Ok(mut active) = backend.model_cancellations.lock() { active.remove(&id); }
+            return 0;
+        }
+        if command == "transcribe_clip" {
+            let tier = request["tier"].as_str().unwrap_or_default();
+            if models::model_for_tier(tier).is_none() || models::model_path_for_tier(tier).is_err() { return 0; }
+            let source_id = request["sourceClipId"].as_str().unwrap_or_default();
+            let source_path = request["sourcePath"].as_str().unwrap_or_default();
+            let duration = request["clipDuration"].as_f64().unwrap_or(0.0);
+            if source_id.is_empty() || source_path.is_empty() || !std::path::Path::new(source_path).is_file()
+                || !duration.is_finite() || duration <= 0.0 { return 0; }
+            let id = backend.next_task.fetch_add(1, Ordering::Relaxed);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Ok(mut active) = backend.model_cancellations.lock() {
+                active.insert(id, Arc::clone(&cancel));
+            } else { return 0; }
+            if backend.transcription_task_tx.send((id, request, cancel)).is_ok() { return id; }
             if let Ok(mut active) = backend.model_cancellations.lock() { active.remove(&id); }
             return 0;
         }

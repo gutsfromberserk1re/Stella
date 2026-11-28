@@ -1452,9 +1452,9 @@ static void Timeline(void) {
     bool inTimelineBody = body.width > 0.f && CheckCollisionPointRec(mouse, (Rectangle){body.x, body.y, body.width, body.height});
     bool inTimelinePanel = timelineBounds.width > 0.f && CheckCollisionPointRec(mouse,
         (Rectangle){timelineBounds.x, timelineBounds.y, timelineBounds.width, timelineBounds.height});
-    if (gCtrlDown && !gTextInputFocused && inTimelineBody && fabsf(gWheelDelta) > .001f)
+    if (gCtrlDown && !StellaKeyboardInputCaptured() && inTimelineBody && fabsf(gWheelDelta) > .001f)
         gTimelineLaneHeight = fmaxf(TIMELINE_LANE_MIN, fminf(TIMELINE_LANE_MAX, gTimelineLaneHeight + gWheelDelta * 3.5f));
-    if (gCtrlDown && !gTextInputFocused && !gTimelinePlaying && inTimelinePanel) {
+    if (gCtrlDown && !StellaKeyboardInputCaptured() && !gTimelinePlaying && inTimelinePanel) {
         bool zoomTrackIn = IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD);
         bool zoomTrackOut = IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT);
         if (zoomTrackIn) gTimelineLaneHeight = fminf(TIMELINE_LANE_MAX, gTimelineLaneHeight + 2.f);

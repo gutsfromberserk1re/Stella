@@ -19,9 +19,10 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
     Rectangle frame = {bounds.x, bounds.y, bounds.width, bounds.height};
     Vector2 mouse = GetMousePosition();
     bool frameValid = frame.width > 1.f && frame.height > 1.f;
+    bool textToolActive = (gTimelineTool == 0 || gTimelineTool == 3);
 
     gTextBoxScreenRectValid = false;
-    if (gTimelineTool == 3 && gTextTitleSelected && frameValid && !gTextBoxDragging) {
+    if (textToolActive && gTextTitleSelected && frameValid && !gTextBoxDragging) {
         float width = gTextBoxW * frame.width;
         float height = gTextBoxH * frame.height;
         gTextBoxScreenRect = (Rectangle){
@@ -33,42 +34,116 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
     }
 
     bool overFrame = frameValid && CheckCollisionPointRec(mouse, frame);
+    bool overSelectedTitle = textToolActive && gTextTitleSelected && gTextBoxScreenRectValid &&
+                             CheckCollisionPointRec(mouse, gTextBoxScreenRect);
     if (gTimelineTool == 3 && overFrame) gCross = true;
-    if (gTimelineTool == 3 && !gTextBoxDragging && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && overFrame) {
+    if (gTimelineTool == 0 && overSelectedTitle) gHand = true;
+
+    /* A single click selects/grabs a title; a second click enters inline editing.
+       This works with both the Select tool and the Text tool. */
+    if (textToolActive && !gTextBoxDragging && !gTextBoxMoving &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && overFrame) {
         static double lastTitleBoxClickAt;
         static char lastTitleBoxClickId[64];
-        bool insideSelectedTitle = gTextTitleSelected && gTextBoxScreenRectValid &&
-                                   CheckCollisionPointRec(mouse, gTextBoxScreenRect);
-        if (insideSelectedTitle) {
+        static Vector2 lastTitleBoxClickPoint;
+        if (overSelectedTitle) {
             const char *clipId = (gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount)
                 ? gTimelineClips[gTimelineSelected].id : "";
             double now = GetTime();
-            if (clipId[0] && strcmp(lastTitleBoxClickId, clipId) == 0 &&
-                lastTitleBoxClickAt > 0.0 && now - lastTitleBoxClickAt <= .42) {
-                /* Double-clicking an existing title enters inline text editing;
-                   the caret is drawn over the WGPU preview on the next frame. */
+            float clickDistance = hypotf(mouse.x - lastTitleBoxClickPoint.x,
+                                         mouse.y - lastTitleBoxClickPoint.y);
+            bool doubleClick = clipId[0] && strcmp(lastTitleBoxClickId, clipId) == 0 &&
+                               lastTitleBoxClickAt > 0.0 && now - lastTitleBoxClickAt <= .42 &&
+                               clickDistance <= 10.f;
+            if (doubleClick) {
                 gTextInputFocused = true;
                 gTextFocusStartedAt = now;
                 gTextCaretT = now;
                 gRightTab = 3;
+                gTextBoxMoving = false;
                 lastTitleBoxClickAt = 0.0;
                 lastTitleBoxClickId[0] = 0;
             } else {
                 lastTitleBoxClickAt = now;
+                lastTitleBoxClickPoint = mouse;
                 snprintf(lastTitleBoxClickId, sizeof(lastTitleBoxClickId), "%s", clipId);
+                /* When the content editor already has focus, keep the first click
+                   as an edit click. Otherwise it begins a movable title gesture. */
+                if ((!gTextInputFocused || gTimelineTool == 0) && clipId[0]) {
+                    Rectangle box = gTextBoxScreenRect;
+                    /* Close any previous text-edit burst, then snapshot the
+                       selected title before the first drag delta is applied. */
+                    PlutoTextAutoUpdateFlush();
+                    PlutoTimelineEndPropertyEdit();
+                    PlutoTextAutoUpdateObserve();
+                    gTextBoxMoving = true;
+                    gTextBoxMoveOffset = (Vector2){
+                        box.x + box.width * .5f - mouse.x,
+                        box.y + box.height * .5f - mouse.y
+                    };
+                    gTextBoxMoveChanged = false;
+                    gTextInputFocused = false;
+                    gTextFocusStartedAt = 0.0;
+                }
             }
         } else {
-            lastTitleBoxClickAt = 0.0;
-            lastTitleBoxClickId[0] = 0;
             gTextInputFocused = false;
             gTextFocusStartedAt = 0.0;
-            gTextBoxDragging = true;
-            gTextBoxDragStart = (Vector2){
-                PreviewClamp(mouse.x, frame.x, frame.x + frame.width),
-                PreviewClamp(mouse.y, frame.y, frame.y + frame.height)
+            if (gTimelineTool == 3) {
+                lastTitleBoxClickAt = 0.0;
+                lastTitleBoxClickId[0] = 0;
+                /* Clicking empty preview space with the Text tool creates a frame. */
+                gTextBoxMoving = false;
+                gTextBoxDragging = true;
+                gTextBoxDragStart = (Vector2){
+                    PreviewClamp(mouse.x, frame.x, frame.x + frame.width),
+                    PreviewClamp(mouse.y, frame.y, frame.y + frame.height)
+                };
+                gTextBoxDragRect = (Rectangle){gTextBoxDragStart.x, gTextBoxDragStart.y, 1.f, 1.f};
+                gTextBoxScreenRectValid = false;
+            }
+        }
+    }
+
+    if (gTextBoxMoving) {
+        gCross = true;
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            float centerX = mouse.x + gTextBoxMoveOffset.x;
+            float centerY = mouse.y + gTextBoxMoveOffset.y;
+            float nextX = PreviewClamp((centerX - frame.x) / frame.width,
+                                       gTextBoxW * .5f, 1.f - gTextBoxW * .5f);
+            float nextY = PreviewClamp((centerY - frame.y) / frame.height,
+                                       gTextBoxH * .5f, 1.f - gTextBoxH * .5f);
+            if (fabsf(nextX - gTextPosX) > .0002f || fabsf(nextY - gTextPosY) > .0002f) {
+                gTextPosX = nextX;
+                gTextPosY = nextY;
+                gTextBoxMoveChanged = true;
+                /* Observe here rather than relying on TextView(): Select-tool
+                   dragging must work even when another inspector tab is open. */
+                PlutoTextAutoUpdateObserve();
+                gPreviewDirty = true;
+            }
+        } else {
+            gTextBoxMoving = false;
+            if (gTextBoxMoveChanged) {
+                /* Flush the final pointer position now. The text auto-update
+                   debounce closes the entire gesture as one undo operation. */
+                PlutoTextAutoUpdateObserve();
+                PlutoTextAutoUpdateFlush();
+                gPreviewDirty = true;
+                gPreviewDebounce = 0.f;
+            }
+            gTextBoxMoveChanged = false;
+        }
+        if (gTextTitleSelected && frameValid) {
+            float width = gTextBoxW * frame.width;
+            float height = gTextBoxH * frame.height;
+            gTextBoxScreenRect = (Rectangle){
+                frame.x + PreviewClamp(gTextPosX - gTextBoxW * .5f, 0.f, 1.f - gTextBoxW) * frame.width,
+                frame.y + PreviewClamp(gTextPosY - gTextBoxH * .5f, 0.f, 1.f - gTextBoxH) * frame.height,
+                width, height
             };
-            gTextBoxDragRect = (Rectangle){gTextBoxDragStart.x, gTextBoxDragStart.y, 1.f, 1.f};
-            gTextBoxScreenRectValid = false;
+            gTextBoxScreenRectValid = true;
         }
     }
 
@@ -85,9 +160,6 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
             Rectangle selection = gTextBoxDragRect;
             gTextBoxDragging = false;
             if (frameValid) {
-                /* A click is also a valid text-box gesture: create a compact
-                   default frame instead of silently doing nothing when the
-                   drag was shorter than the old 12px threshold. */
                 if (selection.width < 12.f) { selection.width = fminf(220.f, frame.width * .38f); selection.x = PreviewClamp(gTextBoxDragStart.x - selection.width * .5f, frame.x, frame.x + frame.width - selection.width); }
                 if (selection.height < 12.f) { selection.height = fminf(100.f, frame.height * .24f); selection.y = PreviewClamp(gTextBoxDragStart.y - selection.height * .5f, frame.y, frame.y + frame.height - selection.height); }
                 float x = (selection.x + selection.width * .5f - frame.x) / frame.width;
@@ -97,7 +169,6 @@ static void UpdateTextToolBox(Clay_ElementId previewFrameId) {
         }
     }
 }
-
 static void CenterPanel(void) {
     static const int resolutions[] = {240, 480, 720, 1080};
     Clay_BoundingBox qb = Clay_GetElementData(CLAY_ID("PreviewQuality")).boundingBox;

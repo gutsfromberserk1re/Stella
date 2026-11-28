@@ -227,7 +227,20 @@ static Rectangle gTextFontPickerRect, gTextFontMenuRect;
 static float gTextFontMenuScroll;
 static bool gTextIsSubtitle;
 static bool gSubtitleCardOpen;
-static bool gSubtitleModelManagerOpen;
+/* Whisper transcription popup state. Balanced (index 1) is the default. */
+static bool gSubtitleTranscribePopupOpen;
+static bool gSubtitleSourceValid;
+static int gSubtitleSelectedTier = 1;
+static uint64_t gSubtitleTranscriptionRequestId;
+static int gSubtitleTranscriptionState; /* 0 idle, 1 running, 2 complete, 3 cancelled, 4 error */
+static float gSubtitleTranscriptionProgress;
+static char gSubtitleTranscriptionDetail[256];
+static char gSubtitleTranscriptionJson[2 * 1024 * 1024];
+static char gSubtitleSourceClipId[64];
+static char gSubtitleSourcePath[1024];
+static char gSubtitleSourceLabel[260];
+static float gSubtitleSourceStart, gSubtitleSourceDuration, gSubtitleSourceOffset, gSubtitleSourceSpeed;
+static double gSubtitlePopupOpenedAt;
 typedef struct {
     bool installed;
     bool downloading;
@@ -244,6 +257,7 @@ static bool gTextOutline;
 static bool gTextShadow = true;
 static bool gTextBackground;
 static bool gTextInputFocused;
+static bool gTextColorHexFocused;
 static bool gTextTitleSelected;
 static float gTextPosX = 0.5f, gTextPosY = 0.78f;
 /* Text tools create a normalized rectangle on the preview. Text is rendered
@@ -253,6 +267,10 @@ static bool gTextAutoFit = true;
 static bool gTextBoxDragging;
 static Vector2 gTextBoxDragStart;
 static Rectangle gTextBoxDragRect;
+/* A selected title can be repositioned directly in the preview with the Select tool. */
+static bool gTextBoxMoving;
+static Vector2 gTextBoxMoveOffset;
+static bool gTextBoxMoveChanged;
 static Rectangle gTextBoxScreenRect;
 static bool gTextBoxScreenRectValid;
 static bool gTextAutoUpdatePending;
@@ -267,6 +285,7 @@ static uint64_t gTextRenderedSignature;
 static float gTextDuration = 5.f;
 static void PlutoTextCreateBox(float x, float y, float width, float height);
 static void PlutoTextAutoUpdateFlush(void);
+static void PlutoTextAutoUpdateObserve(void);
 static uint64_t PlutoTextRasterSignature(void);
 static void PlutoTimelineEndPropertyEdit(void);
 static void PlutoDrawTextCaret(void);
@@ -353,6 +372,12 @@ static bool  gFilterIntensityDrag;
 static uint32_t gDragId;                              /* active drag target (slider/ruler) */
 static int   gDragWheel = -1;
 static uint32_t gEditValueId, gLastValueClickId, gValueDragId;
+
+/* Prevent editor-wide shortcuts from consuming characters while any text-like
+   input or modal text workflow owns the keyboard. */
+static bool StellaKeyboardInputCaptured(void) {
+    return gTextInputFocused || gTextColorHexFocused || gSubtitleTranscribePopupOpen || gEditValueId != 0;
+}
 static char gEditValueText[32];
 static int gEditValueLen;
 static double gLastValueClickTime;
@@ -387,7 +412,7 @@ typedef struct {
     char id[64], label[260], path[1024], audioPath[1024], groupId[64], linkedId[64], detachedFromVideoId[64], unlinkedFromClipId[64], kind[16], subtitleSourceId[64], subtitleText[STELLA_TEXT_MAX];
     char transitionType[16];
     int track, mediaIndex; /* 0..5 = video V1..V6, 6..11 = audio A1..A6 */
-    float start, duration, sourceOffset, sourceDuration, transitionDuration;
+    float start, duration, sourceOffset, sourceDuration, transitionDuration, speed;
     float audioVolume, audioPan, audioFadeInDuration, audioFadeOutDuration;
     bool hasAudio, audioFadeIn, audioFadeOut, isSubtitle, isTitle;
     TimelineKeyframeUi keyframes[32];
@@ -461,10 +486,56 @@ static const char *Fmt(const char *f, ...) {
 /* ------------------------------------------------------------------ */
 static char gFontPath[11][260];
 static bool gFontOK[11];
-static int  gFcps[100], gFcpN;
+#define STELLA_FONT_CODEPOINT_CAPACITY 1024
+static int  gFcps[STELLA_FONT_CODEPOINT_CAPACITY], gFcpN;
 typedef struct { int slot, px; bool custom; char path[1024]; Font f; } FontEnt;
 static FontEnt gFC[512];
 static int gFCN;
+
+/* Add Unicode scalars from the active title to raylib's glyph set. The old
+   100-entry atlas contained ASCII only, so non-Latin text could silently
+   rasterize as empty glyphs. */
+static bool StellaFontAddCodepoint(int codepoint) {
+    if (codepoint < 32 || codepoint > 0x10ffff) return false;
+    for (int i = 0; i < gFcpN; i++) if (gFcps[i] == codepoint) return false;
+    if (gFcpN >= STELLA_FONT_CODEPOINT_CAPACITY) return false;
+    gFcps[gFcpN++] = codepoint;
+    return true;
+}
+
+static void StellaFontEnsureTextCodepoints(const char *text) {
+    if (!text || !*text) return;
+    const unsigned char *p = (const unsigned char *)text;
+    bool changed = false;
+    while (*p) {
+        int codepoint = 0xfffd;
+        if (*p < 0x80) {
+            codepoint = *p++;
+        } else if ((*p & 0xe0u) == 0xc0u && p[1]) {
+            codepoint = ((int)(p[0] & 0x1fu) << 6) | (int)(p[1] & 0x3fu); p += 2;
+        } else if ((*p & 0xf0u) == 0xe0u && p[1] && p[2]) {
+            codepoint = ((int)(p[0] & 0x0fu) << 12) | ((int)(p[1] & 0x3fu) << 6) | (int)(p[2] & 0x3fu); p += 3;
+        } else if ((*p & 0xf8u) == 0xf0u && p[1] && p[2] && p[3]) {
+            codepoint = ((int)(p[0] & 0x07u) << 18) | ((int)(p[1] & 0x3fu) << 12) |
+                        ((int)(p[2] & 0x3fu) << 6) | (int)(p[3] & 0x3fu); p += 4;
+        } else {
+            p++;
+        }
+        if (codepoint >= 32) changed |= StellaFontAddCodepoint(codepoint);
+    }
+    if (!changed) return;
+
+    /* Text fonts are cached separately in slots 3..10, plus user-picked font
+       files (custom=true). Rebuild just those atlases with the expanded glyph
+       list; keep the UI's regular/medium/semibold atlases untouched. */
+    int write = 0;
+    for (int i = 0; i < gFCN; i++) {
+        bool titleFont = gFC[i].custom || gFC[i].slot >= 3;
+        if (titleFont) UnloadFont(gFC[i].f);
+        else gFC[write++] = gFC[i];
+    }
+    gFCN = write;
+}
 #define STELLA_MAX_SYSTEM_FONTS 384
 typedef struct { char name[96]; char path[1024]; } StellaSystemFont;
 static StellaSystemFont gSystemFonts[STELLA_MAX_SYSTEM_FONTS];

@@ -890,12 +890,13 @@ int main(void) {
                 gPreviewDebounce = 1.f;
             }
         }
-        if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0 && !gTextInputFocused) PlutoTogglePlayback();
-        if (IsKeyPressed(KEY_F3)) gPerfOverlay = !gPerfOverlay;
+        bool textEntryOwnsKeyboard = StellaKeyboardInputCaptured();
+        if (IsKeyPressed(KEY_SPACE) && gEditValueId == 0 && !textEntryOwnsKeyboard) PlutoTogglePlayback();
+        if (!textEntryOwnsKeyboard && IsKeyPressed(KEY_F3)) gPerfOverlay = !gPerfOverlay;
         gCtrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         gShiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         bool altDown = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
-        if (gEditValueId == 0 && !gTextInputFocused) {
+        if (gEditValueId == 0 && !textEntryOwnsKeyboard) {
             if (gCtrlDown && IsKeyPressed(KEY_Z)) TimelineHistoryAction(gShiftDown);
             else if (gCtrlDown && IsKeyPressed(KEY_Y)) TimelineHistoryAction(true);
             else if (!gCtrlDown && !altDown) {
@@ -909,7 +910,7 @@ int main(void) {
         bool kPressed = IsKeyPressed(KEY_K);
         bool kShift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         bool kCtrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && kPressed) {
+        if (gEditValueId == 0 && !textEntryOwnsKeyboard && !gTimelinePlaying && kPressed) {
             /* Plain K cuts every clip under the playhead. Shift+K scopes to
                video, Ctrl+K to audio, and Ctrl+Shift+K to both. */
             bool includeVideo = !kCtrl || kShift;
@@ -917,7 +918,7 @@ int main(void) {
             TimelineCutAtPlayhead(includeVideo, includeAudio);
             gTimelineTool = 0;
         }
-        if (gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
+        if (gEditValueId == 0 && !textEntryOwnsKeyboard && !gTimelinePlaying && IsKeyPressed(KEY_DELETE) &&
             gTimelineSelected >= 0 && gTimelineSelected < gTimelineClipCount) {
             /* A focused/selected keyframe takes priority over clip deletion.
                Clicking a diamond selects it; placing the playhead over one is
@@ -936,7 +937,7 @@ int main(void) {
             }
         }
         bool navLeft = IsKeyDown(KEY_LEFT), navRight = IsKeyDown(KEY_RIGHT);
-        bool navActive = gEditValueId == 0 && !gTextInputFocused && !gTimelinePlaying && (navLeft || navRight);
+        bool navActive = gEditValueId == 0 && !textEntryOwnsKeyboard && !gTimelinePlaying && (navLeft || navRight);
         gPreviewNavigating = navActive;
         bool navStep = false;
         if (navActive) {
@@ -998,7 +999,8 @@ int main(void) {
         if (fabsf(currentDpiScale - gDpiScale) > 0.01f) gDpiScale = currentDpiScale;
         Clay_SetLayoutDimensions((Clay_Dimensions){(float)GetScreenWidth(), (float)GetScreenHeight()});
         Vector2 m = GetMousePosition();
-        Clay_SetPointerState((Clay_Vector2){m.x, m.y}, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        /* Modal subtitle transcription owns pointer input; do not click-through to Clay. */
+        Clay_SetPointerState((Clay_Vector2){m.x, m.y}, !gSubtitleTranscribePopupOpen && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
         Clay_BoundingBox timeBodyForWheel = Clay_GetElementData(CLAY_ID("TimeBody")).boundingBox;
         bool shiftTimelineWheel = gShiftDown && !gCtrlDown && timeBodyForWheel.width > 0.f &&
             CheckCollisionPointRec(m, (Rectangle){timeBodyForWheel.x, timeBodyForWheel.y,
@@ -1008,6 +1010,7 @@ int main(void) {
 
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) gDragId = 0;
         PlutoPollBackend();
+        PlutoWhisperApplyTranscriptionResult();
         gCustN = 0; gHand = false; gCross = false; gResize = 0; gScrubCursor = false;
         gMediaHoverName[0] = 0;
         Clay_RenderCommandArray cmds = BuildUI();
@@ -1042,6 +1045,7 @@ int main(void) {
         DrawPreviewQualityDropdown();
         DrawPreviewFpsDropdown();
         DrawTimelineContextMenu();
+        DrawSubtitleTranscribePopup();
         DrawPerfOverlay();
         EndDrawing();
         PlutoAfterDraw();

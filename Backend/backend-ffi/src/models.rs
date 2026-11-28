@@ -55,6 +55,24 @@ pub fn model_for_tier(tier: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|model| model.tier == tier)
 }
 
+pub fn model_path_for_tier(tier: &str) -> Result<PathBuf, String> {
+    let model = model_for_tier(tier).ok_or_else(|| format!("Unknown model tier: {tier}"))?;
+    let directory = model_directory()?;
+    let path = model_path(&directory, model);
+    if !path.is_file() {
+        return Err(format!("{} model is not downloaded yet", model.label));
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {} model: {error}", model.label))?;
+    if metadata.len() == 0 {
+        return Err(format!("{} model is empty. Download it again.", model.label));
+    }
+    // Downloads are SHA-256 verified before their atomic rename. Do not hash a
+    // 500+ MiB model synchronously from the UI's submit call; whisper.cpp will
+    // validate the file when the background worker opens it.
+    Ok(path)
+}
+
 pub fn model_directory() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let root = std::env::var_os("LOCALAPPDATA")

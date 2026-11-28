@@ -85,6 +85,15 @@ jobs:
           "LIBCLANG_PATH=$llvmBin" | Add-Content -Path $env:GITHUB_ENV
           $llvmBin | Add-Content -Path $env:GITHUB_PATH
 
+      # whisper-rs builds whisper.cpp from source with CMake during Cargo builds.
+      - name: Verify CMake for whisper.cpp
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            throw 'CMake is required to build whisper-rs/whisper.cpp but was not found on PATH.'
+          }
+          cmake --version
+
       - name: Test timeline core
         run: cargo test --manifest-path Backend/Cargo.toml -p pluto-timeline-core
 

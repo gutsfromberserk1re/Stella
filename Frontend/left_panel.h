@@ -23,8 +23,10 @@ static void MediaView(void) {
         if (gMediaZoom > 2.2f) gMediaZoom = 2.2f;
     }
     if (gLeftTab == 0) {
-        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) gMediaZoom = fminf(2.2f, gMediaZoom + .1f);
-        if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) gMediaZoom = fmaxf(.65f, gMediaZoom - .1f);
+        if (!StellaKeyboardInputCaptured() && (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)))
+            gMediaZoom = fminf(2.2f, gMediaZoom + .1f);
+        if (!StellaKeyboardInputCaptured() && (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)))
+            gMediaZoom = fmaxf(.65f, gMediaZoom - .1f);
     }
     float desiredTileWidth = 100.f * gMediaZoom;
     int columns = (int)floorf((mediaBox.width - 18.f + 9.f) / (desiredTileWidth + 9.f));

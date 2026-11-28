@@ -584,12 +584,24 @@ static void DrawIcon(int k, Rectangle r, Color c, float v) {
         Vector2 textSize = MeasureTextEx(iconFont, "B", 34.f, 0.f);
         DrawTextEx(iconFont, "B", (Vector2){x + (w - textSize.x) * .5f, y + (h - textSize.y) * .5f}, 34.f, 0.f, c);
     } break;
-    case I_ITALIC: LN(.35, .23, .70, .23); LN(.65, .23, .38, .77); LN(.30, .77, .65, .77); break;
+    case I_ITALIC: {
+        /* A compact italic-I mark: one oblique stem with short horizontal
+           serif caps. Keeping both caps flat prevents the icon reading as Z. */
+        float iconStroke = fmaxf(2.0f, t * 1.15f);
+        DrawLineEx(P(.64, .20), P(.36, .80), iconStroke, c);
+        DrawLineEx(P(.42, .20), P(.72, .20), iconStroke, c);
+        DrawLineEx(P(.28, .80), P(.58, .80), iconStroke, c);
+    } break;
     case I_UNDERLINE: {
+        /* Match the typography toolbar: a readable U glyph with a separate
+           baseline, not a tiny geometric bowl. */
         Font iconFont = FontPx(2, 34);
-        Vector2 textSize = MeasureTextEx(iconFont, "U", 34.f, 0.f);
-        DrawTextEx(iconFont, "U", (Vector2){x + (w - textSize.x) * .5f, y + (h - textSize.y) * .5f - 1.f}, 34.f, 0.f, c);
-        DrawLineEx(P(.18, .88), P(.82, .88), fmaxf(1.4f, t), c);
+        const char *label = "U";
+        Vector2 textSize = MeasureTextEx(iconFont, label, 34.f, 0.f);
+        float fontX = x + (w - textSize.x) * .5f;
+        float fontY = y + (h - textSize.y) * .5f - 1.f;
+        DrawTextEx(iconFont, label, (Vector2){fontX, fontY}, 34.f, 0.f, c);
+        DrawLineEx(P(.18, .91), P(.82, .91), fmaxf(1.5f, t * .95f), c);
     } break;
     default: break;
     }
@@ -819,7 +831,7 @@ static void DrawCustom(Cust *cu, Rectangle r) {
             DrawLineEx((Vector2){r.x, r.y + r.height / 3.f}, (Vector2){r.x + r.width, r.y + r.height / 3.f}, 1.f, grid);
             DrawLineEx((Vector2){r.x, r.y + 2.f * r.height / 3.f}, (Vector2){r.x + r.width, r.y + 2.f * r.height / 3.f}, 1.f, grid);
         }
-        if (gTimelineTool == 3) {
+        if (gTimelineTool == 3 || (gTimelineTool == 0 && gTextTitleSelected)) {
             Rectangle textBox = gTextBoxDragging ? gTextBoxDragRect : gTextBoxScreenRect;
             bool showTextBox = gTextBoxDragging || (gTextTitleSelected && gTextBoxScreenRectValid);
             if (showTextBox && textBox.width > 1.f && textBox.height > 1.f) {
